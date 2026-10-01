@@ -1,0 +1,1397 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Musical Color Freeze</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
+  body {
+    background: #F6F1E7;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  canvas { display: block; width: 100%; height: 100%; }
+
+  #home {
+    position: fixed; top: max(10px, env(safe-area-inset-top)); right: max(10px, env(safe-area-inset-right));
+    width: 52px; height: 52px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+    background: rgba(255, 253, 248, 0.85); box-shadow: 0 2px 8px rgba(74, 64, 54, 0.15);
+    -webkit-tap-highlight-color: transparent; z-index: 5;
+  }
+  #home:active { transform: scale(0.94); }
+
+  /* Hidden parent view: press and hold the top-left corner for 3 seconds. */
+  #parent {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: rgba(74, 64, 54, 0.55); padding: 16px; box-sizing: border-box; z-index: 10;
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #4A4036;
+  }
+  #parent[hidden] { display: none; }
+  #parent .card { background: #FFFDF8; border-radius: 16px; padding: 20px 22px; max-width: 380px; width: 100%; box-shadow: 0 10px 30px rgba(0,0,0,0.18); }
+  #parent h2 { margin: 0 0 10px; font-size: 18px; }
+  #parent table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+  #parent th, #parent td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #EDE5D6; }
+  #parent .hint { margin: 12px 0 0; font-size: 12px; opacity: 0.7; }
+</style>
+</head>
+<body>
+<canvas id="game" aria-label="Musical color freeze game"></canvas>
+<a id="home" href="../../index.html" aria-label="Home">
+  <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><path d="M4 11.5 12 5l8 6.5V19a1 1 0 0 1-1 1h-4.5v-5h-5v5H5a1 1 0 0 1-1-1z" fill="none" stroke="#4A4036" stroke-width="2" stroke-linejoin="round"/></svg>
+</a>
+
+<div id="parent" hidden>
+  <div class="card">
+    <h2>Progress on this device</h2>
+    <div id="parentBody"></div>
+    <p class="hint">Stored only on this device. Tap anywhere to close.</p>
+  </div>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  /* =====================================================================
+   * MUSICAL COLOR FREEZE
+   * ELOF domain: Perceptual/Motor (start/stop to music) + Cognition
+   *              (colour recognition, listening, inhibitory control).
+   *
+   * How it plays:
+   *  - A little bear bops from rug to rug while a synthesized tune plays.
+   *  - The music stops after a short, varied 2.5-4 s. The bear freezes and
+   *    holds up a balloon of one colour (and says the colour if speech exists).
+   *  - The child taps the rug of that colour; the bear hops onto it.
+   *
+   * Design rules this file follows (from the brief):
+   *  - Coherence: only the rugs and the bear on screen. No score, no menus.
+   *  - The music IS the task here, so it is the only time music plays.
+   *  - Inhibitory control without pressure: taps during the music are simply
+   *    ignored. Nothing counts down and the freeze waits for the child forever.
+   *  - Control of error: a wrong rug wobbles softly and the balloon bobs again.
+   *    No buzzer, no red X.
+   *  - Works without speech: the balloon colour alone carries the prompt.
+   *  - Natural stopping point: 5 rounds, then a static "play outside" screen
+   *    with no "play again" button.
+   * ===================================================================== */
+
+  // ---------------------------------------------------------------------
+  // Configuration
+  // ---------------------------------------------------------------------
+  const CONFIG = {
+    ROUNDS: 5,                     // hard session limit (natural stopping point)
+    STORAGE_KEY: 'musical-color-freeze.v1',
+    FREEZES_PER_ROUND: 3,          // colour calls per round
+    IDLE_PULSE_MS: 1500,           // idle time in a freeze before the balloon pulses
+    TUTORIAL_HINT_MS: 5000,        // first round: idle time before the right rug glows too
+    BPM: 120,                      // tune tempo (one beat = 500 ms)
+    STOP_BEATS: [5, 6, 6.5, 7, 8], // where the music may stop: 2.5 to 4 s, never mid-hop
+    HOP_BEATS: 0.9,                // dance hop length, in beats
+    FIRST_READY_MS: 900,           // round start: the bear stands still, then the music begins
+    NEXT_READY_MS: 450,            // pause between a found colour and the next tune
+    LOOKAHEAD_MS: 120,             // audio scheduling window
+    BALLOON_POP_MS: 360,           // balloon pop-in animation
+    HOP_MS: 520,                   // correct tap: hop onto the rug
+    CHEER_MS: 900,                 // happy wiggle after landing
+    WOBBLE_MS: 460,                // wrong rug wobble
+    BOUNCE_MS: 320,                // rug squash when tapped right
+    CELEBRATE_MS: 1800,            // round-complete celebration length
+    FAST_MS_PER_FREEZE: 3500,      // "quick" answer threshold for difficulty step-up
+    PARENT_HOLD_MS: 3000,          // hold time for the hidden parent view
+    PARENT_CORNER_PX: 80,
+    HOME_RESERVE_PX: 72,           // top-right corner kept free for the home button
+  };
+
+  const COLORS = {
+    bg: '#F6F1E7',
+    ink: '#4A4036',
+    star: '#F6C85F',
+    grass: '#B9D7A8',
+    cheek: '#F2A88A',
+    fur: '#E6C9A0',                // the bear is never one of the rug colours
+    belly: '#F8ECD9',
+    earInner: '#EFB7A6',
+  };
+
+  // Rug colours: six clearly different hues at most (no teal-vs-green traps).
+  // Each colour always plays the same note when found.
+  const MAT_COLORS = {
+    red:    { hex: '#E97A6E', name: 'Red',    note: 523.25 },
+    orange: { hex: '#F3A65C', name: 'Orange', note: 587.33 },
+    yellow: { hex: '#F2CE52', name: 'Yellow', note: 659.25 },
+    green:  { hex: '#89C27A', name: 'Green',  note: 783.99 },
+    blue:   { hex: '#6FA6DD', name: 'Blue',   note: 880.00 },
+    purple: { hex: '#A98DD8', name: 'Purple', note: 1046.5 },
+  };
+
+  const FONT = 'ui-rounded, "Arial Rounded MT Bold", "Nunito", system-ui, -apple-system, sans-serif';
+
+  // Difficulty ladder for dynamic difficulty adjustment (scaffolding).
+  // Early tiers only use far-apart colours; the top tier adds the in-between
+  // hues (orange next to red and yellow, purple next to blue).
+  const TIERS = [
+    { mats: 2, sets: [['red', 'blue'], ['yellow', 'blue'], ['red', 'yellow'], ['green', 'purple']] },
+    { mats: 3, sets: [['red', 'yellow', 'blue'], ['red', 'green', 'blue'], ['yellow', 'green', 'blue'], ['red', 'yellow', 'green']] },
+    { mats: 4, sets: [['red', 'yellow', 'green', 'blue']] },
+    { mats: 6, sets: [['red', 'orange', 'yellow', 'green', 'blue', 'purple']] },
+  ];
+
+  // The tune: two 8-beat phrases in C major, written in eighth notes
+  // [eighth index, MIDI note, length in eighths]. They alternate per freeze.
+  const MELODIES = [
+    [[0, 72, 1], [1, 76, 1], [2, 79, 2], [4, 76, 1], [5, 79, 1], [6, 81, 2],
+     [8, 79, 1], [9, 77, 1], [10, 76, 2], [12, 74, 1], [13, 76, 1], [14, 72, 2]],
+    [[0, 76, 1], [1, 74, 1], [2, 72, 2], [4, 74, 1], [5, 76, 1], [6, 79, 2],
+     [8, 81, 1], [9, 79, 1], [10, 76, 2], [12, 77, 1], [13, 76, 1], [14, 74, 2]],
+  ];
+  const BASS = [48, 55, 53, 60, 55, 62, 48, 55]; // oom-pah, one per beat: C, F, G, C
+
+  const TAU = Math.PI * 2;
+  const reduceMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  const MOTION = reduceMotion ? 0.4 : 1;
+  const BEAT_MS = 60000 / CONFIG.BPM;
+
+  // ---------------------------------------------------------------------
+  // Small helpers
+  // ---------------------------------------------------------------------
+  const now = () => performance.now();
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const easeOutCubic = t => 1 - Math.pow(1 - t, 3);
+  const easeInOutQuad = t => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
+  const easeOutBack = t => { const c = 1.70158; return 1 + (c + 1) * Math.pow(t - 1, 3) + c * Math.pow(t - 1, 2); };
+  const midiHz = m => 440 * Math.pow(2, (m - 69) / 12);
+  const pick = arr => arr[Math.floor(Math.random() * arr.length)];
+  const log = (...args) => console.log('[ColorFreeze]', ...args);
+
+  function shuffle(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }
+
+  // Mix a hex colour toward black (amt < 0) or white (amt > 0).
+  const shadeCache = new Map();
+  function shade(hex, amt) {
+    const key = hex + amt;
+    if (shadeCache.has(key)) return shadeCache.get(key);
+    const n = parseInt(hex.slice(1), 16);
+    const target = amt < 0 ? 0 : 255;
+    const p = Math.abs(amt);
+    const c = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map(v => Math.round(lerp(v, target, p)));
+    const out = `rgb(${c[0]},${c[1]},${c[2]})`;
+    shadeCache.set(key, out);
+    return out;
+  }
+
+  // ---------------------------------------------------------------------
+  // Canvas setup
+  // ---------------------------------------------------------------------
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  let W = 0, H = 0, DPR = 1;
+
+  // Layout values recomputed on every resize.
+  const L = { m: 16, w: 120, h: 70, cs: 40 };
+
+  // ---------------------------------------------------------------------
+  // Game state
+  // ---------------------------------------------------------------------
+  const state = {
+    phase: 'start',          // 'start' | 'play' | 'celebrate' | 'between' | 'end'
+    step: 'ready',           // inside 'play': 'ready' | 'dance' | 'freeze' | 'hop' | 'cheer'
+    stepT0: 0,
+    readyMs: 0,
+    round: 0,                // rounds completed this session
+    tier: 0,                 // index into TIERS
+    mats: [],                // { color, x, y, w, h, wobbleT0, bounceT0 }
+    plan: [],                // which mat is called at each freeze this round
+    freezesDone: 0,
+    target: -1,              // mat index being called right now
+    hero: { mat: 0, from: 0, to: 0 },
+    dance: null,             // { t0, a0, stopBeat, events, next, hops, melody }
+    balloonT0: 0,
+    balloonBobT0: -1e9,
+    slips: 0,                // wrong taps on the current freeze
+    roundSlips: 0,
+    firstTry: 0,
+    responseMs: 0,           // time spent deciding (freeze start -> correct tap), summed
+    freezeStart: 0,
+    lastInteraction: 0,
+    roundStart: 0,
+    celebrateStart: 0,
+    particles: [],
+    tunesPlayed: 0,
+  };
+
+  // ---------------------------------------------------------------------
+  // Local progress tracking (localStorage, never leaves the device)
+  // ---------------------------------------------------------------------
+  function freshProgress() {
+    return { version: 1, gamesCompleted: 0, roundsCompleted: 0, found: 0, wrongTaps: 0, lastPlayed: null, sessions: [] };
+  }
+
+  function loadProgress() {
+    try {
+      const raw = window.localStorage.getItem(CONFIG.STORAGE_KEY);
+      if (raw) {
+        const data = JSON.parse(raw);
+        if (data && data.version === 1 && Array.isArray(data.sessions)) return data;
+      }
+    } catch (e) {
+      console.warn('[ColorFreeze] Progress could not be loaded (storage unavailable):', e && e.message);
+    }
+    return freshProgress();
+  }
+
+  function saveProgress() {
+    try {
+      window.localStorage.setItem(CONFIG.STORAGE_KEY, JSON.stringify(progress));
+      log('Progress saved', { gamesCompleted: progress.gamesCompleted, roundsCompleted: progress.roundsCompleted });
+    } catch (e) {
+      console.warn('[ColorFreeze] Progress could not be saved (storage unavailable):', e && e.message);
+    }
+  }
+
+  const progress = loadProgress();
+  let session = null; // created on the first round of this app launch
+
+  function ensureSession() {
+    if (session) return;
+    session = { startedAt: new Date().toISOString(), finished: false, rounds: [] };
+    progress.sessions.push(session);
+    if (progress.sessions.length > 30) progress.sessions.splice(0, progress.sessions.length - 30);
+  }
+
+  // ---------------------------------------------------------------------
+  // Audio: Web Audio tones, the synthesized tune, optional spoken words
+  // ---------------------------------------------------------------------
+  let actx = null;
+  let musicBus = null;     // gain node the tune plays through; muted to stop it instantly
+  let noiseBuf = null;
+
+  // Browsers only allow audio after a user gesture, so this runs on every pointer down.
+  function unlockAudio() {
+    if (!actx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) { try { actx = new AC(); } catch (e) { actx = null; } }
+    }
+    if (actx && actx.state === 'suspended') actx.resume();
+  }
+
+  // One enveloped oscillator at an absolute AudioContext time.
+  function voice(freq, at, dur, vol, type, dest) {
+    const osc = actx.createOscillator();
+    const gain = actx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.0001, at);
+    gain.gain.exponentialRampToValueAtTime(vol, at + 0.015);
+    gain.gain.exponentialRampToValueAtTime(0.0001, at + dur);
+    osc.connect(gain).connect(dest || actx.destination);
+    osc.start(at);
+    osc.stop(at + dur + 0.05);
+  }
+
+  function tone(freq, delay, dur, vol = 0.16, type = 'sine') {
+    if (!actx) return;
+    voice(freq, actx.currentTime + delay, dur, vol, type);
+  }
+
+  // A pitch glide (used for the balloon pop and the landing boing).
+  function glide(f0, f1, delay, dur, vol, type = 'sine') {
+    if (!actx) return;
+    const t = actx.currentTime + delay;
+    const osc = actx.createOscillator();
+    const gain = actx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(f0, t);
+    osc.frequency.exponentialRampToValueAtTime(f1, t + dur * 0.8);
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(vol, t + 0.015);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    osc.connect(gain).connect(actx.destination);
+    osc.start(t);
+    osc.stop(t + dur + 0.05);
+  }
+
+  function noiseBuffer() {
+    if (!noiseBuf) {
+      const len = Math.floor(actx.sampleRate * 0.4);
+      noiseBuf = actx.createBuffer(1, len, actx.sampleRate);
+      const d = noiseBuf.getChannelData(0);
+      for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    }
+    return noiseBuf;
+  }
+
+  // The tune's instruments. All go through musicBus so the freeze can cut them.
+  function playMusicEvent(ev, at) {
+    if (ev.kind === 'melody') {
+      const f = midiHz(ev.midi);
+      const dur = ev.len * 0.25 * 0.9 + 0.12;
+      voice(f, at, dur, 0.13, 'triangle', musicBus);   // soft marimba-ish body
+      voice(f * 2, at, dur * 0.6, 0.03, 'sine', musicBus); // little sparkle on top
+    } else if (ev.kind === 'bass') {
+      voice(midiHz(ev.midi), at, 0.3, 0.12, 'sine', musicBus);
+    } else if (ev.kind === 'kick') {
+      const osc = actx.createOscillator();
+      const gain = actx.createGain();
+      osc.frequency.setValueAtTime(150, at);
+      osc.frequency.exponentialRampToValueAtTime(48, at + 0.12);
+      gain.gain.setValueAtTime(0.0001, at);
+      gain.gain.exponentialRampToValueAtTime(0.2, at + 0.005);
+      gain.gain.exponentialRampToValueAtTime(0.0001, at + 0.17);
+      osc.connect(gain).connect(musicBus);
+      osc.start(at);
+      osc.stop(at + 0.2);
+    } else if (ev.kind === 'tick') {
+      const src = actx.createBufferSource();
+      const filt = actx.createBiquadFilter();
+      const gain = actx.createGain();
+      src.buffer = noiseBuffer();
+      filt.type = 'highpass';
+      filt.frequency.value = 6500;
+      gain.gain.setValueAtTime(0.0001, at);
+      gain.gain.exponentialRampToValueAtTime(0.05, at + 0.004);
+      gain.gain.exponentialRampToValueAtTime(0.0001, at + 0.05);
+      src.connect(filt).connect(gain).connect(musicBus);
+      src.start(at);
+      src.stop(at + 0.08);
+    }
+  }
+
+  function startMusicBus() {
+    if (!actx) return;
+    musicBus = actx.createGain();
+    musicBus.gain.value = 0.9;
+    musicBus.connect(actx.destination);
+  }
+
+  // Stop the tune right now: a 40 ms fade avoids a click, then the bus is dropped.
+  function stopMusic() {
+    if (!actx || !musicBus) return;
+    const bus = musicBus;
+    const ct = actx.currentTime;
+    bus.gain.cancelScheduledValues(ct);
+    bus.gain.setValueAtTime(bus.gain.value, ct);
+    bus.gain.linearRampToValueAtTime(0, ct + 0.04);
+    setTimeout(() => { try { bus.disconnect(); } catch (e) { /* already gone */ } }, 400);
+    musicBus = null;
+  }
+
+  const playPop = () => { glide(420, 880, 0, 0.14, 0.11, 'sine'); tone(1320, 0.05, 0.12, 0.04); };
+  const playChime = color => { const f = MAT_COLORS[color].note; tone(f, 0, 0.35); tone(f * 1.5, 0.07, 0.4, 0.1); };
+  const playLand = () => glide(260, 520, 0, 0.18, 0.08, 'triangle');
+  const playRoundDone = () => [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => tone(f, i * 0.12, 0.5, 0.12));
+
+  // Spoken words via the Web Speech API. Android WebView usually lacks it,
+  // so this quietly does nothing there and the balloon colour carries the prompt.
+  function say(text) {
+    try {
+      if (!('speechSynthesis' in window)) return;
+      window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'en-US';
+      u.rate = 0.85;
+      u.pitch = 1.15;
+      window.speechSynthesis.speak(u);
+    } catch (e) { /* speech is optional */ }
+  }
+
+  // ---------------------------------------------------------------------
+  // Rounds and difficulty
+  // ---------------------------------------------------------------------
+  function startRound() {
+    ensureSession();
+    const tier = TIERS[state.tier];
+    const colors = shuffle(pick(tier.sets).slice());
+
+    state.mats = colors.map(color => ({ color, x: 0, y: 0, w: 0, h: 0, wobbleT0: -1e9, bounceT0: -1e9 }));
+
+    // Plan the three calls up front: different colours each time when there are
+    // enough rugs; with two rugs the call alternates so both colours appear.
+    const n = colors.length;
+    if (n >= CONFIG.FREEZES_PER_ROUND) {
+      state.plan = shuffle([...Array(n).keys()]).slice(0, CONFIG.FREEZES_PER_ROUND);
+    } else {
+      const first = Math.floor(Math.random() * n);
+      state.plan = [...Array(CONFIG.FREEZES_PER_ROUND).keys()].map(k => (first + k) % n);
+    }
+
+    state.hero.mat = Math.floor(Math.random() * n);
+    state.freezesDone = 0;
+    state.target = -1;
+    state.slips = 0;
+    state.roundSlips = 0;
+    state.firstTry = 0;
+    state.responseMs = 0;
+    state.particles = [];
+    state.dance = null;
+    computeLayout();
+
+    state.phase = 'play';
+    setStep('ready', now());
+    state.readyMs = CONFIG.FIRST_READY_MS;
+    state.roundStart = now();
+    state.lastInteraction = now();
+    log(`Round ${state.round + 1}/${CONFIG.ROUNDS} started at level ${state.tier + 1}: rugs ${colors.join(', ')}; calls ${state.plan.map(i => colors[i]).join(', ')}`);
+  }
+
+  function setStep(step, t) {
+    state.step = step;
+    state.stepT0 = t;
+  }
+
+  // The music starts and the bear bops. The stop point and the hops are fixed
+  // up front so the bear is always standing on a rug when the music stops.
+  function startDance(t) {
+    const d = {
+      t0: t + 60,
+      a0: actx ? actx.currentTime + 0.06 : 0,
+      stopBeat: pick(CONFIG.STOP_BEATS),
+      melody: MELODIES[state.tunesPlayed++ % MELODIES.length],
+      events: [],
+      next: 0,
+      hops: [],
+    };
+
+    for (const [e, midi, len] of d.melody) d.events.push({ beat: e / 2, kind: 'melody', midi, len });
+    for (let b = 0; b < 8; b++) {
+      d.events.push({ beat: b, kind: 'bass', midi: BASS[b] });
+      if (b % 2 === 0) d.events.push({ beat: b, kind: 'kick' });
+      d.events.push({ beat: b + 0.5, kind: 'tick' });
+    }
+    d.events = d.events.filter(ev => ev.beat < d.stopBeat).sort((a, b) => a.beat - b.beat);
+
+    // Hop to a different rug every other beat.
+    let at = state.hero.mat;
+    for (let b = 1; b < d.stopBeat; b += 2) {
+      const choices = state.mats.map((m, i) => i).filter(i => i !== at);
+      const to = pick(choices);
+      d.hops.push({ beat: b, from: at, to });
+      at = to;
+    }
+    d.endMat = at;
+
+    state.dance = d;
+    startMusicBus();
+    setStep('dance', t);
+    log(`Music playing, stops after ${d.stopBeat * BEAT_MS / 1000}s`);
+  }
+
+  function danceBeat(t) {
+    return state.dance ? Math.max(0, (t - state.dance.t0) / BEAT_MS) : 0;
+  }
+
+  // Lookahead scheduler: queue the notes due in the next ~120 ms.
+  function scheduleMusic(t) {
+    const d = state.dance;
+    if (!actx || !musicBus || !d) return;
+    const horizon = t - d.t0 + CONFIG.LOOKAHEAD_MS;
+    while (d.next < d.events.length && d.events[d.next].beat * BEAT_MS < horizon) {
+      const ev = d.events[d.next++];
+      playMusicEvent(ev, Math.max(actx.currentTime, d.a0 + ev.beat * BEAT_MS / 1000));
+    }
+  }
+
+  // Music stops, bear freezes and holds up the balloon. All on the same frame.
+  function freeze(t) {
+    stopMusic();
+    state.hero.mat = state.dance.endMat;
+    state.target = state.plan[state.freezesDone];
+    state.slips = 0;
+    state.freezeStart = t;
+    state.balloonT0 = t;
+    state.balloonBobT0 = -1e9;
+    state.lastInteraction = t;
+    setStep('freeze', t);
+    playPop();
+    const name = MAT_COLORS[state.mats[state.target].color].name;
+    say(state.round === 0 && state.freezesDone === 0 ? `${name}! Find ${name.toLowerCase()}!` : `${name}!`);
+    log(`Freeze ${state.freezesDone + 1}/${CONFIG.FREEZES_PER_ROUND}: calling ${state.mats[state.target].color}`);
+  }
+
+  function tapMat(i, t) {
+    const mat = state.mats[i];
+    if (i === state.target) {
+      state.responseMs += t - state.freezeStart;
+      if (state.slips === 0) state.firstTry++;
+      progress.found++;
+      mat.bounceT0 = t;
+      playChime(mat.color);
+      state.hero.from = state.hero.mat;
+      state.hero.to = i;
+      setStep('hop', t);
+      log(`Answer accepted: ${mat.color} (slips on this call: ${state.slips})`);
+    } else {
+      // Control of error: the rug wobbles, the balloon bobs, the colour is called again.
+      mat.wobbleT0 = t;
+      state.balloonBobT0 = t;
+      state.slips++;
+      state.roundSlips++;
+      progress.wrongTaps++;
+      say(`${MAT_COLORS[state.mats[state.target].color].name}!`);
+      log(`Item rejected: tapped ${mat.color}, looking for ${state.mats[state.target].color}`);
+    }
+  }
+
+  // Landing on the right rug: sparkles, boing and wiggle on the same frame.
+  function land(t) {
+    state.hero.mat = state.hero.to;
+    setStep('cheer', t);
+    playLand();
+    spawnParticles(state.mats[state.hero.mat], t);
+  }
+
+  function finishFreeze(t) {
+    state.freezesDone++;
+    state.target = -1;
+    if (state.freezesDone >= CONFIG.FREEZES_PER_ROUND) {
+      completeRound(t);
+    } else {
+      setStep('ready', t);
+      state.readyMs = CONFIG.NEXT_READY_MS;
+    }
+  }
+
+  function completeRound(t) {
+    const ms = state.responseMs;
+    const record = {
+      level: state.tier + 1,
+      rugs: state.mats.length,
+      calls: CONFIG.FREEZES_PER_ROUND,
+      firstTry: state.firstTry,
+      attempts: CONFIG.FREEZES_PER_ROUND + state.roundSlips,   // rug taps during freezes
+      slips: state.roundSlips,
+      seconds: Math.round(ms / 100) / 10,   // thinking time only (music time excluded)
+    };
+
+    session.rounds.push(record);
+    progress.roundsCompleted++;
+    progress.lastPlayed = new Date().toISOString();
+    state.round++;
+    log('Level completed', record);
+
+    const finalRound = state.round >= CONFIG.ROUNDS;
+    if (finalRound) {
+      session.finished = true;
+      progress.gamesCompleted++;
+    } else {
+      // Praise the effort and the listening, not the child's "smartness".
+      say(state.roundSlips > 0 ? 'You kept trying, and you did it!' : 'You listened and found every color!');
+    }
+    saveProgress();
+    adjustDifficulty(record, ms);
+
+    playRoundDone();
+    state.mats.forEach(m => { m.bounceT0 = t; spawnParticles(m, t); });
+    setStep('done', t);
+    state.phase = 'celebrate';
+    state.celebrateStart = t;
+  }
+
+  // Simple DDA: quick and clean -> one step harder; a real struggle -> one step easier.
+  function adjustDifficulty(record, ms) {
+    const fast = ms / record.calls <= CONFIG.FAST_MS_PER_FREEZE;
+    const before = state.tier;
+    if (record.firstTry === record.calls && fast) {
+      state.tier = Math.min(TIERS.length - 1, state.tier + 1);
+    } else if (record.slips >= 3) {
+      state.tier = Math.max(0, state.tier - 1);
+    }
+    if (state.tier !== before) log(`Difficulty ${state.tier > before ? 'up' : 'down'}: level ${before + 1} -> ${state.tier + 1}`);
+  }
+
+  function enterEnd() {
+    stopMusic();
+    state.phase = 'end';
+    say('Great job! Time to play outside!');
+    log('Session finished: end screen shown, no replay offered');
+  }
+
+  // ---------------------------------------------------------------------
+  // Layout
+  // ---------------------------------------------------------------------
+  // Each rug sits at the bottom of a grid cell; the space above it is for the
+  // bear and its balloon. The grid shape (columns x rows) that gives the
+  // biggest rugs wins, so it adapts to portrait and landscape alike.
+  const CELL_H_PER_W = 1.65;   // cell height needed per unit of rug width
+
+  function computeLayout() {
+    const minDim = Math.min(W, H);
+    const m = clamp(minDim * 0.045, 12, 36);
+    const n = state.mats.length || 4;
+    const availW = W - 2 * m;
+    const availH = H - 2 * m;
+
+    let best = { w: 0, cols: n, rows: 1 };
+    for (let cols = 1; cols <= n; cols++) {
+      const rows = Math.ceil(n / cols);
+      const w = Math.min(availW / cols * 0.8, availH / rows / CELL_H_PER_W, 340, minDim * 0.5);
+      if (w > best.w + 0.5) best = { w, cols, rows };
+    }
+    const w = Math.max(40, best.w);
+    const h = w * 0.58;
+    const cellH = w * CELL_H_PER_W;
+    const spacing = Math.min(availW / best.cols, w * 1.4);
+    let gy0 = m + Math.max(0, availH - best.rows * cellH) * 0.6;
+    // Keep the top row of rugs below the home button.
+    gy0 = Math.max(gy0, CONFIG.HOME_RESERVE_PX + 4 - (cellH - h - w * 0.06));
+
+    L.m = m;
+    L.w = w;
+    L.h = h;
+    L.cs = Math.min(w * 0.34, minDim * 0.16);   // bear size
+
+    state.mats.forEach((mat, i) => {
+      const row = Math.floor(i / best.cols);
+      const inRow = row === best.rows - 1 ? n - row * best.cols : best.cols;
+      const col = i - row * best.cols;
+      mat.x = W / 2 + (col - (inRow - 1) / 2) * spacing;
+      mat.y = gy0 + row * cellH + cellH - h * 0.5 - w * 0.06;
+      mat.w = w;
+      mat.h = h;
+    });
+  }
+
+  // Where the bear's feet go when it stands on a rug.
+  const standPos = mat => ({ x: mat.x, y: mat.y + mat.h * 0.08 });
+
+  // Forgiving hit test: each rug's box grows well beyond the drawn rug
+  // (and upward over the bear standing on it). Nearest rug wins on overlap.
+  function findMat(p) {
+    let best = -1, bestD = Infinity;
+    state.mats.forEach((m, i) => {
+      const padX = m.w * 0.18 + 10;
+      const padDown = m.h * 0.45 + 10;
+      const padUp = m.h * 0.9 + 10;
+      if (p.x >= m.x - m.w / 2 - padX && p.x <= m.x + m.w / 2 + padX &&
+          p.y >= m.y - m.h / 2 - padUp && p.y <= m.y + m.h / 2 + padDown) {
+        const d = Math.hypot(p.x - m.x, (p.y - m.y) * 1.4);
+        if (d < bestD) { best = i; bestD = d; }
+      }
+    });
+    return best;
+  }
+
+  // ---------------------------------------------------------------------
+  // Input: touch + mouse
+  // ---------------------------------------------------------------------
+  let activeTouch = null;
+  let mouseDown = false;
+  let parentTimer = null;
+
+  function toCanvas(clientX, clientY) {
+    const r = canvas.getBoundingClientRect();
+    return { x: clientX - r.left, y: clientY - r.top };
+  }
+
+  function findTouch(list, id) {
+    for (let i = 0; i < list.length; i++) if (list[i].identifier === id) return list[i];
+    return null;
+  }
+
+  function cancelParentHold() {
+    if (parentTimer) { clearTimeout(parentTimer); parentTimer = null; }
+  }
+
+  function onDown(p) {
+    unlockAudio();
+    const t = now();
+
+    if (state.phase === 'start' || state.phase === 'between') {
+      state.lastInteraction = t;
+      const g = starGeom();
+      if (Math.hypot(p.x - g.cx, p.y - g.cy) <= g.R * 1.8) { startRound(); return; }
+    } else if (state.phase === 'play' && state.step === 'freeze') {
+      // Only the freeze listens for taps. During the music taps are simply ignored.
+      state.lastInteraction = t;
+      const i = findMat(p);
+      if (i >= 0) { tapMat(i, t); return; }
+    }
+
+    // Hidden parent view: hold the top-left corner still for 3 seconds.
+    if (p.x < CONFIG.PARENT_CORNER_PX && p.y < CONFIG.PARENT_CORNER_PX) {
+      cancelParentHold();
+      parentTimer = setTimeout(openParent, CONFIG.PARENT_HOLD_MS);
+    }
+  }
+
+  function onMove(p) {
+    if (parentTimer && (p.x >= CONFIG.PARENT_CORNER_PX || p.y >= CONFIG.PARENT_CORNER_PX)) cancelParentHold();
+  }
+
+  function onUp() {
+    cancelParentHold();
+  }
+
+  canvas.addEventListener('touchstart', e => {
+    e.preventDefault();
+    if (activeTouch !== null) return;          // one finger at a time
+    const t = e.changedTouches[0];
+    activeTouch = t.identifier;
+    onDown(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  canvas.addEventListener('touchmove', e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (t) onMove(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  const endTouch = e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (!t) return;
+    activeTouch = null;
+    onUp();
+  };
+  canvas.addEventListener('touchend', endTouch, { passive: false });
+  canvas.addEventListener('touchcancel', endTouch, { passive: false });
+
+  canvas.addEventListener('mousedown', e => { mouseDown = true; onDown(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mousemove', e => { if (mouseDown) onMove(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mouseup', () => {
+    if (!mouseDown) return;
+    mouseDown = false;
+    onUp();
+  });
+
+  // ---------------------------------------------------------------------
+  // Parent view (hidden, local data only)
+  // ---------------------------------------------------------------------
+  const parentEl = document.getElementById('parent');
+  const parentBody = document.getElementById('parentBody');
+
+  function el(tag, text) {
+    const node = document.createElement(tag);
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function openParent() {
+    parentTimer = null;
+    const calls = progress.sessions.reduce((a, s) => a + s.rounds.reduce((b, r) => b + r.calls, 0), 0);
+    const firstTry = progress.sessions.reduce((a, s) => a + s.rounds.reduce((b, r) => b + r.firstTry, 0), 0);
+
+    parentBody.textContent = '';
+    parentBody.appendChild(el('div', `Full games finished: ${progress.gamesCompleted}`));
+    parentBody.appendChild(el('div', `Rounds finished: ${progress.roundsCompleted}`));
+    parentBody.appendChild(el('div', `Colors found: ${progress.found}`));
+    parentBody.appendChild(el('div', `Found on the first try: ${calls ? Math.round(100 * firstTry / calls) : 0}%`));
+
+    const recent = progress.sessions.slice(-6).reverse();
+    if (recent.length) {
+      const table = el('table');
+      const head = el('tr');
+      ['When', 'Rounds', 'Top level', 'Slips'].forEach(h => head.appendChild(el('th', h)));
+      table.appendChild(head);
+      recent.forEach(s => {
+        const tr = el('tr');
+        const when = new Date(s.startedAt);
+        tr.appendChild(el('td', when.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' ' +
+          when.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })));
+        tr.appendChild(el('td', `${s.rounds.length}/${CONFIG.ROUNDS}`));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => Math.max(a, r.level), 0) || '-')));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => a + r.slips, 0))));
+        table.appendChild(tr);
+      });
+      parentBody.appendChild(table);
+    }
+    parentEl.hidden = false;
+    log('Parent view opened', progress);
+  }
+
+  parentEl.addEventListener('click', () => { parentEl.hidden = true; });
+
+  // Read-only debug hooks for the Android/desktop console.
+  window.MusicalColorFreeze = {
+    progress: () => JSON.parse(JSON.stringify(progress)),
+    state: () => ({
+      phase: state.phase,
+      step: state.step,
+      listening: state.phase === 'play' && state.step === 'freeze',
+      round: state.round,
+      level: state.tier + 1,
+      freezesDone: state.freezesDone,
+      calledColor: state.target >= 0 ? state.mats[state.target].color : null,
+      correctIndex: state.target,
+      mats: state.mats.map((m, i) => ({ index: i, color: m.color, x: m.x, y: m.y, w: m.w, h: m.h, correct: i === state.target })),
+      star: (state.phase === 'start' || state.phase === 'between') ? { x: starGeom().cx, y: starGeom().cy } : null,
+    }),
+  };
+
+  // ---------------------------------------------------------------------
+  // Drawing primitives
+  // ---------------------------------------------------------------------
+  function roundRectPath(x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  // A soft rounded rug: shadow, body, lighter centre panel, stitched border, fringe.
+  function drawMat(m, t, glow) {
+    const col = MAT_COLORS[m.color].hex;
+    let dx = 0, sx = 1, sy = 1;
+
+    const wp = (t - m.wobbleT0) / CONFIG.WOBBLE_MS;
+    if (wp >= 0 && wp < 1) dx = Math.sin(wp * Math.PI * 4) * m.w * 0.045 * (1 - wp) * MOTION;
+    const bp = (t - m.bounceT0) / CONFIG.BOUNCE_MS;
+    if (bp >= 0 && bp < 1) { const k = Math.sin(Math.PI * bp); sx += 0.05 * k; sy -= 0.1 * k; }
+
+    ctx.save();
+    ctx.translate(m.x + dx, m.y);
+    ctx.scale(sx, sy);
+    const w = m.w, h = m.h;
+
+    // Scaffolding hint: a soft halo around the right rug.
+    if (glow > 0) {
+      const g = h * (0.18 + 0.2 * glow);
+      ctx.globalAlpha = 0.3 + 0.35 * glow;
+      ctx.fillStyle = shade(col, 0.45);
+      ctx.beginPath();
+      roundRectPath(-w / 2 - g, -h / 2 - g, w + g * 2, h + g * 2, h * 0.5 + g);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    // Shadow on the floor.
+    ctx.fillStyle = 'rgba(74, 64, 54, 0.12)';
+    ctx.beginPath();
+    roundRectPath(-w / 2 + w * 0.02, -h / 2 + h * 0.12, w * 0.96, h, h * 0.48);
+    ctx.fill();
+
+    // Fringe on the short ends.
+    ctx.strokeStyle = shade(col, -0.12);
+    ctx.lineCap = 'round';
+    ctx.lineWidth = Math.max(1.5, w * 0.014);
+    for (let k = 0; k < 5; k++) {
+      const fy = -h * 0.24 + k * h * 0.12;
+      ctx.beginPath(); ctx.moveTo(-w / 2 + h * 0.06, fy); ctx.lineTo(-w / 2 - w * 0.045, fy); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(w / 2 - h * 0.06, fy); ctx.lineTo(w / 2 + w * 0.045, fy); ctx.stroke();
+    }
+
+    // Body.
+    ctx.beginPath();
+    roundRectPath(-w / 2, -h / 2, w, h, h * 0.46);
+    ctx.fillStyle = col;
+    ctx.fill();
+    ctx.lineWidth = Math.max(2, w * 0.02);
+    ctx.strokeStyle = shade(col, -0.2);
+    ctx.stroke();
+
+    // Lighter centre panel.
+    ctx.beginPath();
+    roundRectPath(-w * 0.3, -h * 0.24, w * 0.6, h * 0.48, h * 0.24);
+    ctx.fillStyle = shade(col, 0.2);
+    ctx.fill();
+
+    // Stitched border.
+    ctx.setLineDash([w * 0.03, w * 0.025]);
+    ctx.lineWidth = Math.max(1.5, w * 0.012);
+    ctx.strokeStyle = shade(col, 0.42);
+    ctx.beginPath();
+    roundRectPath(-w / 2 + w * 0.06, -h / 2 + h * 0.12, w - w * 0.12, h - h * 0.24, h * 0.36);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    ctx.restore();
+  }
+
+  // Shoulder-to-hand vector for an arm at angle a (0 = hanging down, PI = straight up).
+  function handPos(side, a, s) {
+    const len = s * 0.46;
+    return { x: side * s * 0.52 + side * Math.sin(a) * len, y: -s * 0.98 + Math.cos(a) * len };
+  }
+
+  function drawArm(side, a, s, fur, line) {
+    ctx.save();
+    ctx.translate(side * s * 0.52, -s * 0.98);
+    ctx.rotate(-side * a);
+    const aw = s * 0.22, len = s * 0.46;
+    ctx.beginPath();
+    roundRectPath(-aw / 2, -aw / 2, aw, len + aw / 2, aw / 2);
+    ctx.fillStyle = fur;
+    ctx.fill();
+    ctx.lineWidth = line;
+    ctx.strokeStyle = shade(fur, -0.3);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawBalloon(bx, by, s, color, scale, alpha) {
+    const col = MAT_COLORS[color].hex;
+    scale = Math.max(0.01, scale);           // easing can dip a hair below zero
+    const rx = s * 0.56 * scale, ry = s * 0.67 * scale;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    // Knot.
+    ctx.fillStyle = shade(col, -0.15);
+    ctx.beginPath();
+    ctx.moveTo(bx, by + ry * 0.92);
+    ctx.lineTo(bx - rx * 0.16, by + ry * 1.12);
+    ctx.lineTo(bx + rx * 0.16, by + ry * 1.12);
+    ctx.closePath();
+    ctx.fill();
+    // Body.
+    ctx.beginPath();
+    ctx.ellipse(bx, by, rx, ry, 0, 0, TAU);
+    ctx.fillStyle = col;
+    ctx.fill();
+    ctx.lineWidth = Math.max(1.5, s * 0.05);
+    ctx.strokeStyle = shade(col, -0.22);
+    ctx.stroke();
+    // Shine.
+    ctx.globalAlpha = alpha * 0.5;
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.ellipse(bx - rx * 0.38, by - ry * 0.38, rx * 0.17, ry * 0.25, -0.5, 0, TAU);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // The bear. Feet at (0, 0) in local space; s is its size unit.
+  // pose: { sy, tilt, armL, armR, eyes, mouth, balloon: { color, scale, sway } | null }
+  function drawBear(x, y, s, pose, t) {
+    const fur = COLORS.fur;
+    const line = Math.max(1.5, s * 0.06);
+    const outline = shade(fur, -0.3);
+    const sy = pose.sy, sx = 1 + (1 - sy) * 0.7;
+
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(pose.tilt);
+    ctx.scale(sx, sy);
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+
+    // Balloon string first, so it sits behind the hand.
+    if (pose.balloon) {
+      const hand = handPos(1, pose.armR, s);
+      const b = pose.balloon;
+      const bx = hand.x + s * 0.18 + b.sway, by = hand.y - s * 1.2;
+      ctx.strokeStyle = 'rgba(74, 64, 54, 0.55)';
+      ctx.lineWidth = Math.max(1, s * 0.03);
+      ctx.beginPath();
+      ctx.moveTo(hand.x, hand.y);
+      ctx.quadraticCurveTo(hand.x - s * 0.12 + b.sway * 0.4, hand.y - s * 0.4, bx, by + s * 0.67 * Math.max(0.01, b.scale) * 1.1);
+      ctx.stroke();
+      drawBalloon(bx, by, s, b.color, b.scale, 1);
+    }
+
+    // Feet.
+    ctx.fillStyle = shade(fur, -0.08);
+    ctx.strokeStyle = outline;
+    ctx.lineWidth = line;
+    for (const side of [-1, 1]) {
+      ctx.beginPath();
+      ctx.ellipse(side * s * 0.3, -s * 0.1, s * 0.22, s * 0.13, 0, 0, TAU);
+      ctx.fill();
+      ctx.stroke();
+    }
+
+    // Arms sit behind the body so only the outer part shows.
+    drawArm(-1, pose.armL, s, fur, line);
+    drawArm(1, pose.armR, s, fur, line);
+
+    // Ears.
+    for (const side of [-1, 1]) {
+      ctx.beginPath();
+      ctx.arc(side * s * 0.44, -s * 1.5, s * 0.2, 0, TAU);
+      ctx.fillStyle = fur;
+      ctx.fill();
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(side * s * 0.44, -s * 1.5, s * 0.1, 0, TAU);
+      ctx.fillStyle = COLORS.earInner;
+      ctx.fill();
+    }
+
+    // Body (one round bean, head and tummy together).
+    ctx.beginPath();
+    ctx.ellipse(0, -s * 0.86, s * 0.66, s * 0.76, 0, 0, TAU);
+    ctx.fillStyle = fur;
+    ctx.fill();
+    ctx.stroke();
+
+    // Tummy.
+    ctx.beginPath();
+    ctx.ellipse(0, -s * 0.5, s * 0.38, s * 0.3, 0, 0, TAU);
+    ctx.fillStyle = COLORS.belly;
+    ctx.fill();
+
+    // Muzzle and nose.
+    ctx.beginPath();
+    ctx.ellipse(0, -s * 0.98, s * 0.22, s * 0.16, 0, 0, TAU);
+    ctx.fillStyle = COLORS.belly;
+    ctx.fill();
+    ctx.fillStyle = COLORS.ink;
+    ctx.beginPath();
+    ctx.ellipse(0, -s * 1.04, s * 0.07, s * 0.05, 0, 0, TAU);
+    ctx.fill();
+
+    // Eyes: open (with a slow, regular blink) or happy arcs.
+    ctx.strokeStyle = COLORS.ink;
+    ctx.fillStyle = COLORS.ink;
+    ctx.lineWidth = Math.max(1.5, s * 0.06);
+    const blink = pose.eyes === 'open' && (t % 3400) < 130;
+    for (const side of [-1, 1]) {
+      const ex = side * s * 0.25, ey = -s * 1.2;
+      if (pose.eyes === 'happy') {
+        ctx.beginPath(); ctx.arc(ex, ey + s * 0.03, s * 0.08, 1.15 * Math.PI, 1.85 * Math.PI); ctx.stroke();
+      } else if (blink) {
+        ctx.beginPath(); ctx.moveTo(ex - s * 0.07, ey); ctx.lineTo(ex + s * 0.07, ey); ctx.stroke();
+      } else {
+        ctx.beginPath(); ctx.arc(ex, ey, s * 0.075, 0, TAU); ctx.fill();
+        ctx.fillStyle = '#fff';
+        ctx.beginPath(); ctx.arc(ex + s * 0.025, ey - s * 0.03, s * 0.025, 0, TAU); ctx.fill();
+        ctx.fillStyle = COLORS.ink;
+      }
+    }
+
+    // Mouth.
+    ctx.lineWidth = Math.max(1.2, s * 0.045);
+    if (pose.mouth === 'o') {
+      ctx.beginPath(); ctx.ellipse(0, -s * 0.9, s * 0.055, s * 0.07, 0, 0, TAU); ctx.fill();
+    } else if (pose.mouth === 'grin') {
+      ctx.beginPath();
+      ctx.moveTo(-s * 0.1, -s * 0.94);
+      ctx.quadraticCurveTo(0, -s * 0.8, s * 0.1, -s * 0.94);
+      ctx.closePath();
+      ctx.fill();
+    } else {
+      ctx.beginPath(); ctx.arc(0, -s * 0.97, s * 0.09, 0.2 * Math.PI, 0.8 * Math.PI); ctx.stroke();
+    }
+
+    // Cheeks.
+    ctx.globalAlpha = 0.4;
+    ctx.fillStyle = COLORS.cheek;
+    for (const side of [-1, 1]) {
+      ctx.beginPath(); ctx.ellipse(side * s * 0.42, -s * 0.98, s * 0.09, s * 0.055, 0, 0, TAU); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawStar(cx, cy, R, fill, face) {
+    ctx.save();
+    ctx.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const rad = i % 2 === 0 ? R : R * 0.5;
+      const a = -Math.PI / 2 + i * Math.PI / 5;
+      const x = cx + rad * Math.cos(a), y = cy + rad * Math.sin(a);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    ctx.lineJoin = 'round';
+    if (fill) {
+      ctx.fillStyle = fill;
+      ctx.fill();
+      ctx.strokeStyle = fill;            // same-colour stroke rounds the tips
+      ctx.lineWidth = Math.max(2, R * 0.16);
+      ctx.stroke();
+    } else {
+      ctx.strokeStyle = 'rgba(74, 64, 54, 0.25)';
+      ctx.lineWidth = Math.max(2, R * 0.14);
+      ctx.stroke();
+    }
+
+    if (face) {
+      ctx.fillStyle = COLORS.ink;
+      ctx.beginPath(); ctx.arc(cx - R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.arc(cx + R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.strokeStyle = COLORS.ink;
+      ctx.lineWidth = Math.max(2, R * 0.05);
+      ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.arc(cx, cy + R * 0.06, R * 0.17, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+      ctx.globalAlpha = 0.35;
+      ctx.fillStyle = COLORS.cheek;
+      ctx.beginPath(); ctx.ellipse(cx - R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(cx + R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // Same ring of sparkles from every rug, every time (no random rewards).
+  function spawnParticles(m, t) {
+    const col = MAT_COLORS[m.color].hex;
+    for (let i = 0; i < 10; i++) {
+      const a = -Math.PI / 2 + (i - 4.5) * 0.3;
+      state.particles.push({ x0: m.x, y0: m.y - m.h * 0.2, dx: Math.cos(a), dy: Math.sin(a), dist: m.w * 0.6, t0: t, life: 900, color: i % 2 ? COLORS.star : shade(col, 0.1) });
+    }
+  }
+
+  function drawParticles(t) {
+    state.particles = state.particles.filter(p => t - p.t0 < p.life);
+    for (const p of state.particles) {
+      const k = (t - p.t0) / p.life;
+      const e = easeOutCubic(k);
+      ctx.globalAlpha = 1 - k;
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x0 + p.dx * p.dist * e, p.y0 + p.dy * p.dist * e, L.w * 0.045 * (1 - k * 0.5), 0, TAU);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------------------------------------------------------------------
+  // Screens
+  // ---------------------------------------------------------------------
+  function starGeom() {
+    return { cx: W / 2, cy: H * 0.42, R: Math.min(W, H) * 0.2 };
+  }
+
+  // Start and between-round screen: one big pulsing star to tap, plus 5 slots
+  // that fill up so the child can see the end coming.
+  function drawStarScreen(t) {
+    const { cx, cy, R } = starGeom();
+    const amp = reduceMotion ? 0.03 : 0.07;
+    const k = 1 + amp * (0.5 - 0.5 * Math.cos(TAU * t / 1400));
+    drawStar(cx, cy, R * k, COLORS.star, true);
+
+    const sr = R * 0.16, gap = sr * 2.8, y = cy + R * 1.35;
+    for (let i = 0; i < CONFIG.ROUNDS; i++) {
+      drawStar(cx + (i - (CONFIG.ROUNDS - 1) / 2) * gap, y, sr, i < state.round ? COLORS.star : null, false);
+    }
+  }
+
+  function fitFont(text, weight, size, maxW) {
+    ctx.font = `${weight} ${size}px ${FONT}`;
+    while (size > 12 && ctx.measureText(text).width > maxW) {
+      size -= 1;
+      ctx.font = `${weight} ${size}px ${FONT}`;
+    }
+    return size;
+  }
+
+  // Static end screen. No buttons: the session is over.
+  function drawEnd() {
+    const gh = H * 0.14;
+    ctx.fillStyle = COLORS.grass;
+    ctx.beginPath();
+    ctx.moveTo(0, H - gh);
+    ctx.quadraticCurveTo(W / 2, H - gh * 1.5, W, H - gh);
+    ctx.lineTo(W, H);
+    ctx.lineTo(0, H);
+    ctx.closePath();
+    ctx.fill();
+
+    const R = Math.min(W, H) * 0.2;
+    const cy = H * 0.36;
+    drawStar(W / 2, cy, R, COLORS.star, true);
+
+    const big = clamp(Math.min(W, H) * 0.1, 26, 68);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = COLORS.ink;
+    const top = cy + R * 1.25;
+    fitFont('Great Job!', 800, big, W * 0.9);
+    ctx.fillText('Great Job!', W / 2, top + big * 0.5);
+    fitFont('Time to play outside!', 700, Math.round(big * 0.62), W * 0.9);
+    ctx.fillText('Time to play outside!', W / 2, top + big * 1.55);
+  }
+
+  // How strongly the balloon pulses, and which rug (if any) glows right now.
+  function guidance(t) {
+    const out = { pulse: 1, hintMat: -1, glow: 0 };
+    if (state.phase !== 'play' || state.step !== 'freeze') return out;
+    const amp = reduceMotion ? 0.05 : 0.12;
+    const idle = t - state.lastInteraction;
+
+    // Scaffolding: after 2 slips on this call the right rug glows.
+    if (state.slips >= 2) { out.hintMat = state.target; out.glow = 0.5 + 0.5 * Math.sin(TAU * t / 1300); }
+    if (idle <= CONFIG.IDLE_PULSE_MS) return out;
+
+    const wave = 0.5 - 0.5 * Math.cos(TAU * (idle - CONFIG.IDLE_PULSE_MS) / 1300);
+    out.pulse = 1 + amp * wave;
+
+    // First round: if the child has not found the mechanic yet, glow the right rug too.
+    const tutorial = state.round === 0 && state.freezesDone === 0 && idle > CONFIG.TUTORIAL_HINT_MS;
+    if (tutorial) { out.hintMat = state.target; out.glow = wave; }
+    return out;
+  }
+
+  // Where the bear is and how it stands, for the current step.
+  function heroPose(t, g) {
+    const s = L.cs;
+    const mats = state.mats;
+    const pose = { x: 0, y: 0, lift: 0, sy: 1, tilt: 0, armL: 0.45, armR: 0.45, eyes: 'open', mouth: 'smile', balloon: null };
+    const placeOn = i => { const p = standPos(mats[i]); pose.x = p.x; pose.y = p.y; };
+    const hopBetween = (a, b, p) => {
+      const pa = standPos(mats[a]), pb = standPos(mats[b]);
+      const e = easeInOutQuad(p);
+      const hopH = (L.w * 0.35 + Math.hypot(pb.x - pa.x, pb.y - pa.y) * 0.18) * (reduceMotion ? 0.5 : 1);
+      pose.x = lerp(pa.x, pb.x, e);
+      pose.y = lerp(pa.y, pb.y, e);
+      pose.lift = Math.sin(Math.PI * p) * hopH;
+      pose.sy = 1 + 0.07 * Math.sin(Math.PI * p) * MOTION;
+    };
+    const balloon = (scale, sway) => ({ color: mats[state.target].color, scale, sway });
+
+    if (state.phase === 'celebrate') {
+      placeOn(state.hero.mat);
+      const k = (t - state.celebrateStart) / 480;
+      pose.lift = Math.abs(Math.sin(Math.PI * k)) * s * 0.5 * MOTION;
+      pose.armL = pose.armR = 2.5;
+      pose.eyes = 'happy';
+      pose.mouth = 'grin';
+      return pose;
+    }
+
+    const st = state.step;
+    if (st === 'dance') {
+      const beat = danceBeat(t);
+      const hop = state.dance.hops.find(h => beat >= h.beat && beat < h.beat + CONFIG.HOP_BEATS);
+      pose.eyes = 'happy';
+      pose.mouth = 'grin';
+      if (hop) {
+        hopBetween(hop.from, hop.to, (beat - hop.beat) / CONFIG.HOP_BEATS);
+        pose.armL = pose.armR = 2.3;
+      } else {
+        // Bop on the beat: squash on each beat, sway side to side, arms take turns.
+        const last = state.dance.hops.filter(h => h.beat <= beat).pop();
+        placeOn(last ? last.to : state.hero.mat);
+        const frac = beat % 1;
+        pose.sy = 1 - 0.08 * Math.pow(1 - frac, 3) * MOTION;
+        pose.lift = Math.abs(Math.sin(Math.PI * beat)) * s * 0.12 * MOTION;
+        pose.tilt = 0.13 * Math.sin(Math.PI * beat) * MOTION;
+        const sw = Math.sin(Math.PI * beat);
+        pose.armL = 0.6 + 1.7 * (0.5 + 0.5 * sw) * MOTION;
+        pose.armR = 0.6 + 1.7 * (0.5 - 0.5 * sw) * MOTION;
+      }
+    } else if (st === 'freeze') {
+      placeOn(state.hero.mat);
+      pose.armR = 2.75;
+      pose.armL = 0.85;
+      pose.mouth = t - state.stepT0 < 700 ? 'o' : 'smile';
+      const pop = clamp((t - state.balloonT0) / CONFIG.BALLOON_POP_MS, 0, 1);
+      let sway = Math.sin(t / 650) * s * 0.05 * MOTION;
+      const bp = (t - state.balloonBobT0) / 600;
+      if (bp >= 0 && bp < 1) sway += Math.sin(bp * Math.PI * 3) * s * 0.18 * (1 - bp) * MOTION;
+      pose.balloon = balloon(easeOutBack(pop) * g.pulse, sway);
+    } else if (st === 'hop') {
+      const p = clamp((t - state.stepT0) / CONFIG.HOP_MS, 0, 1);
+      hopBetween(state.hero.from, state.hero.to, p);
+      pose.armR = 2.75;
+      pose.armL = 2.2;
+      pose.eyes = 'happy';
+      pose.mouth = 'grin';
+      pose.balloon = balloon(1, 0);
+    } else if (st === 'cheer') {
+      placeOn(state.hero.mat);
+      const e = clamp((t - state.stepT0) / CONFIG.CHEER_MS, 0, 1);
+      pose.tilt = 0.2 * Math.sin(TAU * e * 3) * (1 - e) * MOTION;
+      pose.sy = 1 - 0.1 * Math.pow(1 - e, 4) * MOTION;
+      pose.armL = pose.armR = 2.5;
+      pose.eyes = 'happy';
+      pose.mouth = 'grin';
+    } else {
+      // 'ready': standing still, breathing softly.
+      placeOn(state.hero.mat);
+      pose.sy = 1 + 0.015 * Math.sin(t / 420) * MOTION;
+    }
+    return pose;
+  }
+
+  function drawHero(t, g) {
+    if (!state.mats.length) return;
+    const s = L.cs;
+    const pose = heroPose(t, g);
+
+    // Shadow stays on the floor and shrinks while the bear is in the air.
+    const k = 1 - clamp(pose.lift / (s * 2), 0, 0.5);
+    ctx.fillStyle = 'rgba(74, 64, 54, 0.16)';
+    ctx.beginPath();
+    ctx.ellipse(pose.x, pose.y, s * 0.6 * k, s * 0.15 * k, 0, 0, TAU);
+    ctx.fill();
+
+    drawBear(pose.x, pose.y - pose.lift, s, pose, t);
+
+    // After landing, the balloon floats up and away (the same every time).
+    if (state.phase === 'play' && state.step === 'cheer' && state.hero.mat >= 0) {
+      const e = clamp((t - state.stepT0) / CONFIG.CHEER_MS, 0, 1);
+      const hand = handPos(1, 2.75, s);
+      const color = state.mats[state.hero.mat].color;
+      drawBalloon(pose.x + hand.x + s * 0.18, pose.y + hand.y - s * 1.2 - easeOutCubic(e) * s * 2.5, s, color, 1 - 0.3 * e, 1 - e);
+    }
+  }
+
+  function drawPlay(t) {
+    const g = guidance(t);
+    state.mats.forEach((m, i) => drawMat(m, t, i === g.hintMat ? g.glow : 0));
+    drawHero(t, g);
+    drawParticles(t);
+  }
+
+  // ---------------------------------------------------------------------
+  // Main loop
+  // ---------------------------------------------------------------------
+  function update(t) {
+    if (state.phase === 'play') {
+      if (state.step === 'ready' && t - state.stepT0 >= state.readyMs) {
+        startDance(t);
+      } else if (state.step === 'dance') {
+        scheduleMusic(t);
+        if (danceBeat(t) >= state.dance.stopBeat) freeze(t);
+      } else if (state.step === 'hop' && t - state.stepT0 >= CONFIG.HOP_MS) {
+        land(t);
+      } else if (state.step === 'cheer' && t - state.stepT0 >= CONFIG.CHEER_MS) {
+        finishFreeze(t);
+      }
+    }
+
+    if (state.phase === 'celebrate' && t - state.celebrateStart >= CONFIG.CELEBRATE_MS) {
+      if (state.round >= CONFIG.ROUNDS) enterEnd();
+      else state.phase = 'between';
+    }
+  }
+
+  function render(t) {
+    ctx.fillStyle = COLORS.bg;
+    ctx.fillRect(0, 0, W, H);
+    if (state.phase === 'start' || state.phase === 'between') drawStarScreen(t);
+    else if (state.phase === 'play' || state.phase === 'celebrate') drawPlay(t);
+    else if (state.phase === 'end') drawEnd();
+  }
+
+  let rafId = 0;
+  function frame(t) {
+    update(t);
+    render(t);
+    // The end screen is static: stop the loop entirely.
+    if (state.phase !== 'end') rafId = requestAnimationFrame(frame);
+  }
+
+  function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    DPR = Math.min(window.devicePixelRatio || 1, 2.5);
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    computeLayout();
+    if (state.phase === 'end') render(now());
+  }
+
+  window.addEventListener('resize', resize);
+  window.addEventListener('orientationchange', resize);
+
+  resize();
+  log('Game loaded', { roundsPerSession: CONFIG.ROUNDS, gamesCompletedBefore: progress.gamesCompleted });
+  rafId = requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

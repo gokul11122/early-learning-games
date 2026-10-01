@@ -1,0 +1,1419 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Number Hopscotch</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
+  body {
+    background: #F6F1E7;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  canvas { display: block; width: 100%; height: 100%; }
+
+  #home {
+    position: fixed; top: max(10px, env(safe-area-inset-top)); right: max(10px, env(safe-area-inset-right));
+    width: 52px; height: 52px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+    background: rgba(255, 253, 248, 0.85); box-shadow: 0 2px 8px rgba(74, 64, 54, 0.15);
+    -webkit-tap-highlight-color: transparent; z-index: 5;
+  }
+  #home:active { transform: scale(0.94); }
+
+  /* Hidden parent view: press and hold the top-left corner for 3 seconds. */
+  #parent {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: rgba(74, 64, 54, 0.55); padding: 16px; box-sizing: border-box; z-index: 10;
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #4A4036;
+  }
+  #parent[hidden] { display: none; }
+  #parent .card { background: #FFFDF8; border-radius: 16px; padding: 20px 22px; max-width: 380px; width: 100%; box-shadow: 0 10px 30px rgba(0,0,0,0.18); }
+  #parent h2 { margin: 0 0 10px; font-size: 18px; }
+  #parent table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+  #parent th, #parent td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #EDE5D6; }
+  #parent .hint { margin: 12px 0 0; font-size: 12px; opacity: 0.7; }
+</style>
+</head>
+<body>
+<canvas id="game" aria-label="Number hopscotch game"></canvas>
+<a id="home" href="../../index.html" aria-label="Home">
+  <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><path d="M4 11.5 12 5l8 6.5V19a1 1 0 0 1-1 1h-4.5v-5h-5v5H5a1 1 0 0 1-1-1z" fill="none" stroke="#4A4036" stroke-width="2" stroke-linejoin="round"/></svg>
+</a>
+
+<div id="parent" hidden>
+  <div class="card">
+    <h2>Progress on this device</h2>
+    <div id="parentBody"></div>
+    <p class="hint">Stored only on this device. Tap anywhere to close.</p>
+  </div>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  /* =====================================================================
+   * NUMBER HOPSCOTCH
+   * ELOF domain: Cognition (emergent mathematical thinking: counting,
+   *              subitizing, numeral recognition, early addition).
+   *
+   * A chalk hopscotch grid of numeral tiles on a soft pavement. A dot card
+   * at the top shows how many (spoken too: "Find three!"). The child taps the
+   * tile with the matching numeral and Bunny hops onto it with a chime.
+   *
+   * Design rules this file follows (from the brief):
+   *  - Coherence: only the dot card, the grid and Bunny. No score, no menus,
+   *    no text instructions. Numerals are the learning content itself.
+   *  - Works without speech: the dot card alone says what to find.
+   *  - Control of error: a wrong tile wobbles gently and nothing else happens.
+   *  - Forgiving hitboxes: the tappable cell is bigger than the drawn tile,
+   *    and the edge cells reach well past the grid.
+   *  - Visual prompts: when idle, the dot card breathes and a soft wave runs
+   *    up the grid (it shows the tiles are tappable without giving the answer).
+   *  - Self-paced: no timers anywhere the child can see or feel.
+   *  - Natural stopping point: 5 rounds of 3 numbers, then a static
+   *    "play outside" screen with no "play again" button.
+   * ===================================================================== */
+
+  // ---------------------------------------------------------------------
+  // Configuration
+  // ---------------------------------------------------------------------
+  const CONFIG = {
+    ROUNDS: 5,                     // hard session limit (natural stopping point)
+    TARGETS_PER_ROUND: 3,          // numbers to find in one round
+    STORAGE_KEY: 'number-hopscotch.v1',
+    IDLE_PULSE_MS: 1500,           // idle time before the dot card pulses
+    TUTORIAL_HINT_MS: 5000,        // first round: idle time before the right tile glows
+    HINT_AFTER_SLIPS: 2,           // wrong taps on one number before the right tile glows
+    HOP_MS: 520,                   // shortest hop; long hops take a little longer
+    HOP_MAX_MS: 880,
+    LAND_MS: 260,                  // landing squash
+    WOBBLE_MS: 480,                // wrong tile wobble
+    BOUNCE_MS: 320,                // right tile bounce when Bunny lands
+    NEXT_TARGET_MS: 900,           // pause on the found number before the next dot card
+    FLIP_MS: 420,                  // dot card flip to the next number
+    POP_MS: 380,                   // dot card pop-in at round start
+    CELEBRATE_MS: 1600,            // round-complete celebration length
+    FAST_MS_PER_TARGET: 6000,      // "quick" threshold for difficulty step-up (includes the hop)
+    PARENT_HOLD_MS: 3000,          // hold time for the hidden parent view
+    PARENT_CORNER_PX: 80,
+    HOME_RESERVE_PX: 76,           // keep the top-right corner clear for the home button
+    START_PAD: 1.0,                // length of Bunny's start square, in cells
+  };
+
+  const COLORS = {
+    bg: '#F6F1E7',
+    ink: '#4A4036',
+    star: '#F6C85F',
+    grass: '#B9D7A8',
+    cheek: '#F2A88A',
+    pavement: '#E7DFD2',
+    pavementEdge: '#D9CDBB',
+    card: '#FFFDF8',
+    // One chalk colour per numeral, always the same (predictable).
+    chalk: ['#E9967A', '#7FAAD6', '#86BE84', '#E2B84F', '#A493D1', '#DE97B5', '#6FB9B2', '#E58F6F', '#8C9FD8'],
+    dotSingle: '#6F9FD0',
+    dotA: '#6F9FD0',               // first group of a sum card
+    dotB: '#E8906F',               // second group of a sum card
+    fur: '#FFFDF8',
+    furLine: '#BBA993',
+    belly: '#F3EADC',
+    earPink: '#F2B8C6',
+    nose: '#E99AAE',
+  };
+
+  const FONT = 'ui-rounded, "Arial Rounded MT Bold", "Nunito", system-ui, -apple-system, sans-serif';
+  const NUMBER_WORDS = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine'];
+
+  // Classic hopscotch rows: singles and side-by-side doubles.
+  const ROW_PATTERN = [[1], [2], [3], [4, 5], [6], [7, 8], [9]];
+
+  // Difficulty ladder for dynamic difficulty adjustment (scaffolding).
+  const TIERS = [
+    { max: 3, sums: false },   // numerals 1-3, dot card
+    { max: 5, sums: false },   // numerals 1-5, dot card
+    { max: 9, sums: false },   // numerals 1-9, dot card (full classic grid)
+    { max: 6, sums: true  },   // two dot groups with a plus, tap the total (2-6)
+  ];
+
+  // Dice-style dot patterns (subitizing friendly), in a -1..1 grid.
+  const DICE = {
+    1: [[0, 0]],
+    2: [[1, -1], [-1, 1]],
+    3: [[1, -1], [0, 0], [-1, 1]],
+    4: [[-1, -1], [1, -1], [-1, 1], [1, 1]],
+    5: [[-1, -1], [1, -1], [0, 0], [-1, 1], [1, 1]],
+    6: [[-1, -1], [-1, 0], [-1, 1], [1, -1], [1, 0], [1, 1]],
+    7: [[-1, -1], [-1, 0], [-1, 1], [0, 0], [1, -1], [1, 0], [1, 1]],
+    8: [[-1, -1], [-1, 0], [-1, 1], [0, -1], [0, 1], [1, -1], [1, 0], [1, 1]],
+    9: [[-1, -1], [-1, 0], [-1, 1], [0, -1], [0, 0], [0, 1], [1, -1], [1, 0], [1, 1]],
+  };
+
+  const TAU = Math.PI * 2;
+  const reduceMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+
+  // ---------------------------------------------------------------------
+  // Small helpers
+  // ---------------------------------------------------------------------
+  const now = () => performance.now();
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const easeOutCubic = t => 1 - Math.pow(1 - t, 3);
+  const easeInOutQuad = t => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
+  const log = (...args) => console.log('[Hopscotch]', ...args);
+
+  function shuffle(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }
+
+  // Mix a hex colour toward black (amt < 0) or white (amt > 0).
+  const shadeCache = new Map();
+  function shade(hex, amt) {
+    const key = hex + amt;
+    if (shadeCache.has(key)) return shadeCache.get(key);
+    const n = parseInt(hex.slice(1), 16);
+    const target = amt < 0 ? 0 : 255;
+    const p = Math.abs(amt);
+    const c = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map(v => Math.round(lerp(v, target, p)));
+    const out = `rgb(${c[0]},${c[1]},${c[2]})`;
+    shadeCache.set(key, out);
+    return out;
+  }
+
+  // Small seeded generator so the pavement texture is identical on every frame.
+  function seeded(seed) {
+    let s = seed >>> 0;
+    return () => {
+      s = (s + 0x6D2B79F5) >>> 0;
+      let t = s;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // Fixed jitter per tile so the chalk lines never shimmer between frames.
+  const jitter = n => Array.from({ length: n }, () => Math.random() * 2 - 1);
+
+  // Pavement speckles in 0..1 space, mapped onto the pavement on every draw.
+  const SPECKLES = (() => {
+    const rnd = seeded(20240611);
+    return Array.from({ length: 240 }, () => ({ u: rnd(), v: rnd(), r: 0.6 + rnd() * 1.4, light: rnd() < 0.45, a: 0.08 + rnd() * 0.14 }));
+  })();
+
+  // ---------------------------------------------------------------------
+  // Canvas setup
+  // ---------------------------------------------------------------------
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  let W = 0, H = 0, DPR = 1;
+
+  // Layout values recomputed on every resize.
+  const L = {
+    m: 16, vertical: true, cp: 80, cc: 80, p0: 0, c0: 0, br: 20,
+    card: { x: 0, y: 0, w: 100, h: 100 },
+    pave: { x: 0, y: 0, w: 0, h: 0 },
+    start: { x: 0, y: 0, w: 0, h: 0 },
+  };
+
+  // ---------------------------------------------------------------------
+  // Game state
+  // ---------------------------------------------------------------------
+  const state = {
+    phase: 'start',          // 'start' | 'play' | 'celebrate' | 'between' | 'end'
+    round: 0,                // rounds completed this session
+    tier: 0,                 // index into TIERS
+    rows: [],                // numerals per hopscotch row for this round
+    sums: false,             // this round shows "a + b" dot cards
+    tiles: [],
+    targets: [],             // { n, a, b, slips, found }
+    targetIdx: 0,
+    prevTarget: null,        // shown on the first half of a card flip
+    step: 'ask',             // 'ask' | 'hop' | 'next' | 'done'
+    stepAt: 0,               // when 'next' turns into the next dot card
+    flipT0: -1e9,
+    popT0: -1e9,
+    cardTapT0: -1e9,
+    bunny: { at: 0, from: 0, hopT0: -1e9, hopDur: CONFIG.HOP_MS, landT0: -1e9 }, // at: 0 = start square, else numeral
+    lastInteraction: 0,
+    roundStart: 0,
+    roundSlips: 0,           // wrong taps this round
+    completeAt: 0,           // time to fire completeRound()
+    celebrateStart: 0,
+    particles: [],
+  };
+
+  const currentTarget = () => state.targets[Math.min(state.targetIdx, state.targets.length - 1)] || null;
+  const tileByN = n => state.tiles.find(tl => tl.n === n) || null;
+
+  // ---------------------------------------------------------------------
+  // Local progress tracking (localStorage, never leaves the device)
+  // ---------------------------------------------------------------------
+  function freshProgress() {
+    return { version: 1, gamesCompleted: 0, roundsCompleted: 0, numbersFound: 0, slips: 0, lastPlayed: null, sessions: [] };
+  }
+
+  function loadProgress() {
+    try {
+      const raw = window.localStorage.getItem(CONFIG.STORAGE_KEY);
+      if (raw) {
+        const data = JSON.parse(raw);
+        if (data && data.version === 1 && Array.isArray(data.sessions)) return data;
+      }
+    } catch (e) {
+      console.warn('[Hopscotch] Progress could not be loaded (storage unavailable):', e && e.message);
+    }
+    return freshProgress();
+  }
+
+  function saveProgress() {
+    try {
+      window.localStorage.setItem(CONFIG.STORAGE_KEY, JSON.stringify(progress));
+      log('Progress saved', { gamesCompleted: progress.gamesCompleted, roundsCompleted: progress.roundsCompleted });
+    } catch (e) {
+      console.warn('[Hopscotch] Progress could not be saved (storage unavailable):', e && e.message);
+    }
+  }
+
+  const progress = loadProgress();
+  let session = null; // created on the first round of this app launch
+
+  function ensureSession() {
+    if (session) return;
+    session = { startedAt: new Date().toISOString(), finished: false, rounds: [] };
+    progress.sessions.push(session);
+    if (progress.sessions.length > 30) progress.sessions.splice(0, progress.sessions.length - 30);
+  }
+
+  // ---------------------------------------------------------------------
+  // Audio: Web Audio tones + optional spoken words
+  // ---------------------------------------------------------------------
+  let actx = null;
+
+  // Browsers only allow audio after a user gesture, so this runs on every pointer down.
+  function unlockAudio() {
+    if (!actx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) { try { actx = new AC(); } catch (e) { actx = null; } }
+    }
+    if (actx && actx.state === 'suspended') actx.resume();
+  }
+
+  function tone(freq, delay, dur, vol = 0.16, type = 'sine') {
+    if (!actx) return;
+    const t = actx.currentTime + delay;
+    const osc = actx.createOscillator();
+    const gain = actx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(vol, t + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    osc.connect(gain).connect(actx.destination);
+    osc.start(t);
+    osc.stop(t + dur + 0.05);
+  }
+
+  // Each numeral always plays the same note of a rising pentatonic scale:
+  // bigger numbers sound higher (predictable, proportional feedback).
+  const NOTE = [0, 523.25, 587.33, 659.25, 783.99, 880, 1046.5, 1174.66, 1318.51, 1567.98];
+  const playHop = () => { tone(392, 0, 0.12, 0.06, 'triangle'); tone(587.33, 0.07, 0.12, 0.045, 'triangle'); };
+  const playChime = n => { const f = NOTE[n]; tone(f, 0, 0.35); tone(f * 1.5, 0.07, 0.4, 0.1); };
+  const playSoft = () => tone(220, 0, 0.18, 0.05, 'sine');          // wrong tile: a quiet low "tok", never a buzzer
+  const playFlip = () => tone(698.46, 0, 0.08, 0.04, 'triangle');
+  const playRoundDone = () => [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => tone(f, i * 0.12, 0.5, 0.12));
+
+  // Spoken words via the Web Speech API. Android WebView usually lacks it,
+  // so this quietly does nothing there and the dot card + tones carry the task.
+  function say(text) {
+    try {
+      if (!('speechSynthesis' in window)) return;
+      window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'en-US';
+      u.rate = 0.85;
+      u.pitch = 1.15;
+      window.speechSynthesis.speak(u);
+    } catch (e) { /* speech is optional */ }
+  }
+
+  function promptText(tg) {
+    return tg.a ? `${NUMBER_WORDS[tg.a]} and ${NUMBER_WORDS[tg.b]}. How many?` : `Find ${NUMBER_WORDS[tg.n]}!`;
+  }
+
+  function announce(first) {
+    const tg = currentTarget();
+    if (!tg) return;
+    say(first ? `Help Bunny hop! ${promptText(tg)}` : promptText(tg));
+    log(`Target ${state.targetIdx + 1}/${CONFIG.TARGETS_PER_ROUND}:`, tg.a ? `${tg.a} + ${tg.b} = ${tg.n}` : tg.n);
+  }
+
+  // ---------------------------------------------------------------------
+  // Rounds and difficulty
+  // ---------------------------------------------------------------------
+  function rowsFor(max) {
+    return ROW_PATTERN.map(r => r.filter(n => n <= max)).filter(r => r.length);
+  }
+
+  // Three different numbers per round, so Bunny never "finds" the tile it stands on.
+  function makeTargets(tier) {
+    const lo = tier.sums ? 2 : 1;
+    const pool = [];
+    for (let n = lo; n <= tier.max; n++) pool.push(n);
+    return shuffle(pool).slice(0, CONFIG.TARGETS_PER_ROUND).map(n => {
+      const a = tier.sums ? 1 + Math.floor(Math.random() * (n - 1)) : 0;
+      return { n, a, b: tier.sums ? n - a : 0, slips: 0, found: false };
+    });
+  }
+
+  function startRound() {
+    ensureSession();
+    const tier = TIERS[state.tier];
+    state.rows = rowsFor(tier.max);
+    state.sums = tier.sums;
+    state.tiles = [];
+    state.rows.forEach((row, ri) => row.forEach((n, ci) => {
+      state.tiles.push({
+        n, row: ri, col: ci, cols: row.length,
+        color: COLORS.chalk[(n - 1) % COLORS.chalk.length],
+        jit: jitter(16),
+        x: 0, y: 0, w: 0, h: 0,      // centre and full cell size (the hit area)
+        wobbleT0: -1e9, bounceT0: -1e9, found: false,
+      });
+    }));
+    state.targets = makeTargets(tier);
+    state.targetIdx = 0;
+    state.prevTarget = null;
+    state.step = 'ask';
+    state.flipT0 = -1e9;
+    state.popT0 = now();
+    state.cardTapT0 = -1e9;
+    state.bunny = { at: 0, from: 0, hopT0: -1e9, hopDur: CONFIG.HOP_MS, landT0: -1e9 };
+    state.roundSlips = 0;
+    state.completeAt = 0;
+    state.particles = [];
+    computeLayout();
+
+    state.phase = 'play';
+    state.roundStart = now();
+    state.lastInteraction = now();
+    log(`Round ${state.round + 1}/${CONFIG.ROUNDS} started at level ${state.tier + 1}:`,
+      tier.sums ? `sums up to ${tier.max}` : `numerals 1-${tier.max}`);
+    announce(state.round === 0);
+    playFlip();
+  }
+
+  function completeRound() {
+    const t = now();
+    const n = state.targets.length;
+    const firstTry = state.targets.filter(tg => tg.slips === 0).length;
+    const ms = t - state.roundStart;
+    const record = {
+      level: state.tier + 1,
+      targets: n,
+      firstTry,
+      slips: state.roundSlips,
+      seconds: Math.round(ms / 100) / 10,
+    };
+
+    session.rounds.push(record);
+    progress.roundsCompleted++;
+    progress.numbersFound += n;
+    progress.slips += state.roundSlips;
+    progress.lastPlayed = new Date().toISOString();
+    state.round++;
+    log('Level completed', record);
+
+    const finalRound = state.round >= CONFIG.ROUNDS;
+    if (finalRound) {
+      session.finished = true;
+      progress.gamesCompleted++;
+    } else {
+      // Praise the effort, not the child's "smartness" (growth mindset).
+      say(state.roundSlips > 0 ? 'You kept trying, and you did it!' : 'You found every number!');
+    }
+    saveProgress();
+    adjustDifficulty(record, ms);
+
+    playRoundDone();
+    const bp = bunnyPose(t);
+    spawnParticles(bp.x, bp.y - L.br * 2, L.br * 3.2, COLORS.star, t);
+    state.phase = 'celebrate';
+    state.celebrateStart = t;
+  }
+
+  // Simple DDA: quick and clean -> one step harder; a real struggle -> one step easier.
+  function adjustDifficulty(record, ms) {
+    const fast = ms / record.targets <= CONFIG.FAST_MS_PER_TARGET;
+    const before = state.tier;
+    if (record.firstTry === record.targets && fast) {
+      state.tier = Math.min(TIERS.length - 1, state.tier + 1);
+    } else if (record.slips >= 3) {
+      state.tier = Math.max(0, state.tier - 1);
+    }
+    if (state.tier !== before) log(`Difficulty ${state.tier > before ? 'up' : 'down'}: level ${before + 1} -> ${state.tier + 1}`);
+  }
+
+  function enterEnd() {
+    state.phase = 'end';
+    say('Great job! Time to play outside!');
+    log('Session finished: end screen shown, no replay offered');
+  }
+
+  // ---------------------------------------------------------------------
+  // Tapping tiles
+  // ---------------------------------------------------------------------
+  function tapTile(tile, t) {
+    const tg = currentTarget();
+    if (!tg) return;
+    if (tile.n === tg.n) {
+      // Right tile: Bunny hops there. The chime fires when Bunny lands.
+      const b = state.bunny;
+      const from = standPoint(b.at), to = standPoint(tile.n);
+      const dist = Math.hypot(to.x - from.x, to.y - from.y);
+      b.from = b.at;
+      b.at = tile.n;
+      b.hopT0 = t;
+      b.hopDur = clamp(CONFIG.HOP_MS + dist * 0.6, CONFIG.HOP_MS, CONFIG.HOP_MAX_MS);
+      state.step = 'hop';
+      playHop();
+      log(`Answer accepted: tapped ${tile.n}${tg.a ? ` for ${tg.a} + ${tg.b}` : ''}, Bunny hops`);
+    } else {
+      // Control of error: the tile wobbles, nothing else changes.
+      tile.wobbleT0 = t;
+      tg.slips++;
+      state.roundSlips++;
+      playSoft();
+      log(`Item rejected: tapped ${tile.n}, looking for ${tg.n} (slip ${tg.slips})`);
+      if (tg.slips === CONFIG.HINT_AFTER_SLIPS) log(`Hint shown: tile ${tg.n} glows`);
+    }
+  }
+
+  // Bunny touches down: sound, tile bounce, sparkles and Bunny's squash share one frame.
+  function landBunny(t) {
+    const b = state.bunny;
+    const tg = currentTarget();
+    const tile = tileByN(b.at);
+    b.landT0 = t;
+    tile.bounceT0 = t;
+    tile.found = true;
+    tg.found = true;
+    playChime(tile.n);
+    say(tg.a ? `${NUMBER_WORDS[tg.a]} and ${NUMBER_WORDS[tg.b]} make ${NUMBER_WORDS[tg.n]}!` : `${NUMBER_WORDS[tg.n]}!`);
+    spawnParticles(tile.x, tile.y, Math.min(tile.w, tile.h) * 0.75, tile.color, t);
+    log(`Item successfully placed: Bunny landed on ${tile.n}`);
+
+    if (state.targetIdx >= state.targets.length - 1) {
+      state.step = 'done';
+      state.completeAt = t + 900;
+    } else {
+      state.step = 'next';
+      state.stepAt = t + (tg.a ? CONFIG.NEXT_TARGET_MS + 500 : CONFIG.NEXT_TARGET_MS);
+    }
+  }
+
+  function nextTarget(t) {
+    state.prevTarget = currentTarget();
+    state.targetIdx++;
+    state.flipT0 = t;
+    state.step = 'ask';
+    state.lastInteraction = t;
+    playFlip();
+    announce(false);
+  }
+
+  // ---------------------------------------------------------------------
+  // Layout
+  // ---------------------------------------------------------------------
+  // The grid runs along a "progress" axis (Bunny's way forward) with up to two
+  // cells across it. Portrait screens usually run it bottom-to-top, wide
+  // screens left-to-right: both are tried and the one with bigger tiles wins.
+  function computeLayout() {
+    const minDim = Math.min(W, H);
+    const m = clamp(minDim * 0.04, 12, 32);
+    L.m = m;
+
+    const rows = state.rows.length ? state.rows : rowsFor(TIERS[state.tier].max);
+    const crossUnits = rows.reduce((a, r) => Math.max(a, r.length), 1);
+
+    // Dot card: top centre, kept clear of the home button on both sides.
+    const aspect = state.sums ? 2.3 : 1.05;
+    let ch = clamp(minDim * 0.2, 60, 170);
+    ch = Math.min(ch, H * 0.22, (W - 2 * CONFIG.HOME_RESERVE_PX) / aspect);
+    ch = Math.max(ch, 44);
+    const cw = ch * aspect;
+    L.card = { x: (W - cw) / 2, y: m, w: cw, h: ch };
+
+    // The grid region leaves room for the pavement border on every side.
+    const pave = m * 0.8;
+    const gTop = L.card.y + ch + m * 0.8 + pave;
+    const gBot = H - m - pave;
+    const gL = m + pave, gR = W - m - pave;
+    const nP = rows.length + CONFIG.START_PAD;
+    const cap = clamp(minDim * 0.36, 90, 200);
+
+    function candidate(vertical) {
+      const regionP = vertical ? gBot - gTop : gR - gL;
+      const regionC = vertical ? gR - gL : gBot - gTop;
+      let cp = regionP / nP, cc = regionC / crossUnits;
+      cp = Math.min(cp, cc * 1.25, cap);
+      cc = Math.min(cc, cp * 1.4, cap * 1.15);
+      return { vertical, cp, cc, regionP, score: Math.min(cp, cc) };
+    }
+    const v = candidate(true), h = candidate(false);
+    const best = (v.score >= h.score * 0.97) ? v : h;   // slight preference for the classic upward grid
+
+    L.vertical = best.vertical;
+    L.cp = best.cp;
+    L.cc = best.cc;
+    const total = nP * best.cp;
+    if (L.vertical) {
+      L.p0 = gTop + (best.regionP + total) / 2;   // bottom end (y)
+      L.c0 = W / 2;
+    } else {
+      L.p0 = gL + (best.regionP - total) / 2;     // left end (x)
+      L.c0 = (gTop + gBot) / 2;
+    }
+    L.br = clamp(Math.min(L.cp, L.cc) * 0.15, 11, 36);
+
+    for (const tl of state.tiles) Object.assign(tl, cellRect(CONFIG.START_PAD + tl.row + 0.5, tl.cols === 2 ? tl.col - 0.5 : 0, 1));
+    L.start = cellRect(CONFIG.START_PAD / 2, 0, CONFIG.START_PAD);
+
+    // Pavement: the grid's bounding box plus a soft margin.
+    let x0 = L.start.x - L.start.w / 2, x1 = L.start.x + L.start.w / 2;
+    let y0 = L.start.y - L.start.h / 2, y1 = L.start.y + L.start.h / 2;
+    for (const tl of state.tiles) {
+      x0 = Math.min(x0, tl.x - tl.w / 2); x1 = Math.max(x1, tl.x + tl.w / 2);
+      y0 = Math.min(y0, tl.y - tl.h / 2); y1 = Math.max(y1, tl.y + tl.h / 2);
+    }
+    L.pave = { x: x0 - pave, y: y0 - pave, w: x1 - x0 + pave * 2, h: y1 - y0 + pave * 2 };
+  }
+
+  // A cell centred `along` cells up the progress axis, `across` cells off-centre,
+  // `lenCells` long along the progress axis.
+  function cellRect(along, across, lenCells) {
+    if (L.vertical) return { x: L.c0 + across * L.cc, y: L.p0 - along * L.cp, w: L.cc, h: L.cp * lenCells };
+    return { x: L.p0 + along * L.cp, y: L.c0 + across * L.cc, w: L.cp * lenCells, h: L.cc };
+  }
+
+  // Where Bunny's feet rest, chosen so the numeral stays readable: beside it on
+  // a wide tile, low in the tile (below the raised numeral) on a tall one.
+  function standPoint(at) {
+    const tl = at ? tileByN(at) : null;
+    if (!tl) return { x: L.start.x, y: L.start.y + L.start.h * 0.28 };
+    if (tl.w >= tl.h * 1.1) return { x: tl.x + tl.w * 0.3, y: tl.y + tl.h * 0.34 };
+    return { x: tl.x, y: tl.y + tl.h * 0.38 };
+  }
+
+  // Forgiving pick: each tile's whole cell plus a margin; nearest centre wins on overlap.
+  function pickTile(p) {
+    let best = null, bestD = Infinity;
+    for (const tl of state.tiles) {
+      const pad = Math.min(tl.w, tl.h) * 0.22;
+      if (Math.abs(p.x - tl.x) <= tl.w / 2 + pad && Math.abs(p.y - tl.y) <= tl.h / 2 + pad) {
+        const d = Math.hypot((p.x - tl.x) / tl.w, (p.y - tl.y) / tl.h);
+        if (d < bestD) { best = tl; bestD = d; }
+      }
+    }
+    return best;
+  }
+
+  function inCard(p) {
+    const c = L.card, pad = L.m * 0.5;
+    return p.x >= c.x - pad && p.x <= c.x + c.w + pad && p.y >= c.y - pad && p.y <= c.y + c.h + pad;
+  }
+
+  // ---------------------------------------------------------------------
+  // Input: touch + mouse
+  // ---------------------------------------------------------------------
+  let activeTouch = null;
+  let mouseDown = false;
+  let parentTimer = null;
+
+  function toCanvas(clientX, clientY) {
+    const r = canvas.getBoundingClientRect();
+    return { x: clientX - r.left, y: clientY - r.top };
+  }
+
+  function findTouch(list, id) {
+    for (let i = 0; i < list.length; i++) if (list[i].identifier === id) return list[i];
+    return null;
+  }
+
+  function cancelParentHold() {
+    if (parentTimer) { clearTimeout(parentTimer); parentTimer = null; }
+  }
+
+  function onDown(p) {
+    unlockAudio();
+    const t = now();
+    state.lastInteraction = t;
+
+    if (state.phase === 'start' || state.phase === 'between') {
+      const g = starGeom();
+      if (Math.hypot(p.x - g.cx, p.y - g.cy) <= g.R * 1.8) { startRound(); return; }
+    } else if (state.phase === 'play') {
+      // Tapping the dot card says the prompt again.
+      if (inCard(p)) {
+        state.cardTapT0 = t;
+        playFlip();
+        if (state.step === 'ask') announce(false);
+        return;
+      }
+      if (state.step === 'ask') {
+        const tl = pickTile(p);
+        if (tl) { tapTile(tl, t); return; }
+      }
+    }
+
+    // Hidden parent view: hold the top-left corner still for 3 seconds.
+    if (p.x < CONFIG.PARENT_CORNER_PX && p.y < CONFIG.PARENT_CORNER_PX) {
+      cancelParentHold();
+      parentTimer = setTimeout(openParent, CONFIG.PARENT_HOLD_MS);
+    }
+  }
+
+  function onMove(p) {
+    if (parentTimer && (p.x >= CONFIG.PARENT_CORNER_PX || p.y >= CONFIG.PARENT_CORNER_PX)) cancelParentHold();
+  }
+
+  function onUp() {
+    cancelParentHold();
+  }
+
+  canvas.addEventListener('touchstart', e => {
+    e.preventDefault();
+    if (activeTouch !== null) return;          // one finger at a time
+    const t = e.changedTouches[0];
+    activeTouch = t.identifier;
+    onDown(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  canvas.addEventListener('touchmove', e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (t) onMove(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  const endTouch = e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (!t) return;
+    activeTouch = null;
+    onUp(toCanvas(t.clientX, t.clientY));
+  };
+  canvas.addEventListener('touchend', endTouch, { passive: false });
+  canvas.addEventListener('touchcancel', endTouch, { passive: false });
+
+  canvas.addEventListener('mousedown', e => { mouseDown = true; onDown(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mousemove', e => { if (mouseDown) onMove(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mouseup', e => {
+    if (!mouseDown) return;
+    mouseDown = false;
+    onUp(toCanvas(e.clientX, e.clientY));
+  });
+
+  // ---------------------------------------------------------------------
+  // Parent view (hidden, local data only)
+  // ---------------------------------------------------------------------
+  const parentEl = document.getElementById('parent');
+  const parentBody = document.getElementById('parentBody');
+
+  function el(tag, text) {
+    const node = document.createElement(tag);
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function openParent() {
+    parentTimer = null;
+    const targets = progress.sessions.reduce((a, s) => a + s.rounds.reduce((b, r) => b + r.targets, 0), 0);
+    const firstTry = progress.sessions.reduce((a, s) => a + s.rounds.reduce((b, r) => b + r.firstTry, 0), 0);
+    const sumRounds = progress.sessions.reduce((a, s) => a + s.rounds.filter(r => r.level === TIERS.length).length, 0);
+
+    parentBody.textContent = '';
+    parentBody.appendChild(el('div', `Full games finished: ${progress.gamesCompleted}`));
+    parentBody.appendChild(el('div', `Rounds finished: ${progress.roundsCompleted}`));
+    parentBody.appendChild(el('div', `Numbers found: ${progress.numbersFound}`));
+    parentBody.appendChild(el('div', `Found on the first try: ${targets ? Math.round(100 * firstTry / targets) : 0}%`));
+    parentBody.appendChild(el('div', `Rounds with adding (level 4): ${sumRounds}`));
+
+    const recent = progress.sessions.slice(-6).reverse();
+    if (recent.length) {
+      const table = el('table');
+      const head = el('tr');
+      ['When', 'Rounds', 'Top level', 'Slips', 'Avg s/round'].forEach(h => head.appendChild(el('th', h)));
+      table.appendChild(head);
+      recent.forEach(s => {
+        const tr = el('tr');
+        const when = new Date(s.startedAt);
+        tr.appendChild(el('td', when.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' ' +
+          when.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })));
+        tr.appendChild(el('td', `${s.rounds.length}/${CONFIG.ROUNDS}`));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => Math.max(a, r.level), 0) || '-')));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => a + r.slips, 0))));
+        const secs = s.rounds.reduce((a, r) => a + r.seconds, 0);
+        tr.appendChild(el('td', s.rounds.length ? String(Math.round(secs / s.rounds.length)) : '-'));
+        table.appendChild(tr);
+      });
+      parentBody.appendChild(table);
+    }
+    parentEl.hidden = false;
+    log('Parent view opened', progress);
+  }
+
+  parentEl.addEventListener('click', () => { parentEl.hidden = true; });
+
+  // Read-only debug hooks for the Android/desktop console.
+  window.NumberHopscotch = {
+    progress: () => JSON.parse(JSON.stringify(progress)),
+    state: () => {
+      const tg = currentTarget();
+      const g = starGeom();
+      return {
+        phase: state.phase,
+        round: state.round,
+        level: state.tier + 1,
+        step: state.step,                         // tiles accept taps only while 'ask'
+        target: tg ? { n: tg.n, a: tg.a, b: tg.b, slips: tg.slips } : null,
+        targetIndex: state.targetIdx,
+        correct: tg ? tg.n : null,
+        tiles: state.tiles.map(tl => ({ n: tl.n, x: tl.x, y: tl.y, w: tl.w, h: tl.h, correct: !!tg && tl.n === tg.n })),
+        card: { x: L.card.x + L.card.w / 2, y: L.card.y + L.card.h / 2 },
+        bunny: { at: state.bunny.at },
+        star: (state.phase === 'start' || state.phase === 'between') ? { x: g.cx, y: g.cy } : null,
+      };
+    },
+  };
+
+  // ---------------------------------------------------------------------
+  // Drawing primitives
+  // ---------------------------------------------------------------------
+  function roundRectPath(x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  function ellipse(x, y, rx, ry, rot = 0) {
+    ctx.beginPath();
+    ctx.ellipse(x, y, Math.max(0.1, rx), Math.max(0.1, ry), rot, 0, TAU);
+  }
+
+  // Hand-drawn chalk box: four slightly bowed strokes that overshoot at the
+  // corners, then a light dashed pass on top for the grainy chalk texture.
+  function chalkBox(x, y, w, h, color, j, lw) {
+    const pts = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]];
+    ctx.lineCap = 'round';
+    for (let pass = 0; pass < 2; pass++) {
+      ctx.strokeStyle = pass === 0 ? color : 'rgba(255, 253, 248, 0.5)';
+      ctx.lineWidth = pass === 0 ? lw : lw * 0.38;
+      ctx.setLineDash(pass === 0 ? [] : [lw * 0.5, lw * 1.3]);
+      ctx.beginPath();
+      for (let s = 0; s < 4; s++) {
+        const a = pts[s], b = pts[(s + 1) % 4];
+        const dx = b[0] - a[0], dy = b[1] - a[1];
+        const len = Math.hypot(dx, dy) || 1;
+        const ux = dx / len, uy = dy / len;
+        const o = lw * (0.6 + 0.4 * j[s + pass * 8]);           // corner overshoot
+        const ja = j[s * 2 % 8] * lw * 0.5, jb = j[(s * 2 + 1) % 8] * lw * 0.5;
+        const bow = j[8 + s] * lw * 0.8;
+        ctx.moveTo(a[0] - ux * o - uy * ja, a[1] - uy * o + ux * ja);
+        ctx.quadraticCurveTo((a[0] + b[0]) / 2 - uy * bow, (a[1] + b[1]) / 2 + ux * bow,
+          b[0] + ux * o - uy * jb, b[1] + uy * o + ux * jb);
+      }
+      ctx.stroke();
+    }
+    ctx.setLineDash([]);
+  }
+
+  // Soft chalk colouring inside a tile: a light wash plus diagonal scribbles.
+  function chalkFill(x, y, w, h, color, alpha) {
+    ctx.save();
+    ctx.beginPath();
+    roundRectPath(x, y, w, h, Math.min(w, h) * 0.06);
+    ctx.clip();
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = color;
+    ctx.fillRect(x, y, w, h);
+    ctx.globalAlpha = alpha * 0.7;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = Math.max(1.5, Math.min(w, h) * 0.035);
+    const step = Math.max(6, Math.min(w, h) * 0.1);
+    ctx.beginPath();
+    for (let d = -h; d < w; d += step) {
+      ctx.moveTo(x + d, y + h);
+      ctx.lineTo(x + d + h, y);
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawPavement() {
+    const p = L.pave;
+    const r = Math.min(p.w, p.h) * 0.08;
+    ctx.save();
+    ctx.shadowColor = 'rgba(74, 64, 54, 0.10)';
+    ctx.shadowBlur = L.m;
+    ctx.shadowOffsetY = L.m * 0.25;
+    ctx.beginPath();
+    roundRectPath(p.x, p.y, p.w, p.h, r);
+    ctx.fillStyle = COLORS.pavement;
+    ctx.fill();
+    ctx.shadowColor = 'transparent';
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = COLORS.pavementEdge;
+    ctx.stroke();
+    ctx.clip();
+
+    // Faint paving-slab joints.
+    const slab = Math.max(L.cp, L.cc) * 1.9;
+    ctx.strokeStyle = 'rgba(120, 100, 80, 0.10)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    for (let x = p.x + slab * 0.6; x < p.x + p.w; x += slab) { ctx.moveTo(x, p.y); ctx.lineTo(x, p.y + p.h); }
+    for (let y = p.y + slab * 0.45; y < p.y + p.h; y += slab) { ctx.moveTo(p.x, y); ctx.lineTo(p.x + p.w, y); }
+    ctx.stroke();
+
+    // Speckles give the pavement a soft, gritty feel.
+    for (const s of SPECKLES) {
+      ctx.globalAlpha = s.a;
+      ctx.fillStyle = s.light ? '#FFFFFF' : '#8C7B66';
+      ctx.fillRect(p.x + s.u * p.w, p.y + s.v * p.h, s.r, s.r);
+    }
+    ctx.restore();
+  }
+
+  // Bunny's start square: a chalk line across the front of the first tile.
+  const START_JIT = jitter(16);
+  function drawStartLine() {
+    const s = L.start;
+    const lw = Math.max(2.5, Math.min(L.cp, L.cc) * 0.045);
+    ctx.save();
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = 'rgba(255, 253, 248, 0.95)';
+    ctx.lineWidth = lw * 1.2;
+    ctx.beginPath();
+    if (L.vertical) {
+      const y = s.y - s.h / 2;
+      ctx.moveTo(s.x - s.w * 0.42, y + START_JIT[0] * lw);
+      ctx.quadraticCurveTo(s.x, y + START_JIT[1] * lw, s.x + s.w * 0.42, y + START_JIT[2] * lw);
+    } else {
+      const x = s.x + s.w / 2;
+      ctx.moveTo(x + START_JIT[0] * lw, s.y - s.h * 0.42);
+      ctx.quadraticCurveTo(x + START_JIT[1] * lw, s.y, x + START_JIT[2] * lw, s.y + s.h * 0.42);
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawTile(tl, t, g) {
+    const inset = Math.min(tl.w, tl.h) * 0.08;
+    const w = tl.w - inset * 2, h = tl.h - inset * 2;
+    const x = tl.x - w / 2, y = tl.y - h / 2;
+    const lw = Math.max(2.5, Math.min(w, h) * 0.05);
+
+    let rot = 0, sc = 1;
+    const wp = (t - tl.wobbleT0) / CONFIG.WOBBLE_MS;
+    if (wp >= 0 && wp < 1) rot = (reduceMotion ? 0.03 : 0.09) * Math.sin(wp * Math.PI * 4) * (1 - wp);
+    const bp = (t - tl.bounceT0) / CONFIG.BOUNCE_MS;
+    if (bp >= 0 && bp < 1) sc *= 1 + (reduceMotion ? 0.03 : 0.07) * Math.sin(Math.PI * bp);
+    sc *= 1 + g.ripple(tl);
+
+    ctx.save();
+    ctx.translate(tl.x, tl.y);
+    ctx.rotate(rot);
+    ctx.scale(sc, sc);
+    ctx.translate(-tl.x, -tl.y);
+
+    // Scaffolding hint: a soft glow around the right tile.
+    if (g.hintTile === tl && g.glow > 0) {
+      const gr = inset * (1.3 + 1.4 * g.glow);
+      ctx.globalAlpha = 0.45 + 0.45 * g.glow;
+      ctx.fillStyle = shade(COLORS.star, 0.35);
+      ctx.beginPath();
+      roundRectPath(x - gr, y - gr, w + gr * 2, h + gr * 2, Math.min(w, h) * 0.12 + gr);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    // A tile Bunny has visited this round is coloured in a little more.
+    chalkFill(x, y, w, h, tl.color, tl.found ? 0.42 : 0.22);
+    chalkBox(x, y, w, h, shade(tl.color, -0.12), tl.jit, lw);
+
+    // The numeral sits above centre so Bunny, standing low in the tile, leaves it readable.
+    const wide = tl.w >= tl.h * 1.1;
+    const fs = Math.min(w, h) * (wide ? 0.58 : 0.5);
+    const ny = wide ? tl.y : tl.y - h * 0.17;
+    ctx.font = `800 ${fs}px ${FONT}`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = shade(tl.color, -0.48);
+    ctx.fillText(String(tl.n), tl.x, ny);
+    ctx.globalAlpha = 0.28;
+    ctx.fillStyle = '#FFFDF8';
+    ctx.fillText(String(tl.n), tl.x - fs * 0.02, ny - fs * 0.02);
+    ctx.globalAlpha = 1;
+    ctx.restore();
+  }
+
+  // Dots in a dice pattern inside a square of side `box`.
+  function drawDots(n, cx, cy, box, color) {
+    const pts = DICE[n] || [];
+    const sp = box * 0.3, rr = box * 0.105;
+    for (const [u, v] of pts) {
+      ctx.beginPath();
+      ctx.arc(cx + u * sp, cy + v * sp, rr, 0, TAU);
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.lineWidth = Math.max(1.5, rr * 0.22);
+      ctx.strokeStyle = shade(color, -0.25);
+      ctx.stroke();
+      ctx.globalAlpha = 0.4;
+      ctx.fillStyle = '#fff';
+      ctx.beginPath();
+      ctx.ellipse(cx + u * sp - rr * 0.3, cy + v * sp - rr * 0.35, rr * 0.32, rr * 0.18, -0.6, 0, TAU);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function drawCard(t, g) {
+    const c = L.card;
+    const cx = c.x + c.w / 2, cy = c.y + c.h / 2;
+    let tg = currentTarget();
+    if (!tg) return;
+
+    // Flip to the next number: first half shows the old card, second half the new.
+    let sx = 1, sy = 1;
+    const fp = (t - state.flipT0) / CONFIG.FLIP_MS;
+    if (fp >= 0 && fp < 1) {
+      if (fp < 0.5) { if (state.prevTarget) tg = state.prevTarget; sx = 1 - easeInOutQuad(fp * 2); }
+      else sx = easeInOutQuad((fp - 0.5) * 2);
+      if (reduceMotion) sx = 1;
+    }
+    const pp = (t - state.popT0) / CONFIG.POP_MS;
+    if (pp >= 0 && pp < 1 && !reduceMotion) { const k = 0.7 + 0.3 * easeOutCubic(pp); sx *= k; sy *= k; }
+    const tp = (t - state.cardTapT0) / 300;
+    if (tp >= 0 && tp < 1) { const k = 1 + 0.05 * Math.sin(Math.PI * tp); sx *= k; sy *= k; }
+    sx *= g.cardPulse; sy *= g.cardPulse;
+    sx = Math.max(0.02, sx);
+
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.scale(sx, sy);
+    ctx.translate(-cx, -cy);
+
+    // Found: a warm golden halo, the same every time.
+    if (tg.found) {
+      const gr = c.h * 0.09;
+      ctx.globalAlpha = 0.55;
+      ctx.fillStyle = shade(COLORS.star, 0.25);
+      ctx.beginPath();
+      roundRectPath(c.x - gr, c.y - gr, c.w + gr * 2, c.h + gr * 2, c.h * 0.16 + gr);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    ctx.shadowColor = 'rgba(74, 64, 54, 0.16)';
+    ctx.shadowBlur = c.h * 0.12;
+    ctx.shadowOffsetY = c.h * 0.04;
+    ctx.beginPath();
+    roundRectPath(c.x, c.y, c.w, c.h, c.h * 0.16);
+    ctx.fillStyle = COLORS.card;
+    ctx.fill();
+    ctx.shadowColor = 'transparent';
+    ctx.lineWidth = Math.max(2, c.h * 0.025);
+    ctx.strokeStyle = '#E6DCCB';
+    ctx.stroke();
+
+    if (tg.a) {
+      // "a + b": two tinted dot groups with a plus between them.
+      const box = c.h * 0.76;
+      const lx = cx - c.w * 0.3, rx = cx + c.w * 0.3;
+      [[lx, tg.a, COLORS.dotA], [rx, tg.b, COLORS.dotB]].forEach(([gx, n, col]) => {
+        ctx.beginPath();
+        roundRectPath(gx - box / 2, cy - box / 2, box, box, box * 0.2);
+        ctx.fillStyle = shade(col, 0.82);
+        ctx.fill();
+        drawDots(n, gx, cy, box, col);
+      });
+      const ps = c.h * 0.15;
+      ctx.strokeStyle = COLORS.ink;
+      ctx.globalAlpha = 0.7;
+      ctx.lineCap = 'round';
+      ctx.lineWidth = Math.max(3, c.h * 0.06);
+      ctx.beginPath();
+      ctx.moveTo(cx - ps, cy); ctx.lineTo(cx + ps, cy);
+      ctx.moveTo(cx, cy - ps); ctx.lineTo(cx, cy + ps);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    } else {
+      drawDots(tg.n, cx, cy, c.h * 0.86, COLORS.dotSingle);
+    }
+    ctx.restore();
+  }
+
+  // Bunny, drawn facing the child. (x, y) is the ground point between the feet.
+  function drawBunny(x, y, r, sx, sy, happy, lift) {
+    // Shadow stays on the ground and shrinks while Bunny is in the air.
+    const sk = 1 / (1 + lift / (r * 3));
+    ctx.globalAlpha = 0.16 * sk + 0.04;
+    ctx.fillStyle = '#5A4A3A';
+    ellipse(x, y + r * 0.08, r * 0.95 * sk, r * 0.24 * sk);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+
+    ctx.save();
+    ctx.translate(x, y - lift);
+    ctx.scale(sx, sy);
+    ctx.lineWidth = Math.max(1.5, r * 0.07);
+    ctx.strokeStyle = COLORS.furLine;
+    ctx.lineJoin = 'round';
+
+    // Ears (behind the head), tipped slightly outward.
+    for (const side of [-1, 1]) {
+      ctx.save();
+      ctx.translate(side * r * 0.3, -r * 2.4);
+      ctx.rotate(side * (happy ? 0.3 : 0.16));
+      ellipse(0, -r * 0.78, r * 0.27, r * 0.86);
+      ctx.fillStyle = COLORS.fur; ctx.fill(); ctx.stroke();
+      ellipse(0, -r * 0.72, r * 0.13, r * 0.6);
+      ctx.fillStyle = COLORS.earPink; ctx.fill();
+      ctx.restore();
+    }
+
+    // Feet.
+    for (const side of [-1, 1]) {
+      ellipse(side * r * 0.42, -r * 0.12, r * 0.34, r * 0.17);
+      ctx.fillStyle = COLORS.fur; ctx.fill(); ctx.stroke();
+    }
+
+    // Body and belly.
+    ellipse(0, -r * 0.88, r * 0.84, r * 0.8);
+    ctx.fillStyle = COLORS.fur; ctx.fill(); ctx.stroke();
+    ellipse(0, -r * 0.74, r * 0.5, r * 0.5);
+    ctx.fillStyle = COLORS.belly; ctx.fill();
+
+    // Little front paws.
+    for (const side of [-1, 1]) {
+      ellipse(side * r * 0.36, -r * 1.12, r * 0.17, r * 0.22, side * -0.3);
+      ctx.fillStyle = COLORS.fur; ctx.fill(); ctx.stroke();
+    }
+
+    // Head.
+    ctx.beginPath();
+    ctx.arc(0, -r * 2.0, r * 0.74, 0, TAU);
+    ctx.fillStyle = COLORS.fur; ctx.fill(); ctx.stroke();
+
+    // Eyes: dots, or happy arcs during the celebration.
+    ctx.fillStyle = COLORS.ink;
+    ctx.strokeStyle = COLORS.ink;
+    ctx.lineCap = 'round';
+    for (const side of [-1, 1]) {
+      if (happy) {
+        ctx.lineWidth = Math.max(1.5, r * 0.08);
+        ctx.beginPath();
+        ctx.arc(side * r * 0.27, -r * 2.02, r * 0.11, Math.PI * 1.15, Math.PI * 1.85);
+        ctx.stroke();
+      } else {
+        ctx.beginPath(); ctx.arc(side * r * 0.27, -r * 2.06, r * 0.085, 0, TAU); ctx.fill();
+        ctx.globalAlpha = 0.9; ctx.fillStyle = '#fff';
+        ctx.beginPath(); ctx.arc(side * r * 0.27 + r * 0.03, -r * 2.09, r * 0.028, 0, TAU); ctx.fill();
+        ctx.globalAlpha = 1; ctx.fillStyle = COLORS.ink;
+      }
+    }
+
+    // Cheeks, nose, mouth.
+    ctx.globalAlpha = 0.45;
+    ctx.fillStyle = COLORS.cheek;
+    for (const side of [-1, 1]) { ellipse(side * r * 0.45, -r * 1.83, r * 0.13, r * 0.08); ctx.fill(); }
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = COLORS.nose;
+    ellipse(0, -r * 1.88, r * 0.09, r * 0.065);
+    ctx.fill();
+    ctx.strokeStyle = COLORS.ink;
+    ctx.lineWidth = Math.max(1.2, r * 0.05);
+    ctx.beginPath();
+    ctx.moveTo(0, -r * 1.83);
+    ctx.quadraticCurveTo(-r * 0.06, -r * 1.72, -r * 0.14, -r * 1.75);
+    ctx.moveTo(0, -r * 1.83);
+    ctx.quadraticCurveTo(r * 0.06, -r * 1.72, r * 0.14, -r * 1.75);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // Where Bunny is right now, including the hop arc, landing squash and celebration jumps.
+  function bunnyPose(t) {
+    const b = state.bunny;
+    const to = standPoint(b.at);
+    const r = L.br;
+    const out = { x: to.x, y: to.y, lift: 0, sx: 1, sy: 1, happy: false };
+
+    if (state.phase === 'play' && state.step === 'hop') {
+      const p = clamp((t - b.hopT0) / b.hopDur, 0, 1);
+      const from = standPoint(b.from);
+      const e = easeInOutQuad(p);
+      const dist = Math.hypot(to.x - from.x, to.y - from.y);
+      const arc = (reduceMotion ? 0.45 : 1) * (r * 2.2 + dist * 0.18);
+      out.x = lerp(from.x, to.x, e);
+      out.y = lerp(from.y, to.y, e);
+      out.lift = Math.sin(Math.PI * p) * arc;
+      out.sy = 1 + 0.1 * Math.sin(Math.PI * p);
+      out.sx = 1 - 0.06 * Math.sin(Math.PI * p);
+    }
+
+    const lp = (t - b.landT0) / CONFIG.LAND_MS;
+    if (lp >= 0 && lp < 1) {
+      const k = Math.sin(Math.PI * lp) * (reduceMotion ? 0.4 : 1);
+      out.sy *= 1 - 0.16 * k;
+      out.sx *= 1 + 0.12 * k;
+    }
+
+    if (state.phase === 'celebrate') {
+      out.happy = true;
+      const ct = t - state.celebrateStart;
+      if (ct < 1400 && !reduceMotion) out.lift = Math.abs(Math.sin(Math.PI * ct / 700)) * r * 1.3;
+    } else if (state.phase === 'play' && state.step !== 'ask' && state.step !== 'hop') {
+      out.happy = true;   // pleased with the find, until the next dot card
+    }
+    return out;
+  }
+
+  function drawStar(cx, cy, R, fill, face) {
+    ctx.save();
+    ctx.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const rad = i % 2 === 0 ? R : R * 0.5;
+      const a = -Math.PI / 2 + i * Math.PI / 5;
+      const x = cx + rad * Math.cos(a), y = cy + rad * Math.sin(a);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    ctx.lineJoin = 'round';
+    if (fill) {
+      ctx.fillStyle = fill;
+      ctx.fill();
+      ctx.strokeStyle = fill;            // same-colour stroke rounds the tips
+      ctx.lineWidth = Math.max(2, R * 0.16);
+      ctx.stroke();
+    } else {
+      ctx.strokeStyle = 'rgba(74, 64, 54, 0.25)';
+      ctx.lineWidth = Math.max(2, R * 0.14);
+      ctx.stroke();
+    }
+
+    if (face) {
+      ctx.fillStyle = COLORS.ink;
+      ctx.beginPath(); ctx.arc(cx - R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.arc(cx + R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.strokeStyle = COLORS.ink;
+      ctx.lineWidth = Math.max(2, R * 0.05);
+      ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.arc(cx, cy + R * 0.06, R * 0.17, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+      ctx.globalAlpha = 0.35;
+      ctx.fillStyle = COLORS.cheek;
+      ctx.beginPath(); ctx.ellipse(cx - R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(cx + R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // Same ring of sparkles every time (no random rewards).
+  function spawnParticles(cx, cy, dist, color, t) {
+    for (let i = 0; i < 10; i++) {
+      const a = i * TAU / 10 - Math.PI / 2;
+      state.particles.push({ x0: cx, y0: cy, dx: Math.cos(a), dy: Math.sin(a), dist, t0: t, life: 900, color: i % 2 ? COLORS.star : shade(color, 0.1) });
+    }
+  }
+
+  function drawParticles(t) {
+    state.particles = state.particles.filter(p => t - p.t0 < p.life);
+    const pr = Math.max(3, L.br * 0.22);
+    for (const p of state.particles) {
+      const k = (t - p.t0) / p.life;
+      const e = easeOutCubic(k);
+      ctx.globalAlpha = 1 - k;
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x0 + p.dx * p.dist * e, p.y0 + p.dy * p.dist * e, pr * (1 - k * 0.5), 0, TAU);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------------------------------------------------------------------
+  // Screens
+  // ---------------------------------------------------------------------
+  function starGeom() {
+    return { cx: W / 2, cy: H * 0.42, R: Math.min(W, H) * 0.2 };
+  }
+
+  // Start and between-round screen: one big pulsing star to tap, plus 5 slots
+  // that fill up so the child can see the end coming.
+  function drawStarScreen(t) {
+    const { cx, cy, R } = starGeom();
+    const amp = reduceMotion ? 0.03 : 0.07;
+    const k = 1 + amp * (0.5 - 0.5 * Math.cos(TAU * t / 1400));
+    drawStar(cx, cy, R * k, COLORS.star, true);
+
+    const sr = R * 0.16, gap = sr * 2.8, y = cy + R * 1.35;
+    for (let i = 0; i < CONFIG.ROUNDS; i++) {
+      drawStar(cx + (i - (CONFIG.ROUNDS - 1) / 2) * gap, y, sr, i < state.round ? COLORS.star : null, false);
+    }
+  }
+
+  function fitFont(text, weight, size, maxW) {
+    ctx.font = `${weight} ${size}px ${FONT}`;
+    while (size > 12 && ctx.measureText(text).width > maxW) {
+      size -= 1;
+      ctx.font = `${weight} ${size}px ${FONT}`;
+    }
+    return size;
+  }
+
+  // Static end screen. No buttons: the session is over.
+  function drawEnd() {
+    const gh = H * 0.14;
+    ctx.fillStyle = COLORS.grass;
+    ctx.beginPath();
+    ctx.moveTo(0, H - gh);
+    ctx.quadraticCurveTo(W / 2, H - gh * 1.5, W, H - gh);
+    ctx.lineTo(W, H);
+    ctx.lineTo(0, H);
+    ctx.closePath();
+    ctx.fill();
+
+    const R = Math.min(W, H) * 0.2;
+    const cy = H * 0.36;
+    drawStar(W / 2, cy, R, COLORS.star, true);
+
+    const big = clamp(Math.min(W, H) * 0.1, 26, 68);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = COLORS.ink;
+    const top = cy + R * 1.25;
+    fitFont('Great Job!', 800, big, W * 0.9);
+    ctx.fillText('Great Job!', W / 2, top + big * 0.5);
+    fitFont('Time to play outside!', 700, Math.round(big * 0.62), W * 0.9);
+    ctx.fillText('Time to play outside!', W / 2, top + big * 1.55);
+  }
+
+  // What to pulse and which tile (if any) to glow right now.
+  function guidance(t) {
+    const out = { cardPulse: 1, ripple: () => 0, hintTile: null, glow: 0 };
+    if (state.phase !== 'play' || state.step !== 'ask') return out;
+    const tg = currentTarget();
+    if (!tg) return out;
+    const amp = reduceMotion ? 0.03 : 0.06;
+
+    // After repeated slips on this number, the right tile glows until it is found.
+    if (tg.slips >= CONFIG.HINT_AFTER_SLIPS) {
+      out.hintTile = tileByN(tg.n);
+      out.glow = 0.5 + 0.5 * Math.sin(TAU * t / 1300);
+    }
+
+    const idle = t - state.lastInteraction;
+    if (idle <= CONFIG.IDLE_PULSE_MS) return out;
+    const it = idle - CONFIG.IDLE_PULSE_MS;
+    const wave = 0.5 - 0.5 * Math.cos(TAU * it / 1300);
+    out.cardPulse = 1 + amp * wave;
+
+    // A soft wave runs up the grid in hopscotch order: "these can be tapped".
+    if (!reduceMotion) {
+      const order = state.tiles.length;
+      out.ripple = tl => {
+        const ph = (it / 1800) * TAU - (tl.n - 1) * (TAU / (order + 3));
+        return 0.035 * Math.max(0, Math.sin(ph));
+      };
+    }
+
+    // First round: if the child has not found the mechanic yet, show the way.
+    const tutorial = state.round === 0 && state.targetIdx === 0 && idle > CONFIG.TUTORIAL_HINT_MS;
+    if (tutorial && !out.hintTile) { out.hintTile = tileByN(tg.n); out.glow = wave; }
+    return out;
+  }
+
+  function drawPlay(t) {
+    const g = guidance(t);
+    drawPavement();
+    drawStartLine();
+    // A wobbling tile is drawn last so its corners overlap its neighbours cleanly.
+    const order = state.tiles.slice().sort((a, b) => (t - a.wobbleT0 < CONFIG.WOBBLE_MS) - (t - b.wobbleT0 < CONFIG.WOBBLE_MS));
+    for (const tl of order) drawTile(tl, t, g);
+    const bp = bunnyPose(t);
+    drawBunny(bp.x, bp.y, L.br, bp.sx, bp.sy, bp.happy, bp.lift);
+    drawCard(t, g);
+    drawParticles(t);
+  }
+
+  // ---------------------------------------------------------------------
+  // Main loop
+  // ---------------------------------------------------------------------
+  function update(t) {
+    if (state.phase === 'play') {
+      if (state.step === 'hop' && t - state.bunny.hopT0 >= state.bunny.hopDur) landBunny(t);
+      if (state.step === 'next' && t >= state.stepAt) nextTarget(t);
+      if (state.step === 'done' && state.completeAt && t >= state.completeAt) {
+        state.completeAt = 0;
+        completeRound();
+      }
+    }
+
+    if (state.phase === 'celebrate' && t - state.celebrateStart >= CONFIG.CELEBRATE_MS) {
+      if (state.round >= CONFIG.ROUNDS) enterEnd();
+      else state.phase = 'between';
+    }
+  }
+
+  function render(t) {
+    ctx.fillStyle = COLORS.bg;
+    ctx.fillRect(0, 0, W, H);
+    if (state.phase === 'start' || state.phase === 'between') drawStarScreen(t);
+    else if (state.phase === 'play' || state.phase === 'celebrate') drawPlay(t);
+    else if (state.phase === 'end') drawEnd();
+  }
+
+  let rafId = 0;
+  function frame(t) {
+    update(t);
+    render(t);
+    // The end screen is static: stop the loop entirely.
+    if (state.phase !== 'end') rafId = requestAnimationFrame(frame);
+  }
+
+  function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    DPR = Math.min(window.devicePixelRatio || 1, 2.5);
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    // Tiles, the start square and Bunny's hop are all stored by grid position,
+    // so a rotation mid-hop simply continues on the new layout.
+    computeLayout();
+    if (state.phase === 'end') render(now());
+  }
+
+  window.addEventListener('resize', resize);
+  window.addEventListener('orientationchange', resize);
+
+  resize();
+  log('Game loaded', { roundsPerSession: CONFIG.ROUNDS, gamesCompletedBefore: progress.gamesCompleted });
+  rafId = requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

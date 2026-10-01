@@ -1,0 +1,1482 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Music and Rhythm Maker</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
+  body {
+    background: #F6F1E7;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  canvas { display: block; width: 100%; height: 100%; }
+
+  #home {
+    position: fixed; top: max(10px, env(safe-area-inset-top)); right: max(10px, env(safe-area-inset-right));
+    width: 52px; height: 52px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+    background: rgba(255, 253, 248, 0.85); box-shadow: 0 2px 8px rgba(74, 64, 54, 0.15);
+    -webkit-tap-highlight-color: transparent; z-index: 5;
+  }
+  #home:active { transform: scale(0.94); }
+
+  /* Hidden parent view: press and hold the top-left corner for 3 seconds. */
+  #parent {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: rgba(74, 64, 54, 0.55); padding: 16px; box-sizing: border-box; z-index: 10;
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #4A4036;
+  }
+  #parent[hidden] { display: none; }
+  #parent .card { background: #FFFDF8; border-radius: 16px; padding: 20px 22px; max-width: 380px; width: 100%; box-shadow: 0 10px 30px rgba(0,0,0,0.18); }
+  #parent h2 { margin: 0 0 10px; font-size: 18px; }
+  #parent table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+  #parent th, #parent td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #EDE5D6; }
+  #parent .hint { margin: 12px 0 0; font-size: 12px; opacity: 0.7; }
+</style>
+</head>
+<body>
+<canvas id="game" aria-label="Music and rhythm echo game"></canvas>
+<a id="home" href="../../index.html" aria-label="Home">
+  <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><path d="M4 11.5 12 5l8 6.5V19a1 1 0 0 1-1 1h-4.5v-5h-5v5H5a1 1 0 0 1-1-1z" fill="none" stroke="#4A4036" stroke-width="2" stroke-linejoin="round"/></svg>
+</a>
+
+<div id="parent" hidden>
+  <div class="card">
+    <h2>Progress on this device</h2>
+    <div id="parentBody"></div>
+    <p class="hint">Stored only on this device. Tap anywhere to close.</p>
+  </div>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  /* =====================================================================
+   * MUSIC AND RHYTHM MAKER
+   * ELOF domain: Creative Arts (music, rhythm) + Cognition (working memory,
+   *              sequencing / pattern recall).
+   *
+   * How it plays:
+   *  - A drum, a five-bar rainbow xylophone and a shaker sit on the floor.
+   *  - A little bird conductor plays a short pattern, pointing its baton at
+   *    each instrument as it lights up and sounds.
+   *  - Then the bird turns to the child: it is their turn to echo it.
+   *
+   * Design rules this file follows (from the brief):
+   *  - Free expression is never blocked: outside the bird's demo every tap
+   *    on an instrument plays its sound with a happy visual response.
+   *  - Control of error: a note that does not match still plays; the bird
+   *    simply plays the pattern again from the start after a short pause.
+   *    No buzzer, no red X, no "wrong" sound.
+   *  - Coherence: only the bird and the instruments on screen. No score.
+   *  - Visual prompts: the next expected instrument pulses only when idle.
+   *    Tapping the bird replays the pattern whenever the child wants.
+   *  - Natural stopping point: 5 rounds, then a static "play outside" screen
+   *    with no "play again" button.
+   * ===================================================================== */
+
+  // ---------------------------------------------------------------------
+  // Configuration
+  // ---------------------------------------------------------------------
+  const CONFIG = {
+    ROUNDS: 5,                     // hard session limit (natural stopping point)
+    STORAGE_KEY: 'music-rhythm-maker.v1',
+    IDLE_PULSE_MS: 1500,           // idle time on the child's turn before the next instrument pulses
+    TUTORIAL_HINT_MS: 5000,        // first round: idle time before it glows as well
+    INTRO_MS: 700,                 // the bird lifts its baton, then plays
+    DEMO_LEAD_MS: 250,             // small breath before the first demo note
+    TURN_GAP: 0.9,                 // after the last demo note, in note intervals, before the child's turn
+    OOPS_MS: 1000,                 // pause after a mismatch before the bird replays
+    HIT_MS: 420,                   // visual response length for one note
+    CELEBRATE_MS: 2000,            // round-complete dance length
+    FAST_MS_PER_NOTE: 2500,        // "quick" threshold for difficulty step-up
+    PARENT_HOLD_MS: 3000,          // hold time for the hidden parent view
+    PARENT_CORNER_PX: 80,
+    HOME_RESERVE_PX: 72,           // top-right corner kept free for the home button
+  };
+
+  const COLORS = {
+    bg: '#F6F1E7',
+    ink: '#4A4036',
+    star: '#F6C85F',
+    grass: '#B9D7A8',
+    cheek: '#F2A88A',
+    wood: '#C9965F',
+    drum: '#A98DD8',               // soft purple body (not one of the bar colours)
+    skin: '#FBF3E2',
+    rim: '#EAD7B5',
+    shaker: '#F2A07B',
+    bird: '#7DC3B8',               // soft teal conductor
+    belly: '#F6EEDB',
+    beak: '#F4B04C',
+    bowtie: '#E9776E',
+  };
+
+  // The rainbow xylophone: longest (lowest) bar on the left. Pentatonic notes,
+  // so anything the child plays sounds pleasant together.
+  const BARS = [
+    { color: '#EE8A80', freq: 523.25 },   // C5
+    { color: '#F4AE63', freq: 587.33 },   // D5
+    { color: '#F3D266', freq: 659.25 },   // E5
+    { color: '#92C982', freq: 783.99 },   // G5
+    { color: '#79AEE0', freq: 880.00 },   // A5
+  ];
+
+  const FONT = 'ui-rounded, "Arial Rounded MT Bold", "Nunito", system-ui, -apple-system, sans-serif';
+
+  // Three-note tunes for the one-instrument tier (bar indexes).
+  const BAR_TUNES = [[0, 2, 4], [4, 2, 0], [0, 1, 2], [2, 3, 4], [4, 3, 2], [0, 4, 0], [2, 0, 2], [1, 3, 1], [0, 0, 4], [4, 4, 0]];
+
+  // Difficulty ladder for dynamic difficulty adjustment (scaffolding).
+  const TIERS = [
+    { notes: 2, interval: 720, make: () => ['drum', 'drum'] },                 // two drum beats
+    { notes: 3, interval: 660, make: () => pick(BAR_TUNES).map(i => 'bar' + i) }, // 3 notes, xylophone only
+    { notes: 4, interval: 620, make: () => mixedPattern(4, 2) },                // 4 notes across instruments
+    { notes: 5, interval: 590, make: () => mixedPattern(5, 3) },                // 5 notes across instruments
+  ];
+
+  const TAU = Math.PI * 2;
+  const reduceMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  const MOTION = reduceMotion ? 0.4 : 1;
+
+  // ---------------------------------------------------------------------
+  // Small helpers
+  // ---------------------------------------------------------------------
+  const now = () => performance.now();
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const easeOutCubic = t => 1 - Math.pow(1 - t, 3);
+  const pick = arr => arr[Math.floor(Math.random() * arr.length)];
+  const kindOf = id => (id.startsWith('bar') ? 'bar' : id);
+  const log = (...args) => console.log('[RhythmMaker]', ...args);
+
+  function shuffle(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }
+
+  // A pattern that mixes instruments, using only a few different bars so the
+  // memory load stays fair for little ones.
+  function mixedPattern(n, maxBars) {
+    for (let tries = 0; tries < 200; tries++) {
+      const bars = shuffle([0, 1, 2, 3, 4]).slice(0, maxBars);
+      const out = [];
+      for (let k = 0; k < n; k++) {
+        const r = Math.random();
+        out.push(r < 0.3 ? 'drum' : r < 0.52 ? 'shaker' : 'bar' + pick(bars));
+      }
+      const kinds = new Set(out.map(kindOf)).size;
+      const distinct = new Set(out).size;
+      if (kinds >= 2 && distinct >= (n >= 5 ? 3 : 2)) return out;
+    }
+    return n >= 5 ? ['drum', 'bar0', 'bar2', 'shaker', 'drum'] : ['drum', 'bar2', 'bar2', 'shaker'];
+  }
+
+  // Mix a hex colour toward black (amt < 0) or white (amt > 0).
+  const shadeCache = new Map();
+  function shade(hex, amt) {
+    const key = hex + amt;
+    if (shadeCache.has(key)) return shadeCache.get(key);
+    const n = parseInt(hex.slice(1), 16);
+    const target = amt < 0 ? 0 : 255;
+    const p = Math.abs(amt);
+    const c = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map(v => Math.round(lerp(v, target, p)));
+    const out = `rgb(${c[0]},${c[1]},${c[2]})`;
+    shadeCache.set(key, out);
+    return out;
+  }
+
+  // ---------------------------------------------------------------------
+  // Canvas setup
+  // ---------------------------------------------------------------------
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  let W = 0, H = 0, DPR = 1;
+
+  // Layout values recomputed on every resize.
+  const L = {
+    m: 16,
+    bird: { x: 0, y: 0, r: 40 },
+    drum: { cx: 0, cy: 0, D: 100 },
+    xylo: { left: 0, cx: 0, cy: 0, X: 200, slot: 40 },
+    shaker: { cx: 0, cy: 0, S: 60 },
+  };
+
+  // Every tappable thing: 'drum', 'bar0'..'bar4', 'shaker'.
+  const TARGET_IDS = ['drum', 'bar0', 'bar1', 'bar2', 'bar3', 'bar4', 'shaker'];
+
+  // ---------------------------------------------------------------------
+  // Game state
+  // ---------------------------------------------------------------------
+  const state = {
+    phase: 'start',          // 'start' | 'play' | 'celebrate' | 'between' | 'end'
+    step: 'intro',           // inside 'play': 'intro' | 'demo' | 'turn' | 'oops'
+    stepT0: 0,
+    round: 0,                // rounds completed this session
+    tier: 0,                 // index into TIERS
+    pattern: [],             // target ids, in order
+    pos: 0,                  // how many notes the child has echoed so far
+    demo: null,              // { t0, idx, lit, interval }
+    hitAt: {},               // id -> time of its last sound (drives the visual response)
+    attempts: 0,             // times the bird has played the pattern this round
+    slips: 0,                // mismatched notes this round
+    birdReplays: 0,          // times the child asked the bird to play again
+    turnMs: 0,               // time spent on the child's turns
+    turnStart: 0,
+    birdBobT0: -1e9,
+    lastInteraction: 0,
+    roundStart: 0,
+    celebrateStart: 0,
+    particles: [],
+  };
+
+  // ---------------------------------------------------------------------
+  // Local progress tracking (localStorage, never leaves the device)
+  // ---------------------------------------------------------------------
+  function freshProgress() {
+    return { version: 1, gamesCompleted: 0, roundsCompleted: 0, patterns: 0, notesPlayed: 0, slips: 0, lastPlayed: null, sessions: [] };
+  }
+
+  function loadProgress() {
+    try {
+      const raw = window.localStorage.getItem(CONFIG.STORAGE_KEY);
+      if (raw) {
+        const data = JSON.parse(raw);
+        if (data && data.version === 1 && Array.isArray(data.sessions)) return data;
+      }
+    } catch (e) {
+      console.warn('[RhythmMaker] Progress could not be loaded (storage unavailable):', e && e.message);
+    }
+    return freshProgress();
+  }
+
+  function saveProgress() {
+    try {
+      window.localStorage.setItem(CONFIG.STORAGE_KEY, JSON.stringify(progress));
+      log('Progress saved', { gamesCompleted: progress.gamesCompleted, roundsCompleted: progress.roundsCompleted });
+    } catch (e) {
+      console.warn('[RhythmMaker] Progress could not be saved (storage unavailable):', e && e.message);
+    }
+  }
+
+  const progress = loadProgress();
+  let session = null; // created on the first round of this app launch
+
+  function ensureSession() {
+    if (session) return;
+    session = { startedAt: new Date().toISOString(), finished: false, rounds: [] };
+    progress.sessions.push(session);
+    if (progress.sessions.length > 30) progress.sessions.splice(0, progress.sessions.length - 30);
+  }
+
+  // ---------------------------------------------------------------------
+  // Audio: Web Audio instruments + optional spoken words
+  // ---------------------------------------------------------------------
+  let actx = null;
+  let master = null;       // everything goes through a gentle compressor
+  let noiseBuf = null;
+
+  // Browsers only allow audio after a user gesture, so this runs on every pointer down.
+  function unlockAudio() {
+    if (!actx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) {
+        try {
+          actx = new AC();
+          master = actx.createGain();
+          master.gain.value = 0.85;
+          try {
+            const comp = actx.createDynamicsCompressor();
+            comp.threshold.value = -12;
+            comp.ratio.value = 4;
+            master.connect(comp).connect(actx.destination);
+          } catch (e) {
+            master.connect(actx.destination);
+          }
+        } catch (e) { actx = null; master = null; }
+      }
+    }
+    if (actx && actx.state === 'suspended') actx.resume();
+  }
+
+  function tone(freq, delay, dur, vol = 0.16, type = 'sine') {
+    if (!actx) return;
+    const t = actx.currentTime + delay;
+    const osc = actx.createOscillator();
+    const gain = actx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(vol, t + 0.005);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    osc.connect(gain).connect(master);
+    osc.start(t);
+    osc.stop(t + dur + 0.05);
+  }
+
+  // A short filtered noise burst (drum skin slap, shaker beads).
+  function noiseBurst(delay, dur, type, freq, vol, q = 1, attack = 0.004) {
+    if (!actx) return;
+    if (!noiseBuf) {
+      const len = Math.floor(actx.sampleRate * 0.5);
+      noiseBuf = actx.createBuffer(1, len, actx.sampleRate);
+      const d = noiseBuf.getChannelData(0);
+      for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    }
+    const t = actx.currentTime + delay;
+    const src = actx.createBufferSource();
+    const filt = actx.createBiquadFilter();
+    const gain = actx.createGain();
+    src.buffer = noiseBuf;
+    filt.type = type;
+    filt.frequency.value = freq;
+    filt.Q.value = q;
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(vol, t + attack);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    src.connect(filt).connect(gain).connect(master);
+    src.start(t);
+    src.stop(t + dur + 0.05);
+  }
+
+  // Drum: a sine "thump" falling in pitch plus a soft skin slap.
+  function playDrum() {
+    if (!actx) return;
+    const t = actx.currentTime;
+    const osc = actx.createOscillator();
+    const gain = actx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(165, t);
+    osc.frequency.exponentialRampToValueAtTime(58, t + 0.22);
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(0.75, t + 0.005);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.42);
+    osc.connect(gain).connect(master);
+    osc.start(t);
+    osc.stop(t + 0.47);
+    noiseBurst(0, 0.09, 'lowpass', 1300, 0.28);
+  }
+
+  // Xylophone bar: a marimba-like sine with a short bright partial.
+  function mallet(freq, delay, vol = 0.24) {
+    tone(freq, delay, 0.95, vol, 'sine');
+    tone(freq * 4, delay, 0.12, vol * 0.22, 'sine');
+    tone(freq * 2, delay, 0.3, vol * 0.1, 'triangle');
+  }
+
+  // Shaker: two quick bursts of bright noise, "ch-ch".
+  function playShaker() {
+    noiseBurst(0, 0.14, 'bandpass', 5200, 0.42, 0.9, 0.018);
+    noiseBurst(0.075, 0.1, 'bandpass', 6200, 0.24, 0.9, 0.012);
+  }
+
+  const playRoundDone = () => {
+    [0, 2, 3, 4].forEach((b, i) => mallet(BARS[b].freq, 0.3 + i * 0.12, 0.2));
+    mallet(1046.5, 0.3 + 4 * 0.12, 0.2);
+  };
+
+  // Sound and visual response of one instrument, always on the same frame.
+  function sound(id, t) {
+    state.hitAt[id] = t;
+    if (id === 'drum') playDrum();
+    else if (id === 'shaker') playShaker();
+    else mallet(BARS[+id.slice(3)].freq, 0);
+  }
+
+  // Spoken words via the Web Speech API. Android WebView usually lacks it,
+  // so this quietly does nothing there and the bird's gestures carry the turn-taking.
+  function say(text) {
+    try {
+      if (!('speechSynthesis' in window)) return;
+      window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'en-US';
+      u.rate = 0.85;
+      u.pitch = 1.15;
+      window.speechSynthesis.speak(u);
+    } catch (e) { /* speech is optional */ }
+  }
+
+  // ---------------------------------------------------------------------
+  // Rounds and difficulty
+  // ---------------------------------------------------------------------
+  function startRound() {
+    ensureSession();
+    const tier = TIERS[state.tier];
+    state.pattern = tier.make();
+    state.pos = 0;
+    state.attempts = 0;
+    state.slips = 0;
+    state.birdReplays = 0;
+    state.turnMs = 0;
+    state.demo = null;
+    state.particles = [];
+    state.hitAt = {};
+    computeLayout();
+
+    state.phase = 'play';
+    setStep('intro', now());
+    state.roundStart = now();
+    state.lastInteraction = now();
+    if (state.round === 0) say('Listen to the bird!');
+    log(`Round ${state.round + 1}/${CONFIG.ROUNDS} started at level ${state.tier + 1}: pattern ${state.pattern.join(' ')}`);
+  }
+
+  function setStep(step, t) {
+    state.step = step;
+    state.stepT0 = t;
+  }
+
+  // The bird plays the whole pattern from the start.
+  function startDemo(t) {
+    state.attempts++;
+    state.pos = 0;
+    state.demo = { t0: t + CONFIG.DEMO_LEAD_MS, idx: 0, lit: -1, litT: 0, interval: TIERS[state.tier].interval };
+    setStep('demo', t);
+    log(`Bird plays the pattern (time ${state.attempts})`);
+  }
+
+  // Fire demo notes on the frame they are due; then hand the turn to the child.
+  function updateDemo(t) {
+    const d = state.demo;
+    while (d.idx < state.pattern.length && t >= d.t0 + d.idx * d.interval) {
+      sound(state.pattern[d.idx], t);
+      d.lit = d.idx;
+      d.litT = t;
+      d.idx++;
+    }
+    const end = d.t0 + (state.pattern.length - 1 + CONFIG.TURN_GAP) * d.interval;
+    if (d.idx >= state.pattern.length && t >= end) beginTurn(t);
+  }
+
+  function beginTurn(t) {
+    setStep('turn', t);
+    state.turnStart = t;
+    state.lastInteraction = t;
+    if (state.attempts === 1) say('Your turn!');
+    log('Child\'s turn: echo', state.pattern.join(' '));
+  }
+
+  // A tap on an instrument during the child's turn.
+  function judge(id, t) {
+    const expected = state.pattern[state.pos];
+    if (id === expected) {
+      state.pos++;
+      state.birdBobT0 = t;
+      log(`Answer accepted: note ${state.pos}/${state.pattern.length} (${id})`);
+      if (state.pos >= state.pattern.length) {
+        state.turnMs += t - state.turnStart;
+        completeRound(t);
+      }
+    } else {
+      // Control of error: the note already played; the bird calmly plays the pattern again.
+      state.slips++;
+      progress.slips++;
+      state.turnMs += t - state.turnStart;
+      setStep('oops', t);
+      log(`Item rejected: expected ${expected}, got ${id}; the bird will play it again`);
+    }
+  }
+
+  function completeRound(t) {
+    const ms = state.turnMs;
+    const record = {
+      level: state.tier + 1,
+      notes: state.pattern.length,
+      pattern: state.pattern.join(' '),
+      attempts: state.attempts,
+      slips: state.slips,
+      birdReplays: state.birdReplays,
+      seconds: Math.round(ms / 100) / 10,
+    };
+
+    session.rounds.push(record);
+    progress.roundsCompleted++;
+    progress.patterns++;
+    progress.lastPlayed = new Date().toISOString();
+    state.round++;
+    log('Level completed', record);
+
+    const finalRound = state.round >= CONFIG.ROUNDS;
+    if (finalRound) {
+      session.finished = true;
+      progress.gamesCompleted++;
+    } else {
+      // Praise the listening and the effort (growth mindset).
+      say(state.slips > 0 ? 'You kept trying, and you did it!' : 'You played it just like the bird!');
+    }
+    saveProgress();
+    adjustDifficulty(record, ms);
+
+    playRoundDone();
+    instrumentCenters().forEach(c => spawnParticles(c.x, c.y, c.size, c.color, t));
+    setStep('done', t);
+    state.phase = 'celebrate';
+    state.celebrateStart = t;
+  }
+
+  // Simple DDA: quick and clean -> one step harder; a real struggle -> one step easier.
+  function adjustDifficulty(record, ms) {
+    const fast = ms / record.notes <= CONFIG.FAST_MS_PER_NOTE;
+    const before = state.tier;
+    if (record.slips === 0 && record.birdReplays === 0 && fast) {
+      state.tier = Math.min(TIERS.length - 1, state.tier + 1);
+    } else if (record.slips >= 2) {
+      state.tier = Math.max(0, state.tier - 1);
+    }
+    if (state.tier !== before) log(`Difficulty ${state.tier > before ? 'up' : 'down'}: level ${before + 1} -> ${state.tier + 1}`);
+  }
+
+  function enterEnd() {
+    state.phase = 'end';
+    say('Great job! Time to play outside!');
+    log('Session finished: end screen shown, no replay offered');
+  }
+
+  // ---------------------------------------------------------------------
+  // Layout
+  // ---------------------------------------------------------------------
+  // The bird stands on a little podium top-centre. Wide screens put the three
+  // instruments in one row; tall screens put the xylophone on top and the
+  // drum and shaker side by side below it.
+  function computeLayout() {
+    const minDim = Math.min(W, H);
+    const m = clamp(minDim * 0.045, 12, 36);
+    const b = clamp(minDim * 0.1, 28, 70);
+    L.m = m;
+    L.bird = { x: W / 2, y: m + b * 1.15, r: b };
+
+    const top = L.bird.y + b * 1.25 + m * 0.6;      // just under the podium
+    const aw = W - 2 * m;
+    const ah = Math.max(140, H - m - top);
+    let drumBox, xyloBox, shakerBox;
+
+    if (aw > ah * 1.6) {
+      const unit = (aw - 2 * m) / 3.65;
+      drumBox = { x: m, y: top, w: unit, h: ah };
+      xyloBox = { x: m + unit + m, y: top, w: unit * 1.9, h: ah };
+      shakerBox = { x: m + unit * 2.9 + 2 * m, y: top, w: unit * 0.75, h: ah };
+    } else {
+      const h1 = ah * 0.48 - m / 2, h2 = ah * 0.52 - m / 2;
+      xyloBox = { x: m, y: top, w: aw, h: h1 };
+      drumBox = { x: m, y: top + h1 + m, w: aw * 0.56, h: h2 };
+      shakerBox = { x: m + aw * 0.56, y: top + h1 + m, w: aw * 0.44, h: h2 };
+    }
+
+    const D = Math.min(drumBox.w * 0.9, drumBox.h / 0.95 * 0.9);
+    L.drum = { cx: drumBox.x + drumBox.w / 2, cy: drumBox.y + drumBox.h / 2, D };
+
+    const X = Math.min(xyloBox.w * 0.96, xyloBox.h / 0.66 * 0.96);
+    L.xylo = { left: xyloBox.x + (xyloBox.w - X) / 2, cx: xyloBox.x + xyloBox.w / 2, cy: xyloBox.y + xyloBox.h / 2, X, slot: X / 5 };
+
+    const S = Math.min(shakerBox.w * 0.7, shakerBox.h / 2.2 * 0.9);
+    L.shaker = { cx: shakerBox.x + shakerBox.w / 2, cy: shakerBox.y + shakerBox.h / 2, S };
+  }
+
+  const barHeight = i => L.xylo.X * (0.6 - i * 0.07);
+  const barCenter = i => ({ x: L.xylo.left + L.xylo.slot * (i + 0.5), y: L.xylo.cy });
+
+  // Where each target sits (for the bird's baton, sparkles and the debug hook).
+  function targetCenter(id) {
+    if (id === 'drum') return { x: L.drum.cx, y: L.drum.cy, size: L.drum.D, color: COLORS.drum };
+    if (id === 'shaker') return { x: L.shaker.cx, y: L.shaker.cy, size: L.shaker.S * 1.4, color: COLORS.shaker };
+    const i = +id.slice(3);
+    const c = barCenter(i);
+    return { x: c.x, y: c.y, size: L.xylo.slot * 1.2, color: BARS[i].color };
+  }
+
+  const instrumentCenters = () => [targetCenter('drum'), { x: L.xylo.cx, y: L.xylo.cy, size: L.xylo.X * 0.7, color: BARS[2].color }, targetCenter('shaker')];
+
+  // Forgiving hit boxes, all well beyond the drawn instruments. Bars split
+  // the xylophone into full-height columns so neighbours never overlap.
+  function hitBox(id) {
+    if (id === 'drum') {
+      const { cx, cy, D } = L.drum, pad = D * 0.15 + 10;
+      return { x0: cx - D / 2 - pad, x1: cx + D / 2 + pad, y0: cy - D * 0.45 - pad, y1: cy + D * 0.45 + pad };
+    }
+    if (id === 'shaker') {
+      const { cx, cy, S } = L.shaker;
+      return { x0: cx - S * 0.75 - 10, x1: cx + S * 0.75 + 10, y0: cy - S * 1.15 - 10, y1: cy + S * 1.15 + 10 };
+    }
+    const i = +id.slice(3);
+    const { left, slot, cy, X } = L.xylo;
+    return { x0: left + slot * i, x1: left + slot * (i + 1), y0: cy - X * 0.36 - 12, y1: cy + X * 0.36 + 12 };
+  }
+
+  function findTarget(p) {
+    let best = null, bestD = Infinity;
+    for (const id of TARGET_IDS) {
+      const b = hitBox(id);
+      if (p.x >= b.x0 && p.x <= b.x1 && p.y >= b.y0 && p.y <= b.y1) {
+        const c = targetCenter(id);
+        const d = Math.hypot(p.x - c.x, p.y - c.y);
+        if (d < bestD) { best = id; bestD = d; }
+      }
+    }
+    return best;
+  }
+
+  const onBird = p => Math.hypot(p.x - L.bird.x, p.y - L.bird.y) <= L.bird.r * 1.35;
+
+  // ---------------------------------------------------------------------
+  // Input: touch + mouse
+  // ---------------------------------------------------------------------
+  let activeTouch = null;
+  let mouseDown = false;
+  let parentTimer = null;
+
+  function toCanvas(clientX, clientY) {
+    const r = canvas.getBoundingClientRect();
+    return { x: clientX - r.left, y: clientY - r.top };
+  }
+
+  function findTouch(list, id) {
+    for (let i = 0; i < list.length; i++) if (list[i].identifier === id) return list[i];
+    return null;
+  }
+
+  function cancelParentHold() {
+    if (parentTimer) { clearTimeout(parentTimer); parentTimer = null; }
+  }
+
+  function onDown(p) {
+    unlockAudio();
+    const t = now();
+
+    if (state.phase === 'start' || state.phase === 'between') {
+      state.lastInteraction = t;
+      const g = starGeom();
+      if (Math.hypot(p.x - g.cx, p.y - g.cy) <= g.R * 1.8) { startRound(); return; }
+    } else if ((state.phase === 'play' && state.step !== 'intro' && state.step !== 'demo') || state.phase === 'celebrate') {
+      // Free play: every instrument always answers (except while the bird is showing the pattern).
+      const id = findTarget(p);
+      if (id) {
+        state.lastInteraction = t;
+        progress.notesPlayed++;
+        sound(id, t);
+        if (state.phase === 'play' && state.step === 'turn') judge(id, t);
+        return;
+      }
+      // Tapping the bird asks it to play the pattern again.
+      if (state.phase === 'play' && onBird(p)) {
+        state.lastInteraction = t;
+        if (state.step === 'turn') state.turnMs += t - state.turnStart;
+        state.birdReplays++;
+        state.birdBobT0 = t;
+        startDemo(t);
+        return;
+      }
+    }
+
+    // Hidden parent view: hold the top-left corner still for 3 seconds.
+    if (p.x < CONFIG.PARENT_CORNER_PX && p.y < CONFIG.PARENT_CORNER_PX) {
+      cancelParentHold();
+      parentTimer = setTimeout(openParent, CONFIG.PARENT_HOLD_MS);
+    }
+  }
+
+  function onMove(p) {
+    if (parentTimer && (p.x >= CONFIG.PARENT_CORNER_PX || p.y >= CONFIG.PARENT_CORNER_PX)) cancelParentHold();
+  }
+
+  function onUp() {
+    cancelParentHold();
+  }
+
+  canvas.addEventListener('touchstart', e => {
+    e.preventDefault();
+    if (activeTouch !== null) return;          // one finger at a time
+    const t = e.changedTouches[0];
+    activeTouch = t.identifier;
+    onDown(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  canvas.addEventListener('touchmove', e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (t) onMove(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  const endTouch = e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (!t) return;
+    activeTouch = null;
+    onUp();
+  };
+  canvas.addEventListener('touchend', endTouch, { passive: false });
+  canvas.addEventListener('touchcancel', endTouch, { passive: false });
+
+  canvas.addEventListener('mousedown', e => { mouseDown = true; onDown(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mousemove', e => { if (mouseDown) onMove(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mouseup', () => {
+    if (!mouseDown) return;
+    mouseDown = false;
+    onUp();
+  });
+
+  // ---------------------------------------------------------------------
+  // Parent view (hidden, local data only)
+  // ---------------------------------------------------------------------
+  const parentEl = document.getElementById('parent');
+  const parentBody = document.getElementById('parentBody');
+
+  function el(tag, text) {
+    const node = document.createElement(tag);
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function openParent() {
+    parentTimer = null;
+    const rounds = progress.sessions.reduce((a, s) => a + s.rounds.length, 0);
+    const clean = progress.sessions.reduce((a, s) => a + s.rounds.filter(r => r.slips === 0).length, 0);
+
+    parentBody.textContent = '';
+    parentBody.appendChild(el('div', `Full games finished: ${progress.gamesCompleted}`));
+    parentBody.appendChild(el('div', `Patterns echoed: ${progress.patterns}`));
+    parentBody.appendChild(el('div', `Echoed with no slips: ${rounds ? Math.round(100 * clean / rounds) : 0}%`));
+    parentBody.appendChild(el('div', `Notes the child played (incl. free play): ${progress.notesPlayed}`));
+
+    const recent = progress.sessions.slice(-6).reverse();
+    if (recent.length) {
+      const table = el('table');
+      const head = el('tr');
+      ['When', 'Rounds', 'Longest', 'Slips'].forEach(h => head.appendChild(el('th', h)));
+      table.appendChild(head);
+      recent.forEach(s => {
+        const tr = el('tr');
+        const when = new Date(s.startedAt);
+        tr.appendChild(el('td', when.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' ' +
+          when.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })));
+        tr.appendChild(el('td', `${s.rounds.length}/${CONFIG.ROUNDS}`));
+        const longest = s.rounds.reduce((a, r) => Math.max(a, r.notes), 0);
+        tr.appendChild(el('td', longest ? `${longest} notes` : '-'));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => a + r.slips, 0))));
+        table.appendChild(tr);
+      });
+      parentBody.appendChild(table);
+    }
+    parentEl.hidden = false;
+    log('Parent view opened', progress);
+  }
+
+  parentEl.addEventListener('click', () => { parentEl.hidden = true; });
+
+  // Read-only debug hooks for the Android/desktop console.
+  window.MusicRhythmMaker = {
+    progress: () => JSON.parse(JSON.stringify(progress)),
+    state: () => ({
+      phase: state.phase,
+      step: state.step,
+      listening: state.phase === 'play' && state.step === 'turn',
+      round: state.round,
+      level: state.tier + 1,
+      pattern: state.pattern.slice(),
+      pos: state.pos,
+      nextExpected: state.phase === 'play' ? state.pattern[state.pos] || null : null,
+      targets: TARGET_IDS.map(id => { const c = targetCenter(id); return { id, x: c.x, y: c.y, correct: state.phase === 'play' && id === state.pattern[state.pos] }; }),
+      bird: { x: L.bird.x, y: L.bird.y, r: L.bird.r },
+      star: (state.phase === 'start' || state.phase === 'between') ? { x: starGeom().cx, y: starGeom().cy } : null,
+    }),
+  };
+
+  // ---------------------------------------------------------------------
+  // Drawing primitives
+  // ---------------------------------------------------------------------
+  function roundRectPath(x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  function oval(x, y, rx, ry, rot = 0) { ctx.beginPath(); ctx.ellipse(x, y, Math.max(0.01, rx), Math.max(0.01, ry), rot, 0, TAU); }
+
+  // 0..1 response for a target that just sounded (1 at the hit, fading out).
+  function hitK(id, t) {
+    const h = state.hitAt[id];
+    if (h === undefined) return 0;
+    const p = (t - h) / CONFIG.HIT_MS;
+    return p >= 0 && p < 1 ? 1 - p : 0;
+  }
+
+  // A soft halo behind a target (used for the idle hint and the glow hint).
+  function halo(x, y, rx, ry, color, k) {
+    if (k <= 0) return;
+    ctx.save();
+    ctx.globalAlpha = 0.22 + 0.38 * k;
+    ctx.fillStyle = shade(color, 0.4);
+    oval(x, y, rx, ry);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // Drum: purple body with a cream rope zig-zag, cream skin that ripples when hit.
+  function drawDrum(t, g) {
+    const { cx, cy, D } = L.drum;
+    const k = hitK('drum', t);
+    const pulse = g.id === 'drum' ? g.pulse : 1;
+    const rx = D * 0.5, ry = D * 0.16;
+    const topY = cy - D * 0.22, botY = cy + D * 0.3;
+
+    if (g.id === 'drum') halo(cx, cy, D * 0.68, D * 0.6, COLORS.drum, g.glow);
+
+    ctx.save();
+    ctx.translate(cx, botY);
+    ctx.scale(pulse * (1 + 0.03 * k * MOTION), pulse * (1 - 0.05 * k * MOTION));
+    ctx.translate(-cx, -botY);
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    const lw = Math.max(2, D * 0.022);
+
+    // Shadow.
+    ctx.fillStyle = 'rgba(74, 64, 54, 0.13)';
+    oval(cx, botY + D * 0.06, rx * 1.02, ry * 0.9);
+    ctx.fill();
+
+    // Body.
+    ctx.beginPath();
+    ctx.moveTo(cx - rx, topY);
+    ctx.lineTo(cx - rx, botY);
+    ctx.ellipse(cx, botY, rx, ry, 0, Math.PI, 0, true);
+    ctx.lineTo(cx + rx, topY);
+    ctx.closePath();
+    ctx.fillStyle = COLORS.drum;
+    ctx.fill();
+    ctx.lineWidth = lw;
+    ctx.strokeStyle = shade(COLORS.drum, -0.28);
+    ctx.stroke();
+
+    // Rope zig-zag between the rims.
+    ctx.strokeStyle = COLORS.skin;
+    ctx.lineWidth = Math.max(1.5, D * 0.018);
+    ctx.beginPath();
+    const zig = 7;
+    for (let i = 0; i <= zig; i++) {
+      const a = Math.PI - (i / zig) * Math.PI;           // front half, left to right
+      const x = cx + Math.cos(a) * rx * 0.96;
+      const yTop = topY + Math.sin(a) * ry + D * 0.06;
+      const yBot = botY + Math.sin(a) * ry - D * 0.06;
+      if (i === 0) ctx.moveTo(x, yTop);
+      ctx.lineTo(x, i % 2 === 0 ? yTop : yBot);
+    }
+    ctx.stroke();
+
+    // Bottom rim band.
+    ctx.strokeStyle = COLORS.rim;
+    ctx.lineWidth = D * 0.05;
+    ctx.beginPath();
+    ctx.ellipse(cx, botY - D * 0.025, rx * 0.985, ry, 0, 0, Math.PI);
+    ctx.stroke();
+
+    // Skin and top rim.
+    const sy = ry * (1 - 0.12 * k * MOTION);
+    oval(cx, topY, rx, sy);
+    ctx.fillStyle = COLORS.skin;
+    ctx.fill();
+    ctx.lineWidth = D * 0.045;
+    ctx.strokeStyle = COLORS.rim;
+    ctx.stroke();
+    ctx.lineWidth = lw * 0.7;
+    ctx.strokeStyle = shade(COLORS.rim, -0.3);
+    oval(cx, topY, rx * 1.02, sy * 1.06);
+    ctx.stroke();
+
+    // Ripples spread across the skin after a hit.
+    if (k > 0) {
+      for (let w = 0; w < 2; w++) {
+        const p = clamp(1 - k - w * 0.25, 0, 1);
+        if (p <= 0) continue;
+        ctx.globalAlpha = (1 - p) * 0.7;
+        ctx.strokeStyle = shade(COLORS.drum, 0.2);
+        ctx.lineWidth = Math.max(1.5, D * 0.02);
+        oval(cx, topY, rx * 0.85 * p, sy * 0.85 * p);
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+    }
+    ctx.restore();
+  }
+
+  // Xylophone: two wooden rails, five rainbow bars that glow when they sound.
+  function drawXylophone(t, g) {
+    const { left, slot, cy, X } = L.xylo;
+    const right = left + slot * 5;
+    const h0 = barHeight(0), h4 = barHeight(4);
+
+    // Shadow and rails.
+    ctx.fillStyle = 'rgba(74, 64, 54, 0.12)';
+    oval(L.xylo.cx, cy + h0 * 0.5 + X * 0.04, X * 0.5, X * 0.05);
+    ctx.fill();
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = COLORS.wood;
+    ctx.lineWidth = Math.max(4, X * 0.035);
+    for (const f of [-0.3, 0.3]) {
+      ctx.beginPath();
+      ctx.moveTo(left - slot * 0.12, cy + h0 * f);
+      ctx.lineTo(right + slot * 0.12, cy + h4 * f);
+      ctx.stroke();
+    }
+    ctx.strokeStyle = shade(COLORS.wood, -0.25);
+    ctx.lineWidth = Math.max(1.5, X * 0.008);
+    for (const f of [-0.3, 0.3]) {
+      ctx.beginPath();
+      ctx.moveTo(left - slot * 0.12, cy + h0 * f + X * 0.0175);
+      ctx.lineTo(right + slot * 0.12, cy + h4 * f + X * 0.0175);
+      ctx.stroke();
+    }
+
+    for (let i = 0; i < 5; i++) {
+      const id = 'bar' + i;
+      const c = barCenter(i);
+      const col = BARS[i].color;
+      const k = hitK(id, t);
+      const hh = barHeight(i);
+      const pulse = g.id === id ? g.pulse : 1;
+      const bw = slot * 0.74 * pulse, bh = hh * pulse;
+      const by = c.y + k * X * 0.012 * MOTION;      // a tiny push down when struck
+
+      if (g.id === id) halo(c.x, c.y, slot * 0.7, hh * 0.62, col, g.glow);
+      if (k > 0) halo(c.x, by, slot * 0.62, hh * 0.6, col, k);
+
+      ctx.beginPath();
+      roundRectPath(c.x - bw / 2, by - bh / 2, bw, bh, bw * 0.28);
+      ctx.fillStyle = k > 0 ? shade(col, 0.25 * k) : col;
+      ctx.fill();
+      ctx.lineWidth = Math.max(1.5, slot * 0.04);
+      ctx.strokeStyle = shade(col, -0.25);
+      ctx.stroke();
+
+      // Shine stripe.
+      ctx.globalAlpha = 0.35;
+      ctx.fillStyle = '#fff';
+      ctx.beginPath();
+      roundRectPath(c.x - bw * 0.3, by - bh * 0.4, bw * 0.16, bh * 0.5, bw * 0.08);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+
+      // Pegs where the bar rests on the rails.
+      ctx.fillStyle = '#E8E1D6';
+      ctx.strokeStyle = 'rgba(74, 64, 54, 0.35)';
+      ctx.lineWidth = 1;
+      for (const f of [-0.3, 0.3]) {
+        const py = lerp(cy + h0 * f, cy + h4 * f, (c.x - left + slot * 0.12) / (right - left + slot * 0.24)) + (by - c.y);
+        ctx.beginPath(); ctx.arc(c.x, py, Math.max(2, slot * 0.07), 0, TAU); ctx.fill(); ctx.stroke();
+      }
+    }
+  }
+
+  // Shaker: a polka-dot maraca that rattles side to side when it sounds.
+  function drawShaker(t, g) {
+    const { cx, cy, S } = L.shaker;
+    const k = hitK('shaker', t);
+    const pulse = g.id === 'shaker' ? g.pulse : 1;
+    const col = COLORS.shaker;
+
+    if (g.id === 'shaker') halo(cx, cy, S * 0.95, S * 1.25, col, g.glow);
+
+    // Shadow under the handle end.
+    ctx.fillStyle = 'rgba(74, 64, 54, 0.12)';
+    oval(cx, cy + S * 1.05, S * 0.5, S * 0.08);
+    ctx.fill();
+
+    ctx.save();
+    ctx.translate(cx, cy + S * 0.7);
+    const shake = k > 0 ? Math.sin((1 - k) * Math.PI * 6) * 0.28 * k * MOTION : 0;
+    ctx.rotate(-0.22 + shake);
+    ctx.scale(pulse, pulse);
+    ctx.translate(0, -S * 0.7);
+    ctx.lineJoin = 'round';
+    const lw = Math.max(2, S * 0.045);
+
+    // Handle.
+    ctx.beginPath();
+    roundRectPath(-S * 0.12, S * 0.1, S * 0.24, S * 0.95, S * 0.12);
+    ctx.fillStyle = COLORS.wood;
+    ctx.fill();
+    ctx.lineWidth = lw;
+    ctx.strokeStyle = shade(COLORS.wood, -0.28);
+    ctx.stroke();
+
+    // Head.
+    oval(0, -S * 0.42, S * 0.5, S * 0.62);
+    ctx.fillStyle = col;
+    ctx.fill();
+    ctx.strokeStyle = shade(col, -0.28);
+    ctx.stroke();
+
+    // Zig-zag band and dots.
+    ctx.save();
+    oval(0, -S * 0.42, S * 0.5, S * 0.62);
+    ctx.clip();
+    ctx.fillStyle = COLORS.skin;
+    ctx.fillRect(-S * 0.6, -S * 0.5, S * 1.2, S * 0.18);
+    ctx.strokeStyle = shade(col, -0.1);
+    ctx.lineWidth = Math.max(1.5, S * 0.04);
+    ctx.beginPath();
+    for (let i = 0; i <= 8; i++) {
+      const x = -S * 0.6 + i * S * 0.15;
+      const y = -S * 0.41 + (i % 2 ? -S * 0.05 : S * 0.05);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    ctx.fillStyle = COLORS.skin;
+    for (const [dx, dy] of [[-0.22, -0.78], [0.18, -0.72], [0, -0.92], [-0.25, -0.15], [0.22, -0.2], [0, -0.05]]) {
+      ctx.beginPath(); ctx.arc(dx * S, dy * S, S * 0.055, 0, TAU); ctx.fill();
+    }
+    ctx.restore();
+
+    // Shine.
+    ctx.globalAlpha = 0.35;
+    ctx.fillStyle = '#fff';
+    oval(-S * 0.2, -S * 0.7, S * 0.08, S * 0.16, -0.4);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.restore();
+
+    // Little rattle lines beside the head while it sounds.
+    if (k > 0) {
+      ctx.save();
+      ctx.globalAlpha = k * 0.8;
+      ctx.strokeStyle = shade(col, -0.15);
+      ctx.lineCap = 'round';
+      ctx.lineWidth = Math.max(2, S * 0.05);
+      for (const side of [-1, 1]) {
+        for (let j = 0; j < 2; j++) {
+          const r = S * (0.75 + j * 0.18);
+          ctx.beginPath();
+          ctx.arc(cx, cy - S * 0.4, r, side < 0 ? Math.PI - 0.35 : -0.35, side < 0 ? Math.PI + 0.35 : 0.35);
+          ctx.stroke();
+        }
+      }
+      ctx.restore();
+    }
+  }
+
+  // An eighth note glyph (used in the bird's dance).
+  function drawNote(x, y, r, color) {
+    ctx.fillStyle = color;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = Math.max(1.5, r * 0.28);
+    ctx.lineCap = 'round';
+    oval(x, y, r, r * 0.75, -0.4);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(x + r * 0.85, y - r * 0.2);
+    ctx.lineTo(x + r * 0.85, y - r * 2.6);
+    ctx.quadraticCurveTo(x + r * 1.9, y - r * 2.1, x + r * 1.8, y - r * 1.3);
+    ctx.stroke();
+  }
+
+  // How the bird stands right now: where it looks, where the baton points, etc.
+  function birdPose(t) {
+    const b = L.bird.r;
+    const pose = { lookX: 0, lookY: 0.35, baton: -Math.PI / 2 + 0.5, wingOpen: 0, bob: 0, tilt: 0, happy: false, beak: 0, flap: 0 };
+    const bp = (t - state.birdBobT0) / 300;
+    if (bp >= 0 && bp < 1) pose.bob = Math.sin(Math.PI * bp) * b * 0.12 * MOTION;
+
+    if (state.phase === 'celebrate') {
+      const k = (t - state.celebrateStart) / 420;
+      pose.bob = Math.abs(Math.sin(Math.PI * k)) * b * 0.3 * MOTION;
+      pose.tilt = 0.15 * Math.sin(Math.PI * k) * MOTION;
+      pose.baton = -Math.PI / 2 + 0.7 * Math.sin(Math.PI * k);
+      pose.flap = 0.5 + 0.5 * Math.sin(TAU * k);
+      pose.happy = true;
+      pose.beak = 0.6;
+      return pose;
+    }
+    if (state.phase !== 'play') return pose;
+
+    if (state.step === 'demo' && state.demo && state.demo.lit >= 0) {
+      // Point the baton at the instrument that is sounding, and look at it.
+      const c = targetCenter(state.pattern[state.demo.lit]);
+      const ang = Math.atan2(c.y - L.bird.y, c.x - (L.bird.x + b * 0.75));
+      const flick = Math.max(0, 1 - (t - state.demo.litT) / 220);
+      pose.baton = ang - 0.25 * flick * MOTION;
+      pose.lookX = Math.cos(ang) * 0.9;
+      pose.lookY = Math.sin(ang) * 0.9;
+      pose.beak = 0.35 * flick;
+    } else if (state.step === 'turn') {
+      // Looking at the child, one wing held out: "your turn".
+      pose.lookX = 0;
+      pose.lookY = 0.3;
+      pose.baton = Math.PI / 2 - 0.6;
+      pose.wingOpen = 1;
+    } else if (state.step === 'oops') {
+      // A calm, curious head tilt before playing it again.
+      const p = clamp((t - state.stepT0) / 300, 0, 1);
+      pose.tilt = -0.14 * p * MOTION;
+      pose.lookX = -0.4;
+      pose.lookY = -0.3;
+      pose.baton = -Math.PI / 2 + 0.5;
+    }
+    return pose;
+  }
+
+  // The conductor: a round teal bird with a red bow tie, on a little podium.
+  function drawBird(t) {
+    const { x, y, r: b } = L.bird;
+    const pose = birdPose(t);
+    const lw = Math.max(1.5, b * 0.06);
+    const outline = shade(COLORS.bird, -0.3);
+
+    // Podium (stays put while the bird bobs).
+    ctx.beginPath();
+    roundRectPath(x - b * 0.95, y + b * 0.78, b * 1.9, b * 0.42, b * 0.12);
+    ctx.fillStyle = COLORS.wood;
+    ctx.fill();
+    ctx.lineWidth = lw;
+    ctx.strokeStyle = shade(COLORS.wood, -0.28);
+    ctx.stroke();
+    ctx.fillStyle = shade(COLORS.wood, 0.2);
+    ctx.fillRect(x - b * 0.8, y + b * 0.86, b * 1.6, b * 0.06);
+
+    ctx.save();
+    ctx.translate(x, y - pose.bob);
+    ctx.rotate(pose.tilt);
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.lineWidth = lw;
+
+    // Feet.
+    ctx.strokeStyle = shade(COLORS.beak, -0.2);
+    for (const side of [-1, 1]) {
+      ctx.beginPath();
+      ctx.moveTo(side * b * 0.22, b * 0.62); ctx.lineTo(side * b * 0.22, b * 0.8 + pose.bob);
+      ctx.stroke();
+    }
+
+    // Tail and crest behind the body.
+    ctx.strokeStyle = outline;
+    ctx.save(); ctx.translate(-b * 0.62, b * 0.35); ctx.rotate(0.9);
+    oval(0, 0, b * 0.14, b * 0.34); ctx.fillStyle = shade(COLORS.bird, -0.1); ctx.fill(); ctx.stroke();
+    ctx.restore();
+    for (const [dx, a] of [[-0.1, -0.4], [0.06, 0.15]]) {
+      ctx.save(); ctx.translate(dx * b, -b * 0.72); ctx.rotate(a);
+      oval(0, -b * 0.14, b * 0.08, b * 0.18); ctx.fillStyle = COLORS.bird; ctx.fill(); ctx.stroke();
+      ctx.restore();
+    }
+
+    // Body.
+    oval(0, 0, b * 0.78, b * 0.76);
+    ctx.fillStyle = COLORS.bird;
+    ctx.fill();
+    ctx.stroke();
+    oval(0, b * 0.28, b * 0.48, b * 0.38);
+    ctx.fillStyle = COLORS.belly;
+    ctx.fill();
+
+    // Left wing: tucked, or held out palm-up on the child's turn, or flapping in the dance.
+    ctx.save();
+    ctx.translate(-b * 0.66, b * 0.08);
+    ctx.rotate(0.35 + pose.wingOpen * 1.05 * MOTION + pose.flap * 0.6 * MOTION);   // positive swings it outward
+    oval(0, b * 0.22, b * 0.16, b * 0.32);
+    ctx.fillStyle = shade(COLORS.bird, -0.12);
+    ctx.fill();
+    ctx.strokeStyle = outline;
+    ctx.stroke();
+    ctx.restore();
+
+    // Right wing holds the baton.
+    const hx = b * 0.72, hy = b * 0.12;
+    ctx.save();
+    ctx.translate(hx, hy);
+    ctx.rotate(pose.baton);
+    ctx.strokeStyle = '#FFFDF8';
+    ctx.lineWidth = Math.max(2, b * 0.07);
+    ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(b * 0.95, 0); ctx.stroke();
+    ctx.strokeStyle = 'rgba(74, 64, 54, 0.35)';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(b * 0.1, b * 0.035); ctx.lineTo(b * 0.95, b * 0.02); ctx.stroke();
+    ctx.fillStyle = shade(COLORS.wood, -0.1);
+    oval(b * 0.08, 0, b * 0.1, b * 0.06);
+    ctx.fill();
+    ctx.restore();
+    oval(hx - b * 0.02, hy, b * 0.15, b * 0.22, -0.5 - pose.flap * 0.5 * MOTION);
+    ctx.fillStyle = shade(COLORS.bird, -0.12);
+    ctx.fill();
+    ctx.strokeStyle = outline;
+    ctx.lineWidth = lw;
+    ctx.stroke();
+
+    // Eyes: white, with pupils that follow the music (or look at the child).
+    const blink = !pose.happy && (t % 3600) < 130;
+    for (const side of [-1, 1]) {
+      const ex = side * b * 0.27, ey = -b * 0.26;
+      if (pose.happy) {
+        ctx.strokeStyle = COLORS.ink;
+        ctx.lineWidth = Math.max(1.5, b * 0.06);
+        ctx.beginPath(); ctx.arc(ex, ey + b * 0.05, b * 0.11, 1.15 * Math.PI, 1.85 * Math.PI); ctx.stroke();
+        continue;
+      }
+      oval(ex, ey, b * 0.17, blink ? b * 0.02 : b * 0.19);
+      ctx.fillStyle = '#FFFDF8';
+      ctx.fill();
+      ctx.lineWidth = Math.max(1, b * 0.035);
+      ctx.strokeStyle = outline;
+      ctx.stroke();
+      if (blink) continue;
+      const px = ex + pose.lookX * b * 0.06, py = ey + pose.lookY * b * 0.07;
+      ctx.fillStyle = COLORS.ink;
+      ctx.beginPath(); ctx.arc(px, py, b * 0.095, 0, TAU); ctx.fill();
+      ctx.fillStyle = '#fff';
+      ctx.beginPath(); ctx.arc(px + b * 0.03, py - b * 0.035, b * 0.032, 0, TAU); ctx.fill();
+    }
+
+    // Beak (opens a little with each demo note and in the dance).
+    const open = pose.beak * b * 0.08;
+    ctx.fillStyle = shade(COLORS.beak, -0.12);
+    ctx.beginPath(); ctx.moveTo(-b * 0.1, -b * 0.06); ctx.lineTo(b * 0.1, -b * 0.06); ctx.lineTo(0, b * 0.06 + open); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = COLORS.beak;
+    ctx.beginPath(); ctx.moveTo(-b * 0.13, -b * 0.1); ctx.lineTo(b * 0.13, -b * 0.1); ctx.lineTo(0, b * 0.04 - open * 0.3); ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = shade(COLORS.beak, -0.3);
+    ctx.lineWidth = Math.max(1, b * 0.03);
+    ctx.stroke();
+
+    // Bow tie.
+    ctx.fillStyle = COLORS.bowtie;
+    ctx.strokeStyle = shade(COLORS.bowtie, -0.3);
+    for (const side of [-1, 1]) {
+      ctx.beginPath();
+      ctx.moveTo(0, b * 0.16);
+      ctx.lineTo(side * b * 0.2, b * 0.06);
+      ctx.lineTo(side * b * 0.2, b * 0.28);
+      ctx.closePath();
+      ctx.fill(); ctx.stroke();
+    }
+    ctx.beginPath(); ctx.arc(0, b * 0.17, b * 0.055, 0, TAU); ctx.fill(); ctx.stroke();
+
+    // Cheeks.
+    ctx.globalAlpha = 0.4;
+    ctx.fillStyle = COLORS.cheek;
+    for (const side of [-1, 1]) { oval(side * b * 0.45, -b * 0.05, b * 0.09, b * 0.055); ctx.fill(); }
+    ctx.globalAlpha = 1;
+    ctx.restore();
+
+    // In the dance, three music notes drift up (always the same three).
+    if (state.phase === 'celebrate') {
+      const e = (t - state.celebrateStart) / CONFIG.CELEBRATE_MS;
+      [[-1.3, 0], [1.4, 0.25], [-0.4, 0.5]].forEach(([dx, delay], i) => {
+        const p = clamp((e - delay * 0.5) * 1.6, 0, 1);
+        if (p <= 0 || p >= 1) return;
+        ctx.globalAlpha = 1 - p;
+        drawNote(x + dx * b + Math.sin(p * TAU) * b * 0.15, y - b * 0.4 - p * b * 1.3, b * 0.13, [BARS[0].color, BARS[4].color, BARS[3].color][i]);
+      });
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function drawStar(cx, cy, R, fill, face) {
+    ctx.save();
+    ctx.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const rad = i % 2 === 0 ? R : R * 0.5;
+      const a = -Math.PI / 2 + i * Math.PI / 5;
+      const x = cx + rad * Math.cos(a), y = cy + rad * Math.sin(a);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    ctx.lineJoin = 'round';
+    if (fill) {
+      ctx.fillStyle = fill;
+      ctx.fill();
+      ctx.strokeStyle = fill;            // same-colour stroke rounds the tips
+      ctx.lineWidth = Math.max(2, R * 0.16);
+      ctx.stroke();
+    } else {
+      ctx.strokeStyle = 'rgba(74, 64, 54, 0.25)';
+      ctx.lineWidth = Math.max(2, R * 0.14);
+      ctx.stroke();
+    }
+
+    if (face) {
+      ctx.fillStyle = COLORS.ink;
+      ctx.beginPath(); ctx.arc(cx - R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.arc(cx + R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.strokeStyle = COLORS.ink;
+      ctx.lineWidth = Math.max(2, R * 0.05);
+      ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.arc(cx, cy + R * 0.06, R * 0.17, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+      ctx.globalAlpha = 0.35;
+      ctx.fillStyle = COLORS.cheek;
+      ctx.beginPath(); ctx.ellipse(cx - R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(cx + R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // Same ring of sparkles from every instrument, every time (no random rewards).
+  function spawnParticles(x, y, size, color, t) {
+    for (let i = 0; i < 10; i++) {
+      const a = -Math.PI / 2 + (i - 4.5) * 0.3;
+      state.particles.push({ x0: x, y0: y - size * 0.3, dx: Math.cos(a), dy: Math.sin(a), dist: size * 0.7, r: size * 0.045, t0: t, life: 900, color: i % 2 ? COLORS.star : shade(color, 0.05) });
+    }
+  }
+
+  function drawParticles(t) {
+    state.particles = state.particles.filter(p => t - p.t0 < p.life);
+    for (const p of state.particles) {
+      const k = (t - p.t0) / p.life;
+      const e = easeOutCubic(k);
+      ctx.globalAlpha = 1 - k;
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x0 + p.dx * p.dist * e, p.y0 + p.dy * p.dist * e, Math.max(2, p.r * (1 - k * 0.5)), 0, TAU);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------------------------------------------------------------------
+  // Screens
+  // ---------------------------------------------------------------------
+  function starGeom() {
+    return { cx: W / 2, cy: H * 0.42, R: Math.min(W, H) * 0.2 };
+  }
+
+  // Start and between-round screen: one big pulsing star to tap, plus 5 slots
+  // that fill up so the child can see the end coming.
+  function drawStarScreen(t) {
+    const { cx, cy, R } = starGeom();
+    const amp = reduceMotion ? 0.03 : 0.07;
+    const k = 1 + amp * (0.5 - 0.5 * Math.cos(TAU * t / 1400));
+    drawStar(cx, cy, R * k, COLORS.star, true);
+
+    const sr = R * 0.16, gap = sr * 2.8, y = cy + R * 1.35;
+    for (let i = 0; i < CONFIG.ROUNDS; i++) {
+      drawStar(cx + (i - (CONFIG.ROUNDS - 1) / 2) * gap, y, sr, i < state.round ? COLORS.star : null, false);
+    }
+  }
+
+  function fitFont(text, weight, size, maxW) {
+    ctx.font = `${weight} ${size}px ${FONT}`;
+    while (size > 12 && ctx.measureText(text).width > maxW) {
+      size -= 1;
+      ctx.font = `${weight} ${size}px ${FONT}`;
+    }
+    return size;
+  }
+
+  // Static end screen. No buttons: the session is over.
+  function drawEnd() {
+    const gh = H * 0.14;
+    ctx.fillStyle = COLORS.grass;
+    ctx.beginPath();
+    ctx.moveTo(0, H - gh);
+    ctx.quadraticCurveTo(W / 2, H - gh * 1.5, W, H - gh);
+    ctx.lineTo(W, H);
+    ctx.lineTo(0, H);
+    ctx.closePath();
+    ctx.fill();
+
+    const R = Math.min(W, H) * 0.2;
+    const cy = H * 0.36;
+    drawStar(W / 2, cy, R, COLORS.star, true);
+
+    const big = clamp(Math.min(W, H) * 0.1, 26, 68);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = COLORS.ink;
+    const top = cy + R * 1.25;
+    fitFont('Great Job!', 800, big, W * 0.9);
+    ctx.fillText('Great Job!', W / 2, top + big * 0.5);
+    fitFont('Time to play outside!', 700, Math.round(big * 0.62), W * 0.9);
+    ctx.fillText('Time to play outside!', W / 2, top + big * 1.55);
+  }
+
+  // Which instrument (if any) to pulse or glow right now. Only on the child's turn.
+  function guidance(t) {
+    const out = { id: null, pulse: 1, glow: 0 };
+    if (state.phase !== 'play' || state.step !== 'turn') return out;
+    const next = state.pattern[state.pos];
+    const amp = reduceMotion ? 0.04 : 0.08;
+
+    // Scaffolding: after 2 slips this round the next note glows.
+    if (state.slips >= 2) { out.id = next; out.glow = 0.5 + 0.5 * Math.sin(TAU * t / 1300); }
+    const idle = t - state.lastInteraction;
+    if (idle <= CONFIG.IDLE_PULSE_MS) return out;
+
+    const wave = 0.5 - 0.5 * Math.cos(TAU * (idle - CONFIG.IDLE_PULSE_MS) / 1300);
+    out.id = next;
+    out.pulse = 1 + amp * wave;
+
+    // First round: if the child has not found the mechanic yet, glow it too.
+    const tutorial = state.round === 0 && state.pos === 0 && idle > CONFIG.TUTORIAL_HINT_MS;
+    if (tutorial) out.glow = Math.max(out.glow, wave);
+    return out;
+  }
+
+  function drawPlay(t) {
+    const g = guidance(t);
+    drawXylophone(t, g);
+    drawDrum(t, g);
+    drawShaker(t, g);
+    drawBird(t);
+    drawParticles(t);
+  }
+
+  // ---------------------------------------------------------------------
+  // Main loop
+  // ---------------------------------------------------------------------
+  function update(t) {
+    if (state.phase === 'play') {
+      if (state.step === 'intro' && t - state.stepT0 >= CONFIG.INTRO_MS) startDemo(t);
+      else if (state.step === 'demo') updateDemo(t);
+      else if (state.step === 'oops' && t - state.stepT0 >= CONFIG.OOPS_MS) startDemo(t);
+    }
+
+    if (state.phase === 'celebrate' && t - state.celebrateStart >= CONFIG.CELEBRATE_MS) {
+      if (state.round >= CONFIG.ROUNDS) enterEnd();
+      else state.phase = 'between';
+    }
+  }
+
+  function render(t) {
+    ctx.fillStyle = COLORS.bg;
+    ctx.fillRect(0, 0, W, H);
+    if (state.phase === 'start' || state.phase === 'between') drawStarScreen(t);
+    else if (state.phase === 'play' || state.phase === 'celebrate') drawPlay(t);
+    else if (state.phase === 'end') drawEnd();
+  }
+
+  let rafId = 0;
+  function frame(t) {
+    update(t);
+    render(t);
+    // The end screen is static: stop the loop entirely.
+    if (state.phase !== 'end') rafId = requestAnimationFrame(frame);
+  }
+
+  function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    DPR = Math.min(window.devicePixelRatio || 1, 2.5);
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    computeLayout();
+    if (state.phase === 'end') render(now());
+  }
+
+  window.addEventListener('resize', resize);
+  window.addEventListener('orientationchange', resize);
+
+  resize();
+  log('Game loaded', { roundsPerSession: CONFIG.ROUNDS, gamesCompletedBefore: progress.gamesCompleted });
+  rafId = requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

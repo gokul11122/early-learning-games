@@ -1,0 +1,1205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Pattern Sequencing</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
+  body {
+    background: #F6F1E7;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  canvas { display: block; width: 100%; height: 100%; }
+
+  #home {
+    position: fixed; top: max(10px, env(safe-area-inset-top)); right: max(10px, env(safe-area-inset-right));
+    width: 52px; height: 52px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+    background: rgba(255, 253, 248, 0.85); box-shadow: 0 2px 8px rgba(74, 64, 54, 0.15);
+    -webkit-tap-highlight-color: transparent; z-index: 5;
+  }
+  #home:active { transform: scale(0.94); }
+
+  /* Hidden parent view: press and hold the top-left corner for 3 seconds. */
+  #parent {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: rgba(74, 64, 54, 0.55); padding: 16px; box-sizing: border-box; z-index: 10;
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #4A4036;
+  }
+  #parent[hidden] { display: none; }
+  #parent .card { background: #FFFDF8; border-radius: 16px; padding: 20px 22px; max-width: 380px; width: 100%; box-shadow: 0 10px 30px rgba(0,0,0,0.18); }
+  #parent h2 { margin: 0 0 10px; font-size: 18px; }
+  #parent table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+  #parent th, #parent td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #EDE5D6; }
+  #parent .hint { margin: 12px 0 0; font-size: 12px; opacity: 0.7; }
+</style>
+</head>
+<body>
+<canvas id="game" aria-label="Pattern sequencing game"></canvas>
+<a id="home" href="../../index.html" aria-label="Home">
+  <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><path d="M4 11.5 12 5l8 6.5V19a1 1 0 0 1-1 1h-4.5v-5h-5v5H5a1 1 0 0 1-1-1z" fill="none" stroke="#4A4036" stroke-width="2" stroke-linejoin="round"/></svg>
+</a>
+
+<div id="parent" hidden>
+  <div class="card">
+    <h2>Progress on this device</h2>
+    <div id="parentBody"></div>
+    <p class="hint">Stored only on this device. Tap anywhere to close.</p>
+  </div>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  /* =====================================================================
+   * PATTERN SEQUENCING
+   * ELOF domain: Mathematics Development (patterning: extend a repeating
+   *              pattern) + Perceptual/Motor (fine motor drag-and-drop).
+   *
+   * Design rules this file follows (from the brief):
+   *  - Coherence: only the pattern row, its empty slot and a tray of choices.
+   *    No score, no menus, no text during play.
+   *  - Control of error: a tile that does not continue the pattern glides
+   *    back to the tray. No buzzer, no red X.
+   *  - Forgiving hitboxes: the slot accepts drops far outside its outline.
+   *  - Visual prompts: the empty slot always pulses; tray tiles breathe when
+   *    the child is idle. Every shape has its own note, so a finished
+   *    pattern "plays" and the child can hear the rhythm repeat.
+   *  - Self-paced: no timers anywhere the child can see or feel.
+   *  - Natural stopping point: 5 rounds, then a static "play outside" screen
+   *    with no "play again" button.
+   * ===================================================================== */
+
+  // ---------------------------------------------------------------------
+  // Configuration
+  // ---------------------------------------------------------------------
+  const CONFIG = {
+    ROUNDS: 5,                     // hard session limit (natural stopping point)
+    PATTERNS_PER_ROUND: 2,
+    STORAGE_KEY: 'pattern-sequencing.v1',
+    IDLE_PULSE_MS: 1500,           // idle time before the tray tiles breathe
+    TUTORIAL_HINT_MS: 5000,        // first pattern: idle time before the right tile glows and nudges
+    RETURN_MS: 380,                // wrong drop: glide-home duration
+    TO_SLOT_MS: 240,               // right drop: slide-into-slot duration
+    APPEAR_MS: 380,                // pattern tiles pop in when a pattern starts
+    APPEAR_STAGGER_MS: 60,
+    POP_MS: 300,                   // one tile popping during the play-through
+    PLAY_LEAD_MS: 300,             // pause between the last tile landing and the play-through
+    PLAY_STEP_MS: 360,             // one beat of the play-through
+    PLAY_TAIL_MS: 650,             // pause after the play-through before moving on
+    CELEBRATE_MS: 1500,            // round-complete celebration length
+    FAST_MS_PER_BLANK: 6000,       // "quick" thinking time per blank for a step up
+    PARENT_HOLD_MS: 3000,          // hold time for the hidden parent view
+    PARENT_CORNER_PX: 80,
+    HOME_RESERVE_PX: 72,           // keep the top band clear for the home button
+    TAP_SLOP_PX: 12,               // movement below this is a tap, not a drop
+    GAP: 0.16,                     // gap between pattern tiles, as a fraction of a tile
+    WRAP_ADVANTAGE: 1.25,          // a wrapped pattern must be this much bigger to beat one row
+  };
+
+  const COLORS = {
+    bg: '#F6F1E7',
+    ink: '#4A4036',
+    tile: '#FFFDF8',
+    tileEdge: '#E6DCCB',
+    tray: '#EADFCB',
+    star: '#F6C85F',
+    grass: '#B9D7A8',
+    cheek: '#F2A88A',
+  };
+
+  // Each shape owns a colour (used while colour and shape vary together) and a note.
+  const SHAPES = ['circle', 'square', 'triangle', 'star', 'heart'];
+  const SHAPE_COLOR = { circle: '#8FB8DE', square: '#9CCB9A', triangle: '#F2A88A', star: '#F6C85F', heart: '#E8A4BC' };
+  const COLOR_NAME = { '#8FB8DE': 'blue', '#9CCB9A': 'green', '#F2A88A': 'orange', '#F6C85F': 'yellow', '#E8A4BC': 'pink' };
+  const NEUTRALS = ['#B8A9D9', '#A8D5D1', '#8FB8DE', '#F2A88A'];  // one colour for a whole shape-only pattern
+  const NOTE = { circle: 523.25, square: 587.33, triangle: 659.25, star: 783.99, heart: 880.0 };
+  const SIZE_R = { big: 0.37, mid: 0.3, small: 0.19 };            // shape radius as a fraction of the tile
+  const SIZE_PITCH = { big: 2 / 3, mid: 1, small: 4 / 3 };         // bigger sounds lower
+  const FONT = 'ui-rounded, "Arial Rounded MT Bold", "Nunito", system-ui, -apple-system, sans-serif';
+
+  // Difficulty ladder for dynamic difficulty adjustment (scaffolding).
+  // vary lists what changes between pattern elements, per pattern of the round.
+  const TIERS = [
+    { units: ['AB'],         vary: ['colorShape'],    blanks: 1, distractor: false, lengths: [5, 6] }, // AB, 2 choices
+    { units: ['ABC'],        vary: ['colorShape'],    blanks: 1, distractor: false, lengths: [6, 7] }, // ABC, 3 choices
+    { units: ['AAB', 'ABB'], vary: ['shape'],         blanks: 1, distractor: true,  lengths: [6, 7] }, // shape only + an odd one out
+    { units: ['AB'],         vary: ['shape', 'size'], blanks: 2, distractor: true,  lengths: [6, 7] }, // two blanks, filled in order
+  ];
+
+  const TAU = Math.PI * 2;
+  const reduceMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+
+  // ---------------------------------------------------------------------
+  // Small helpers
+  // ---------------------------------------------------------------------
+  const now = () => performance.now();
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const easeOutCubic = t => 1 - Math.pow(1 - t, 3);
+  const easeInOutQuad = t => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
+  const pick = arr => arr[Math.floor(Math.random() * arr.length)];
+  const log = (...args) => console.log('[PatternSeq]', ...args);
+
+  function shuffle(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }
+
+  // Mix a hex colour toward black (amt < 0) or white (amt > 0).
+  const shadeCache = new Map();
+  function shade(hex, amt) {
+    const key = hex + amt;
+    if (shadeCache.has(key)) return shadeCache.get(key);
+    const n = parseInt(hex.slice(1), 16);
+    const target = amt < 0 ? 0 : 255;
+    const p = Math.abs(amt);
+    const c = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map(v => Math.round(lerp(v, target, p)));
+    const out = `rgb(${c[0]},${c[1]},${c[2]})`;
+    shadeCache.set(key, out);
+    return out;
+  }
+
+  const keyOf = v => `${v.shape}|${v.color}|${v.size}`;
+
+  // What the child hears when picking a tile up: only the property that matters.
+  function nameOf(v, vary) {
+    if (vary === 'size') return `${v.size === 'mid' ? '' : v.size + ' '}${v.shape}`;
+    if (vary === 'colorShape') return `${COLOR_NAME[v.color] || ''} ${v.shape}`.trim();
+    return v.shape;
+  }
+
+  // ---------------------------------------------------------------------
+  // Canvas setup
+  // ---------------------------------------------------------------------
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  let W = 0, H = 0, DPR = 1;
+
+  // Layout values recomputed on every resize.
+  const L = { m: 16, s: 80, ts: 80, perRow: 6, trayRect: null };
+
+  // ---------------------------------------------------------------------
+  // Game state
+  // ---------------------------------------------------------------------
+  const state = {
+    phase: 'start',          // 'start' | 'play' | 'celebrate' | 'between' | 'end'
+    step: 'ask',             // inside 'play': 'ask' (waiting for a tile) | 'playing' (pattern plays back)
+    round: 0,                // rounds completed this session
+    tier: 0,                 // index into TIERS
+    sub: 0,                  // pattern index inside the round (0..PATTERNS_PER_ROUND-1)
+    pattern: null,           // { unit, vary, period }
+    seq: [],                 // pattern cells: { value, key, blank, filled, x, y, popT0, appearT0 }
+    blanks: [],              // indices into seq, filled in order
+    active: 0,               // index into blanks of the slot waiting now
+    tray: [],                // draggable choice tiles
+    drag: null,              // { obj, dx, dy, sx, sy, moved }
+    lastInteraction: 0,
+    roundStart: 0,
+    askStart: 0,             // when the current pattern started waiting for tiles
+    thinkMs: 0,              // time spent in 'ask' this round (play-throughs excluded)
+    roundSlips: 0,           // wrong drops on the slot this round
+    roundAttempts: 0,        // every drop on the slot this round
+    blankSlips: 0,           // wrong drops on the current slot
+    playStart: 0,
+    playIdx: -1,
+    playEnd: 0,
+    celebrateStart: 0,
+    particles: [],
+  };
+
+  // ---------------------------------------------------------------------
+  // Local progress tracking (localStorage, never leaves the device)
+  // ---------------------------------------------------------------------
+  function freshProgress() {
+    return { version: 1, gamesCompleted: 0, roundsCompleted: 0, patternsCompleted: 0, slips: 0, lastPlayed: null, sessions: [] };
+  }
+
+  function loadProgress() {
+    try {
+      const raw = window.localStorage.getItem(CONFIG.STORAGE_KEY);
+      if (raw) {
+        const data = JSON.parse(raw);
+        if (data && data.version === 1 && Array.isArray(data.sessions)) return data;
+      }
+    } catch (e) {
+      console.warn('[PatternSeq] Progress could not be loaded (storage unavailable):', e && e.message);
+    }
+    return freshProgress();
+  }
+
+  function saveProgress() {
+    try {
+      window.localStorage.setItem(CONFIG.STORAGE_KEY, JSON.stringify(progress));
+      log('Progress saved', { gamesCompleted: progress.gamesCompleted, roundsCompleted: progress.roundsCompleted });
+    } catch (e) {
+      console.warn('[PatternSeq] Progress could not be saved (storage unavailable):', e && e.message);
+    }
+  }
+
+  const progress = loadProgress();
+  let session = null; // created on the first round of this app launch
+
+  function ensureSession() {
+    if (session) return;
+    session = { startedAt: new Date().toISOString(), finished: false, rounds: [] };
+    progress.sessions.push(session);
+    if (progress.sessions.length > 30) progress.sessions.splice(0, progress.sessions.length - 30);
+  }
+
+  // ---------------------------------------------------------------------
+  // Audio: Web Audio tones + optional spoken words
+  // ---------------------------------------------------------------------
+  let actx = null;
+
+  // Browsers only allow audio after a user gesture, so this runs on every pointer down.
+  function unlockAudio() {
+    if (!actx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) { try { actx = new AC(); } catch (e) { actx = null; } }
+    }
+    if (actx && actx.state === 'suspended') actx.resume();
+  }
+
+  function tone(freq, delay, dur, vol = 0.16, type = 'sine') {
+    if (!actx) return;
+    const t = actx.currentTime + delay;
+    const osc = actx.createOscillator();
+    const gain = actx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(vol, t + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    osc.connect(gain).connect(actx.destination);
+    osc.start(t);
+    osc.stop(t + dur + 0.05);
+  }
+
+  // A tile always sounds the same: its shape picks the note, its size the octave region.
+  const noteOf = v => NOTE[v.shape] * SIZE_PITCH[v.size];
+  const playPickup = () => tone(440, 0, 0.08, 0.05, 'triangle');
+  const playNote = v => { const f = noteOf(v); tone(f, 0, 0.3, 0.15); tone(f * 2, 0, 0.18, 0.04, 'triangle'); };
+  const playPlace = v => { const f = noteOf(v); tone(f, 0, 0.35); tone(f * 1.5, 0.07, 0.4, 0.1); };
+  const playRoundDone = () => [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => tone(f, i * 0.12, 0.5, 0.12));
+
+  // Spoken words via the Web Speech API. Android WebView usually lacks it,
+  // so this quietly does nothing there and the tones carry the feedback.
+  function say(text) {
+    try {
+      if (!('speechSynthesis' in window)) return;
+      window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'en-US';
+      u.rate = 0.85;
+      u.pitch = 1.15;
+      window.speechSynthesis.speak(u);
+    } catch (e) { /* speech is optional */ }
+  }
+
+  // ---------------------------------------------------------------------
+  // Patterns
+  // ---------------------------------------------------------------------
+  // Builds one pattern for the tier. sub picks which "vary" rule applies.
+  function makePattern(tier, sub) {
+    const unit = pick(tier.units);
+    const letters = [...new Set(unit.split(''))];
+    const vary = tier.vary[sub % tier.vary.length];
+    const shapes = shuffle(SHAPES.slice());
+    const values = {};
+    let distractor = null;
+
+    if (vary === 'colorShape') {
+      letters.forEach((l, i) => { values[l] = { shape: shapes[i], color: SHAPE_COLOR[shapes[i]], size: 'mid' }; });
+      if (tier.distractor) distractor = { shape: shapes[letters.length], color: SHAPE_COLOR[shapes[letters.length]], size: 'mid' };
+    } else if (vary === 'shape') {
+      const color = pick(NEUTRALS);
+      letters.forEach((l, i) => { values[l] = { shape: shapes[i], color, size: 'mid' }; });
+      if (tier.distractor) distractor = { shape: shapes[letters.length], color, size: 'mid' };
+    } else {
+      // Size: one shape and colour, big and small alternate. The odd one out is another shape.
+      const color = pick(NEUTRALS);
+      const sizes = shuffle(['big', 'small']);
+      letters.forEach((l, i) => { values[l] = { shape: shapes[0], color, size: sizes[i] }; });
+      if (tier.distractor) distractor = { shape: shapes[1], color, size: 'big' };
+    }
+
+    const n = pick(tier.lengths);
+    const seq = [];
+    for (let i = 0; i < n; i++) {
+      const v = values[unit[i % unit.length]];
+      seq.push({ value: v, key: keyOf(v), blank: i >= n - tier.blanks, filled: false, x: 0, y: 0, popT0: -1e9, appearT0: 0 });
+    }
+    const choices = letters.map(l => values[l]);
+    if (distractor) choices.push(distractor);
+    return { unit, vary, period: unit.length, seq, choices: shuffle(choices) };
+  }
+
+  function beginPattern(t) {
+    const tier = TIERS[state.tier];
+    const p = makePattern(tier, state.sub);
+    state.pattern = { unit: p.unit, vary: p.vary, period: p.period };
+    state.seq = p.seq;
+    state.seq.forEach((c, i) => { c.appearT0 = reduceMotion ? t - CONFIG.APPEAR_MS : t + i * CONFIG.APPEAR_STAGGER_MS; });
+    state.blanks = p.seq.map((c, i) => (c.blank ? i : -1)).filter(i => i >= 0);
+    state.active = 0;
+    state.tray = p.choices.map((v, i) => ({
+      id: i, value: v, key: keyOf(v), homeSlot: i,
+      x: 0, y: 0, homeX: 0, homeY: 0, scale: 1,
+      state: 'idle',             // 'idle' | 'drag' | 'return' | 'toSlot' | 'placed'
+      anim: null, errors: 0, cell: -1,
+      appearT0: reduceMotion ? t - CONFIG.APPEAR_MS : t + (p.seq.length + i) * CONFIG.APPEAR_STAGGER_MS,
+    }));
+    state.blankSlips = 0;
+    state.drag = null;
+    state.step = 'ask';
+    state.askStart = t;
+    state.lastInteraction = t;
+    computeLayout();
+    say('What comes next?');
+    log(`Pattern ${state.sub + 1}/${CONFIG.PATTERNS_PER_ROUND}: ${p.unit} by ${p.vary}, ${p.seq.length} cells, ${tier.blanks} blank(s): ${p.seq.map(c => c.blank ? '_' : c.value.shape[0]).join('')}`);
+  }
+
+  const activeCell = () => (state.step === 'ask' && state.active < state.blanks.length ? state.seq[state.blanks[state.active]] : null);
+
+  // ---------------------------------------------------------------------
+  // Rounds and difficulty
+  // ---------------------------------------------------------------------
+  function startRound() {
+    ensureSession();
+    const t = now();
+    state.sub = 0;
+    state.roundSlips = 0;
+    state.roundAttempts = 0;
+    state.thinkMs = 0;
+    state.particles = [];
+    state.phase = 'play';
+    state.roundStart = t;
+    log(`Round ${state.round + 1}/${CONFIG.ROUNDS} started at level ${state.tier + 1}`);
+    beginPattern(t);
+  }
+
+  function completeRound() {
+    const t = now();
+    const tier = TIERS[state.tier];
+    const blanks = tier.blanks * CONFIG.PATTERNS_PER_ROUND;
+    const ms = t - state.roundStart;
+    const record = {
+      level: state.tier + 1,
+      patterns: CONFIG.PATTERNS_PER_ROUND,
+      blanks,
+      attempts: state.roundAttempts,
+      slips: state.roundSlips,
+      thinkSeconds: Math.round(state.thinkMs / 100) / 10,
+      seconds: Math.round(ms / 100) / 10,
+    };
+
+    session.rounds.push(record);
+    progress.roundsCompleted++;
+    progress.slips += state.roundSlips;
+    progress.lastPlayed = new Date().toISOString();
+    state.round++;
+    log('Level completed', record);
+
+    const finalRound = state.round >= CONFIG.ROUNDS;
+    if (finalRound) {
+      session.finished = true;
+      progress.gamesCompleted++;
+    } else {
+      // Praise the effort, not the child's "smartness" (growth mindset).
+      say(state.roundSlips > 0 ? 'You kept trying, and you found the pattern!' : 'You listened and looked carefully!');
+    }
+    saveProgress();
+    adjustDifficulty(record);
+
+    playRoundDone();
+    state.seq.forEach(c => spawnParticles(c, t));
+    state.phase = 'celebrate';
+    state.celebrateStart = t;
+  }
+
+  // Simple DDA: quick and clean -> one step harder; a real struggle -> one step easier.
+  // Only thinking time counts; the play-through animations are not the child's time.
+  function adjustDifficulty(record) {
+    const fast = state.thinkMs / record.blanks <= CONFIG.FAST_MS_PER_BLANK;
+    const before = state.tier;
+    if (record.slips === 0 && fast) {
+      state.tier = Math.min(TIERS.length - 1, state.tier + 1);
+    } else if (record.slips >= 3) {
+      state.tier = Math.max(0, state.tier - 1);
+    }
+    if (state.tier !== before) log(`Difficulty ${state.tier > before ? 'up' : 'down'}: level ${before + 1} -> ${state.tier + 1}`);
+  }
+
+  function enterEnd() {
+    state.phase = 'end';
+    say('Great job! Time to play outside!');
+    log('Session finished: end screen shown, no replay offered');
+  }
+
+  // ---------------------------------------------------------------------
+  // Layout
+  // ---------------------------------------------------------------------
+  // Pattern on top, tray of choices below, everything under the home-button band.
+  // A long pattern that would be too small in one row wraps after whole repeats
+  // (e.g. ABC / ABC / A_), so matching elements line up in columns.
+  function computeLayout() {
+    const minDim = Math.min(W, H);
+    const m = clamp(minDim * 0.04, 12, 32);
+    const top = CONFIG.HOME_RESERVE_PX;
+    const aw = W - 2 * m;
+    const contentH = Math.max(160, H - top - m);
+    const trayH = clamp(contentH * 0.36, 90, 260);
+    const patH = Math.max(60, contentH - trayH - m);
+    const G = CONFIG.GAP;
+    const sMax = Math.min(150, minDim * 0.24);
+    L.m = m;
+
+    const n = state.seq.length || 1;
+    const period = state.pattern ? state.pattern.period : 1;
+    const options = [n];
+    for (let k = Math.floor((n - 1) / period); k >= 1; k--) options.push(k * period);
+
+    let best = null;
+    for (const perRow of options) {
+      const rows = Math.ceil(n / perRow);
+      const s = Math.min(sMax, aw / (perRow + (perRow - 1) * G), patH / (rows + (rows - 1) * G));
+      if (!best || s > best.s * CONFIG.WRAP_ADVANTAGE) best = { perRow, rows, s };
+    }
+    const s = best.s;
+    L.s = s;
+    L.perRow = best.perRow;
+
+    // Rows are left-aligned so each column holds the same pattern element.
+    const gridW = best.perRow * s + (best.perRow - 1) * s * G;
+    const gridH = best.rows * s + (best.rows - 1) * s * G;
+    const x0 = (W - gridW) / 2;
+    const y0 = top + (patH - gridH) / 2;
+    state.seq.forEach((c, i) => {
+      const row = Math.floor(i / best.perRow), col = i % best.perRow;
+      c.x = x0 + col * s * (1 + G) + s / 2;
+      c.y = y0 + row * s * (1 + G) + s / 2;
+    });
+
+    // Tray tiles: close to the pattern tiles' size so they read as the same pieces,
+    // but never smaller than a comfortable finger target.
+    const k = Math.max(1, state.tray.length);
+    const gap = clamp(minDim * 0.04, 12, 36);
+    const ts = clamp(Math.min(trayH * 0.7, (aw - gap * (k + 1)) / k, s * 1.3, 150), 56, 150);
+    L.ts = ts;
+    const trayY = top + patH + m + trayH / 2;
+    const rowW = k * ts + (k - 1) * gap;
+    const tx0 = (W - rowW) / 2;
+    const pad = ts * 0.22;
+    L.trayRect = { x: tx0 - pad, y: trayY - ts / 2 - pad, w: rowW + pad * 2, h: ts + pad * 2 };
+    state.tray.forEach(o => {
+      o.homeX = tx0 + o.homeSlot * (ts + gap) + ts / 2;
+      o.homeY = trayY;
+    });
+    relayoutTiles();
+  }
+
+  // Keep every tile where it belongs after a resize or rotation.
+  function relayoutTiles() {
+    for (const o of state.tray) {
+      if (o.state === 'idle') {
+        o.x = o.homeX; o.y = o.homeY;
+      } else if (o.state === 'return' && o.anim) {
+        o.anim.tx = o.homeX; o.anim.ty = o.homeY;
+      } else if (o.state === 'toSlot' && o.anim) {
+        o.anim.tx = state.seq[o.cell].x; o.anim.ty = state.seq[o.cell].y;
+      } else if (o.state === 'placed') {
+        o.x = state.seq[o.cell].x; o.y = state.seq[o.cell].y;
+      } else if (o.state === 'drag') {
+        o.x = clamp(o.x, 0, W); o.y = clamp(o.y, 0, H);
+      }
+    }
+  }
+
+  // Scale that turns a tray tile into a pattern tile (they may differ in size).
+  const slotScale = () => L.s / L.ts;
+
+  // Generous drop zone around the waiting slot.
+  function overActiveSlot(o) {
+    const c = activeCell();
+    if (!c) return false;
+    const pad = Math.max(L.s * 0.65, L.ts * 0.5, 36);
+    return Math.abs(o.x - c.x) <= L.s / 2 + pad && Math.abs(o.y - c.y) <= L.s / 2 + pad;
+  }
+
+  // ---------------------------------------------------------------------
+  // Drag and drop
+  // ---------------------------------------------------------------------
+  // Forgiving pick: the nearest tray tile within its padded square.
+  function pickTile(p) {
+    let best = null, bestD = Infinity;
+    const reach = L.ts * 0.5 * 1.35;
+    for (const o of state.tray) {
+      if (o.state !== 'idle' && o.state !== 'return') continue;
+      if (Math.abs(p.x - o.x) > reach || Math.abs(p.y - o.y) > reach) continue;
+      const d = Math.hypot(p.x - o.x, p.y - o.y);
+      if (d < bestD) { best = o; bestD = d; }
+    }
+    return best;
+  }
+
+  function beginDrag(o, p) {
+    o.state = 'drag';
+    o.anim = null;
+    o.scale = 1;
+    state.drag = { obj: o, dx: o.x - p.x, dy: o.y - p.y, sx: p.x, sy: p.y, moved: 0 };
+    // Draw the held tile on top of the others.
+    state.tray.splice(state.tray.indexOf(o), 1);
+    state.tray.push(o);
+    playPickup();
+    say(nameOf(o.value, state.pattern.vary));
+    log('Picked up', nameOf(o.value, state.pattern.vary));
+  }
+
+  function dropTile() {
+    const o = state.drag.obj;
+    const wasTap = state.drag.moved < CONFIG.TAP_SLOP_PX;
+    state.drag = null;
+    const cell = activeCell();
+    const onSlot = !wasTap && cell && overActiveSlot(o);
+
+    if (onSlot) {
+      state.roundAttempts++;
+      if (o.key === cell.key) { acceptTile(o); return; }
+      o.errors++;
+      state.roundSlips++;
+      state.blankSlips++;
+      log(`Item rejected: ${nameOf(o.value, state.pattern.vary)} does not come next, gliding home (slips on this slot: ${state.blankSlips})`);
+    }
+    sendHome(o);
+  }
+
+  function acceptTile(o) {
+    const idx = state.blanks[state.active];
+    const c = state.seq[idx];
+    o.state = 'toSlot';
+    o.cell = idx;
+    o.anim = { fx: o.x, fy: o.y, tx: c.x, ty: c.y, fs: o.scale, ts: slotScale(), t0: now(), dur: CONFIG.TO_SLOT_MS, ease: easeInOutQuad };
+  }
+
+  // Montessori control of error: the tile simply glides back to the tray.
+  function sendHome(o) {
+    o.state = 'return';
+    o.anim = { fx: o.x, fy: o.y, tx: o.homeX, ty: o.homeY, fs: o.scale, ts: 1, t0: now(), dur: CONFIG.RETURN_MS, ease: easeOutCubic };
+  }
+
+  // Called when a tile finishes sliding into its slot.
+  // The note, the pop and the slot filling all happen on the same frame (temporal contiguity).
+  function landInSlot(o, t) {
+    o.state = 'placed';
+    const c = state.seq[o.cell];
+    c.filled = true;
+    c.popT0 = t;
+    playPlace(o.value);
+    state.active++;
+    state.blankSlips = 0;
+    state.lastInteraction = t;
+    log(`Answer accepted: ${nameOf(o.value, state.pattern.vary)} placed in cell ${o.cell + 1}`);
+
+    if (state.active >= state.blanks.length) {
+      // Pattern complete: hand control to the play-through. No more drags until it ends.
+      state.thinkMs += t - state.askStart;
+      state.step = 'playing';
+      state.playStart = t + CONFIG.PLAY_LEAD_MS;
+      state.playIdx = -1;
+      state.playEnd = state.playStart + state.seq.length * CONFIG.PLAY_STEP_MS + CONFIG.PLAY_TAIL_MS;
+      progress.patternsCompleted++;
+      // Any tile still gliding home just settles.
+      state.tray.forEach(x => { if (x.state === 'return') { x.anim = null; x.state = 'idle'; x.x = x.homeX; x.y = x.homeY; } });
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Input: touch + mouse
+  // ---------------------------------------------------------------------
+  let activeTouch = null;
+  let mouseDown = false;
+  let parentTimer = null;
+
+  function toCanvas(clientX, clientY) {
+    const r = canvas.getBoundingClientRect();
+    return { x: clientX - r.left, y: clientY - r.top };
+  }
+
+  function findTouch(list, id) {
+    for (let i = 0; i < list.length; i++) if (list[i].identifier === id) return list[i];
+    return null;
+  }
+
+  function cancelParentHold() {
+    if (parentTimer) { clearTimeout(parentTimer); parentTimer = null; }
+  }
+
+  function onDown(p) {
+    unlockAudio();
+    state.lastInteraction = now();
+
+    if (state.phase === 'start' || state.phase === 'between') {
+      const g = starGeom();
+      if (Math.hypot(p.x - g.cx, p.y - g.cy) <= g.R * 1.8) { startRound(); return; }
+    } else if (state.phase === 'play' && state.step === 'ask' && !state.drag && !state.tray.some(o => o.state === 'toSlot')) {
+      const o = pickTile(p);
+      if (o) { beginDrag(o, p); return; }
+    }
+
+    // Hidden parent view: hold the top-left corner still for 3 seconds.
+    if (p.x < CONFIG.PARENT_CORNER_PX && p.y < CONFIG.PARENT_CORNER_PX) {
+      cancelParentHold();
+      parentTimer = setTimeout(openParent, CONFIG.PARENT_HOLD_MS);
+    }
+  }
+
+  function onMove(p) {
+    if (parentTimer && (p.x >= CONFIG.PARENT_CORNER_PX || p.y >= CONFIG.PARENT_CORNER_PX)) cancelParentHold();
+    if (!state.drag) return;
+    state.lastInteraction = now();
+    const d = state.drag;
+    d.moved = Math.max(d.moved, Math.hypot(p.x - d.sx, p.y - d.sy));
+    d.obj.x = clamp(p.x + d.dx, 0, W);
+    d.obj.y = clamp(p.y + d.dy, 0, H);
+  }
+
+  function onUp() {
+    cancelParentHold();
+    if (state.drag) dropTile();
+  }
+
+  canvas.addEventListener('touchstart', e => {
+    e.preventDefault();
+    if (activeTouch !== null) return;          // one finger at a time
+    const t = e.changedTouches[0];
+    activeTouch = t.identifier;
+    onDown(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  canvas.addEventListener('touchmove', e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (t) onMove(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  const endTouch = e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (!t) return;
+    activeTouch = null;
+    onUp(toCanvas(t.clientX, t.clientY));
+  };
+  canvas.addEventListener('touchend', endTouch, { passive: false });
+  canvas.addEventListener('touchcancel', endTouch, { passive: false });
+
+  canvas.addEventListener('mousedown', e => { mouseDown = true; onDown(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mousemove', e => { if (mouseDown) onMove(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mouseup', e => {
+    if (!mouseDown) return;
+    mouseDown = false;
+    onUp(toCanvas(e.clientX, e.clientY));
+  });
+
+  // ---------------------------------------------------------------------
+  // Parent view (hidden, local data only)
+  // ---------------------------------------------------------------------
+  const parentEl = document.getElementById('parent');
+  const parentBody = document.getElementById('parentBody');
+
+  function el(tag, text) {
+    const node = document.createElement(tag);
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function openParent() {
+    parentTimer = null;
+    const blanks = progress.sessions.reduce((a, s) => a + s.rounds.reduce((b, r) => b + r.blanks, 0), 0);
+    const attempts = progress.sessions.reduce((a, s) => a + s.rounds.reduce((b, r) => b + r.attempts, 0), 0);
+
+    parentBody.textContent = '';
+    parentBody.appendChild(el('div', `Full games finished: ${progress.gamesCompleted}`));
+    parentBody.appendChild(el('div', `Rounds finished: ${progress.roundsCompleted}`));
+    parentBody.appendChild(el('div', `Patterns completed: ${progress.patternsCompleted}`));
+    parentBody.appendChild(el('div', `Drops that continued the pattern: ${attempts ? Math.round(100 * blanks / attempts) : 0}%`));
+
+    const recent = progress.sessions.slice(-6).reverse();
+    if (recent.length) {
+      const table = el('table');
+      const head = el('tr');
+      ['When', 'Rounds', 'Top level', 'Slips'].forEach(h => head.appendChild(el('th', h)));
+      table.appendChild(head);
+      recent.forEach(s => {
+        const tr = el('tr');
+        const when = new Date(s.startedAt);
+        tr.appendChild(el('td', when.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' ' +
+          when.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })));
+        tr.appendChild(el('td', `${s.rounds.length}/${CONFIG.ROUNDS}`));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => Math.max(a, r.level), 0) || '-')));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => a + r.slips, 0))));
+        table.appendChild(tr);
+      });
+      parentBody.appendChild(table);
+    }
+    parentEl.hidden = false;
+    log('Parent view opened', progress);
+  }
+
+  parentEl.addEventListener('click', () => { parentEl.hidden = true; });
+
+  // Read-only debug hooks for the Android/desktop console.
+  window.PatternSeq = {
+    progress: () => JSON.parse(JSON.stringify(progress)),
+    state: () => {
+      const c = activeCell();
+      return {
+        phase: state.phase,
+        step: state.step,
+        round: state.round,
+        level: state.tier + 1,
+        patternIndex: state.sub,
+        pattern: state.pattern ? { unit: state.pattern.unit, vary: state.pattern.vary } : null,
+        star: (state.phase === 'start' || state.phase === 'between') ? { x: starGeom().cx, y: starGeom().cy } : null,
+        cells: state.seq.map(s => ({ x: s.x, y: s.y, size: L.s, key: s.blank && !s.filled ? null : s.key, blank: s.blank, filled: s.filled })),
+        slot: c ? { x: c.x, y: c.y, size: L.s, index: state.blanks[state.active], expected: c.key } : null,
+        tray: state.tray.map(o => ({ id: o.id, key: o.key, x: o.x, y: o.y, size: L.ts, state: o.state, correct: !!c && o.key === c.key })),
+      };
+    },
+  };
+
+  // ---------------------------------------------------------------------
+  // Drawing primitives
+  // ---------------------------------------------------------------------
+  function roundRectPath(x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  function starPath(cx, cy, R, inner = 0.5) {
+    ctx.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const rad = i % 2 === 0 ? R : R * inner;
+      const a = -Math.PI / 2 + i * Math.PI / 5;
+      const x = cx + rad * Math.cos(a), y = cy + rad * Math.sin(a);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+  }
+
+  // Every shape fits inside radius r so they read as the same size.
+  function shapePath(type, x, y, r) {
+    ctx.beginPath();
+    if (type === 'circle') {
+      ctx.arc(x, y, r, 0, TAU);
+    } else if (type === 'square') {
+      const h = r * 0.86;
+      roundRectPath(x - h, y - h, h * 2, h * 2, r * 0.2);
+    } else if (type === 'triangle') {
+      // Equilateral triangle, shifted down so it looks centred.
+      const R = r * 1.12, cy = y + R * 0.25;
+      for (let k = 0; k < 3; k++) {
+        const a = -Math.PI / 2 + k * TAU / 3;
+        const px = x + R * Math.cos(a), py = cy + R * Math.sin(a);
+        if (k === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      }
+      ctx.closePath();
+    } else if (type === 'star') {
+      starPath(x, y + r * 0.06, r * 1.12, 0.5);
+    } else {
+      ctx.moveTo(x, y + r * 0.95);
+      ctx.bezierCurveTo(x - r * 1.5, y - r * 0.05, x - r * 0.68, y - r * 1.15, x, y - r * 0.46);
+      ctx.bezierCurveTo(x + r * 0.68, y - r * 1.15, x + r * 1.5, y - r * 0.05, x, y + r * 0.95);
+      ctx.closePath();
+    }
+  }
+
+  function drawShape(type, x, y, r, fill) {
+    shapePath(type, x, y, r);
+    ctx.fillStyle = fill;
+    ctx.fill();
+    ctx.lineJoin = 'round';
+    ctx.lineWidth = Math.max(2, r * 0.12);
+    ctx.strokeStyle = shade(fill, -0.28);
+    ctx.stroke();
+
+    // Small soft highlight so shapes feel touchable.
+    const hx = type === 'triangle' ? x - r * 0.15 : x - r * 0.3;
+    const hy = type === 'triangle' ? y - r * 0.05 : y - r * 0.35;
+    ctx.save();
+    ctx.globalAlpha *= 0.35;
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.ellipse(hx, hy, r * 0.22, r * 0.12, -0.6, 0, TAU);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // A tile: a cream square with a soft shadow and one shape on it.
+  // glow > 0 draws the scaffolding halo behind it.
+  function drawTile(v, x, y, s, lifted, glow) {
+    const rad = s * 0.18;
+    ctx.save();
+    if (glow > 0) {
+      const g = s * (0.08 + 0.1 * glow);
+      ctx.globalAlpha = 0.35 + 0.4 * glow;
+      ctx.fillStyle = shade(COLORS.star, 0.3);
+      ctx.beginPath();
+      roundRectPath(x - s / 2 - g, y - s / 2 - g, s + g * 2, s + g * 2, rad + g);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+    ctx.shadowColor = 'rgba(60, 45, 30, 0.2)';
+    ctx.shadowBlur = s * (lifted ? 0.25 : 0.1);
+    ctx.shadowOffsetY = s * (lifted ? 0.14 : 0.05);
+    ctx.beginPath();
+    roundRectPath(x - s / 2, y - s / 2, s, s, rad);
+    ctx.fillStyle = COLORS.tile;
+    ctx.fill();
+    ctx.shadowColor = 'transparent';
+    ctx.lineWidth = Math.max(1.5, s * 0.03);
+    ctx.strokeStyle = COLORS.tileEdge;
+    ctx.stroke();
+    drawShape(v.shape, x, y, s * SIZE_R[v.size], v.color);
+    ctx.restore();
+  }
+
+  // The empty slot: a dashed outline. The one waiting now pulses gently.
+  function drawSlot(x, y, s, active, hovered, t) {
+    let k = 1;
+    if (active) k = 1 + (reduceMotion ? 0.025 : 0.06) * (0.5 - 0.5 * Math.cos(TAU * t / 1300));
+    if (hovered) k *= 1.08;
+    const sz = s * k;
+    ctx.save();
+    ctx.beginPath();
+    roundRectPath(x - sz / 2, y - sz / 2, sz, sz, sz * 0.18);
+    ctx.fillStyle = hovered ? 'rgba(246, 200, 95, 0.28)' : (active ? 'rgba(255, 253, 248, 0.75)' : 'rgba(255, 253, 248, 0.35)');
+    ctx.fill();
+    ctx.setLineDash([sz * 0.13, sz * 0.09]);
+    ctx.lineDashOffset = active && !reduceMotion ? -t * 0.012 : 0;
+    ctx.lineWidth = Math.max(2, s * 0.045);
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = active ? 'rgba(74, 64, 54, 0.5)' : 'rgba(74, 64, 54, 0.22)';
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // The tray the choice tiles rest on: a soft wooden board.
+  function drawTray() {
+    const r = L.trayRect;
+    if (!r) return;
+    ctx.save();
+    ctx.beginPath();
+    roundRectPath(r.x, r.y + r.h * 0.06, r.w, r.h, r.h * 0.28);
+    ctx.fillStyle = shade(COLORS.tray, -0.08);
+    ctx.fill();
+    ctx.beginPath();
+    roundRectPath(r.x, r.y, r.w, r.h, r.h * 0.28);
+    ctx.fillStyle = COLORS.tray;
+    ctx.fill();
+    ctx.globalAlpha = 0.5;
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = Math.max(1.5, r.h * 0.02);
+    ctx.beginPath();
+    roundRectPath(r.x + r.h * 0.06, r.y + r.h * 0.06, r.w - r.h * 0.12, r.h - r.h * 0.12, r.h * 0.22);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawStar(cx, cy, R, fill, face) {
+    ctx.save();
+    starPath(cx, cy, R);
+    ctx.lineJoin = 'round';
+    if (fill) {
+      ctx.fillStyle = fill;
+      ctx.fill();
+      ctx.strokeStyle = fill;            // same-colour stroke rounds the tips
+      ctx.lineWidth = Math.max(2, R * 0.16);
+      ctx.stroke();
+    } else {
+      ctx.strokeStyle = 'rgba(74, 64, 54, 0.25)';
+      ctx.lineWidth = Math.max(2, R * 0.14);
+      ctx.stroke();
+    }
+
+    if (face) {
+      ctx.fillStyle = COLORS.ink;
+      ctx.beginPath(); ctx.arc(cx - R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.arc(cx + R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.strokeStyle = COLORS.ink;
+      ctx.lineWidth = Math.max(2, R * 0.05);
+      ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.arc(cx, cy + R * 0.06, R * 0.17, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+      ctx.globalAlpha = 0.35;
+      ctx.fillStyle = COLORS.cheek;
+      ctx.beginPath(); ctx.ellipse(cx - R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(cx + R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // Same small ring of sparkles from every cell, every time (no random rewards).
+  function spawnParticles(c, t) {
+    for (let i = 0; i < 6; i++) {
+      const a = -Math.PI / 2 + i * TAU / 6;
+      state.particles.push({ x0: c.x, y0: c.y, dx: Math.cos(a), dy: Math.sin(a), dist: L.s * 0.8, t0: t, life: 900, color: i % 2 ? COLORS.star : shade(c.value.color, 0.1) });
+    }
+  }
+
+  function drawParticles(t) {
+    state.particles = state.particles.filter(p => t - p.t0 < p.life);
+    for (const p of state.particles) {
+      const k = (t - p.t0) / p.life;
+      const e = easeOutCubic(k);
+      ctx.globalAlpha = 1 - k;
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x0 + p.dx * p.dist * e, p.y0 + p.dy * p.dist * e, L.s * 0.07 * (1 - k * 0.5), 0, TAU);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------------------------------------------------------------------
+  // Screens
+  // ---------------------------------------------------------------------
+  function starGeom() {
+    return { cx: W / 2, cy: H * 0.42, R: Math.min(W, H) * 0.2 };
+  }
+
+  // Start and between-round screen: one big pulsing star to tap, plus 5 slots
+  // that fill up so the child can see the end coming.
+  function drawStarScreen(t) {
+    const { cx, cy, R } = starGeom();
+    const amp = reduceMotion ? 0.03 : 0.07;
+    const k = 1 + amp * (0.5 - 0.5 * Math.cos(TAU * t / 1400));
+    drawStar(cx, cy, R * k, COLORS.star, true);
+
+    const sr = R * 0.16, gap = sr * 2.8, y = cy + R * 1.35;
+    for (let i = 0; i < CONFIG.ROUNDS; i++) {
+      drawStar(cx + (i - (CONFIG.ROUNDS - 1) / 2) * gap, y, sr, i < state.round ? COLORS.star : null, false);
+    }
+  }
+
+  function fitFont(text, weight, size, maxW) {
+    ctx.font = `${weight} ${size}px ${FONT}`;
+    while (size > 12 && ctx.measureText(text).width > maxW) {
+      size -= 1;
+      ctx.font = `${weight} ${size}px ${FONT}`;
+    }
+    return size;
+  }
+
+  // Static end screen. No buttons: the session is over.
+  function drawEnd() {
+    const gh = H * 0.14;
+    ctx.fillStyle = COLORS.grass;
+    ctx.beginPath();
+    ctx.moveTo(0, H - gh);
+    ctx.quadraticCurveTo(W / 2, H - gh * 1.5, W, H - gh);
+    ctx.lineTo(W, H);
+    ctx.lineTo(0, H);
+    ctx.closePath();
+    ctx.fill();
+
+    const R = Math.min(W, H) * 0.2;
+    const cy = H * 0.36;
+    drawStar(W / 2, cy, R, COLORS.star, true);
+
+    const big = clamp(Math.min(W, H) * 0.1, 26, 68);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = COLORS.ink;
+    const top = cy + R * 1.25;
+    fitFont('Great Job!', 800, big, W * 0.9);
+    ctx.fillText('Great Job!', W / 2, top + big * 0.5);
+    fitFont('Time to play outside!', 700, Math.round(big * 0.62), W * 0.9);
+    ctx.fillText('Time to play outside!', W / 2, top + big * 1.55);
+  }
+
+  // Which tray tiles breathe, and whether the right one glows and nudges toward the slot.
+  function guidance(t) {
+    const out = { pulse: 1, wave: 0, idle: false, hint: null, glow: 0, nudge: 0 };
+    if (state.phase !== 'play' || state.step !== 'ask') return out;
+    const c = activeCell();
+    const right = c ? state.tray.find(o => (o.state === 'idle' || o.state === 'return' || o.state === 'drag') && o.key === c.key) : null;
+
+    if (state.drag) {
+      // While the right tile is held after repeated slips, the slot glows to say "here".
+      if (state.blankSlips >= 2 && state.drag.obj === right) { out.hint = right; out.glow = 0.5 + 0.5 * Math.sin(TAU * t / 1300); }
+      return out;
+    }
+
+    const idle = t - state.lastInteraction;
+    if (idle <= CONFIG.IDLE_PULSE_MS) return out;
+    out.idle = true;
+    out.wave = idle - CONFIG.IDLE_PULSE_MS;
+    const amp = reduceMotion ? 0.03 : 0.07;
+    out.pulse = amp;
+
+    // Scaffolding: after 2 slips on this slot, or in the very first pattern if the
+    // child has not found the mechanic yet, the right tile glows and leans toward the slot.
+    const tutorial = state.round === 0 && state.sub === 0 && state.roundAttempts === 0 && idle > CONFIG.TUTORIAL_HINT_MS;
+    if (right && (state.blankSlips >= 2 || tutorial)) {
+      const w = 0.5 - 0.5 * Math.cos(TAU * out.wave / 1300);
+      out.hint = right;
+      out.glow = w;
+      out.nudge = reduceMotion ? 0 : w * 0.22;
+    }
+    return out;
+  }
+
+  function drawPlay(t) {
+    const g = guidance(t);
+    const cur = activeCell();
+    const hovering = state.drag && cur ? overActiveSlot(state.drag.obj) : false;
+
+    // Pattern cells: shown tiles, the waiting slot, later slots, and filled slots.
+    state.seq.forEach((c, i) => {
+      const ap = clamp((t - c.appearT0) / CONFIG.APPEAR_MS, 0, 1);
+      if (ap <= 0) return;
+      let k = 0.2 + 0.8 * easeOutCubic(ap);
+      const pp = (t - c.popT0) / CONFIG.POP_MS;
+      if (pp >= 0 && pp < 1) k *= 1 + (reduceMotion ? 0.06 : 0.18) * Math.sin(Math.PI * pp);
+      let hop = 0;
+      if (state.phase === 'celebrate' && !reduceMotion) {
+        const hp = (t - state.celebrateStart - i * 70) / 500;
+        if (hp > 0 && hp < 1) hop = Math.sin(Math.PI * hp) * L.s * 0.14;
+      }
+      if (c.blank && !c.filled) {
+        const isActive = c === cur;
+        drawSlot(c.x, c.y, L.s * k, isActive, isActive && hovering, t);
+        if (isActive && g.hint && state.drag && g.glow > 0) {
+          ctx.save();
+          ctx.globalAlpha = 0.25 + 0.3 * g.glow;
+          ctx.fillStyle = shade(COLORS.star, 0.2);
+          ctx.beginPath();
+          const gs = L.s * (1.1 + 0.1 * g.glow);
+          roundRectPath(c.x - gs / 2, c.y - gs / 2, gs, gs, gs * 0.2);
+          ctx.fill();
+          ctx.restore();
+        }
+      } else {
+        drawTile(c.value, c.x, c.y - hop, L.s * k, false, 0);
+      }
+    });
+
+    drawTray();
+    for (const o of state.tray) {
+      if (o.state === 'placed' || o.state === 'drag') continue;
+      const ap = clamp((t - o.appearT0) / CONFIG.APPEAR_MS, 0, 1);
+      if (ap <= 0) continue;
+      let k = (0.2 + 0.8 * easeOutCubic(ap)) * o.scale;
+      if (g.idle && o.state === 'idle' && o !== g.hint) {
+        k *= 1 + g.pulse * (0.5 - 0.5 * Math.cos(TAU * (g.wave - o.homeSlot * 220) / 1400));
+      }
+      let x = o.x, y = o.y;
+      if (o === g.hint && cur && g.nudge > 0) {
+        const dx = cur.x - o.x, dy = cur.y - o.y, d = Math.hypot(dx, dy) || 1;
+        x += dx / d * L.ts * g.nudge;
+        y += dy / d * L.ts * g.nudge;
+      }
+      drawTile(o.value, x, y, L.ts * k, false, o === g.hint ? g.glow : 0);
+    }
+    if (state.drag) {
+      const o = state.drag.obj;
+      drawTile(o.value, o.x, o.y, L.ts * 1.08, true, 0);
+    }
+    drawParticles(t);
+  }
+
+  // ---------------------------------------------------------------------
+  // Main loop
+  // ---------------------------------------------------------------------
+  function update(t) {
+    for (const o of state.tray) {
+      const a = o.anim;
+      if (!a) continue;
+      const p = clamp((t - a.t0) / a.dur, 0, 1);
+      const e = a.ease(p);
+      o.x = lerp(a.fx, a.tx, e);
+      o.y = lerp(a.fy, a.ty, e);
+      o.scale = lerp(a.fs, a.ts, e);
+      if (p >= 1) {
+        o.anim = null;
+        if (o.state === 'return') o.state = 'idle';
+        else if (o.state === 'toSlot') landInSlot(o, t);
+      }
+    }
+
+    // Play-through: each tile pops with its own note, left to right, so the
+    // rhythm of the pattern can be heard as well as seen.
+    if (state.phase === 'play' && state.step === 'playing') {
+      const idx = Math.floor((t - state.playStart) / CONFIG.PLAY_STEP_MS);
+      while (state.playIdx < Math.min(idx, state.seq.length - 1)) {
+        state.playIdx++;
+        const c = state.seq[state.playIdx];
+        c.popT0 = t;
+        playNote(c.value);
+      }
+      if (t >= state.playEnd) {
+        if (state.sub + 1 < CONFIG.PATTERNS_PER_ROUND) {
+          state.sub++;
+          beginPattern(t);
+        } else {
+          completeRound();
+        }
+      }
+    }
+
+    if (state.phase === 'celebrate' && t - state.celebrateStart >= CONFIG.CELEBRATE_MS) {
+      if (state.round >= CONFIG.ROUNDS) enterEnd();
+      else state.phase = 'between';
+    }
+  }
+
+  function render(t) {
+    ctx.fillStyle = COLORS.bg;
+    ctx.fillRect(0, 0, W, H);
+    if (state.phase === 'start' || state.phase === 'between') drawStarScreen(t);
+    else if (state.phase === 'play' || state.phase === 'celebrate') drawPlay(t);
+    else if (state.phase === 'end') drawEnd();
+  }
+
+  let rafId = 0;
+  function frame(t) {
+    update(t);
+    render(t);
+    // The end screen is static: stop the loop entirely.
+    if (state.phase !== 'end') rafId = requestAnimationFrame(frame);
+  }
+
+  function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    DPR = Math.min(window.devicePixelRatio || 1, 2.5);
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    computeLayout();
+    if (state.phase === 'end') render(now());
+  }
+
+  window.addEventListener('resize', resize);
+  window.addEventListener('orientationchange', resize);
+
+  resize();
+  log('Game loaded', { roundsPerSession: CONFIG.ROUNDS, gamesCompletedBefore: progress.gamesCompleted });
+  rafId = requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

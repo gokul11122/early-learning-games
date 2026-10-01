@@ -1,0 +1,1299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Storytelling Dice</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
+  body {
+    background: #F6F1E7;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  canvas { display: block; width: 100%; height: 100%; }
+
+  #home {
+    position: fixed; top: max(10px, env(safe-area-inset-top)); right: max(10px, env(safe-area-inset-right));
+    width: 52px; height: 52px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+    background: rgba(255, 253, 248, 0.85); box-shadow: 0 2px 8px rgba(74, 64, 54, 0.15);
+    -webkit-tap-highlight-color: transparent; z-index: 5;
+  }
+  #home:active { transform: scale(0.94); }
+
+  /* Hidden parent view: press and hold the top-left corner for 3 seconds. */
+  #parent {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: rgba(74, 64, 54, 0.55); padding: 16px; box-sizing: border-box; z-index: 10;
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #4A4036;
+  }
+  #parent[hidden] { display: none; }
+  #parent .card { background: #FFFDF8; border-radius: 16px; padding: 20px 22px; max-width: 420px; width: 100%; max-height: 100%; overflow-y: auto; box-sizing: border-box; box-shadow: 0 10px 30px rgba(0,0,0,0.18); }
+  #parent h2 { margin: 0 0 10px; font-size: 18px; }
+  #parent h3 { margin: 14px 0 0; font-size: 15px; }
+  #parent table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 13px; }
+  #parent th, #parent td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #EDE5D6; vertical-align: top; }
+  #parent .hint { margin: 12px 0 0; font-size: 12px; opacity: 0.7; }
+</style>
+</head>
+<body>
+<canvas id="game" aria-label="Storytelling dice game"></canvas>
+<a id="home" href="../../index.html" aria-label="Home">
+  <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><path d="M4 11.5 12 5l8 6.5V19a1 1 0 0 1-1 1h-4.5v-5h-5v5H5a1 1 0 0 1-1-1z" fill="none" stroke="#4A4036" stroke-width="2" stroke-linejoin="round"/></svg>
+</a>
+
+<div id="parent" hidden>
+  <div class="card">
+    <h2>Progress on this device</h2>
+    <div id="parentBody"></div>
+    <p class="hint">Stored only on this device. Tap anywhere to close.</p>
+  </div>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  /* =====================================================================
+   * STORYTELLING DICE
+   * ELOF domain: Language and Literacy (oral language, vocabulary and
+   *              narrative: telling a story that links several ideas).
+   *
+   * Design rules this file follows (from the brief):
+   *  - Coherence: only the dice and, once every picture has been explored,
+   *    one "I told my story" button. No score, no menus, no text.
+   *  - Open-ended task: there is no wrong answer, so nothing is ever
+   *    rejected. A landed die simply stays put (it cannot be re-rolled),
+   *    and the done button only appears once each picture was tapped once.
+   *  - Visual prompts: the next die to roll / picture to hear pulses gently
+   *    when the child is idle; the done button pulses once it appears.
+   *  - Self-paced: no timers anywhere the child can see or feel. The child
+   *    can talk for as long as they like before tapping the button.
+   *  - Natural stopping point: 5 rounds, then a static "play outside" screen
+   *    with no "play again" button.
+   * ===================================================================== */
+
+  // ---------------------------------------------------------------------
+  // Configuration
+  // ---------------------------------------------------------------------
+  const CONFIG = {
+    ROUNDS: 5,                     // hard session limit (natural stopping point)
+    STORAGE_KEY: 'storytelling-dice.v1',
+    IDLE_PULSE_MS: 1500,           // idle time before the next die pulses
+    HINT_MS: 5000,                 // idle time before the next die glows with a tap ripple
+    ROLL_MS: 1100,                 // tumble animation length
+    ROLL_MS_REDUCED: 520,          // shorter, flatter tumble for prefers-reduced-motion
+    FLICK_MS: 110,                 // how often the tumbling face flicks to another picture
+    LAND_MS: 340,                  // squash when a die lands
+    TAP_MS: 320,                   // little stretch when a landed picture is tapped
+    INVITE_DELAY_MS: 1000,         // after the last word: let it finish before the story invite
+    DONE_APPEAR_MS: 450,           // done button grow-in
+    DONE_ARM_MS: 700,              // ignore taps on the done button right after it appears
+    CHEER_MS: 700,                 // dice hop during the celebration
+    CELEBRATE_MS: 1700,            // round-complete celebration length
+    PARENT_HOLD_MS: 3000,          // hold time for the hidden parent view
+    PARENT_CORNER_PX: 80,
+    HOME_RESERVE_PX: 72,           // top-right corner kept clear for the home button
+    PARENT_STORY_ROWS: 10,         // recent picture sets listed for parents
+  };
+
+  const COLORS = {
+    bg: '#F6F1E7',
+    ink: '#4A4036',
+    face: '#FFFDF8',               // the picture panel on each die
+    dice: ['#8FB8DE', '#9CCB9A', '#F2A88A', '#B8A9D9', '#E8B4C8'],
+    done: '#9CCB9A',
+    star: '#F6C85F',
+    grass: '#B9D7A8',
+    cheek: '#F2A88A',
+  };
+
+  // Picture vocabulary. `word` is what the voice says and uses in the story invite.
+  const PICTURES = [
+    { id: 'sun', word: 'sun' }, { id: 'cat', word: 'cat' }, { id: 'tree', word: 'tree' },
+    { id: 'boat', word: 'boat' }, { id: 'cake', word: 'cake' }, { id: 'moon', word: 'moon' },
+    { id: 'dog', word: 'dog' }, { id: 'house', word: 'house' }, { id: 'cloud', word: 'rain cloud' },
+    { id: 'ball', word: 'ball' }, { id: 'bird', word: 'bird' }, { id: 'flower', word: 'flower' },
+    { id: 'car', word: 'car' }, { id: 'fish', word: 'fish' }, { id: 'star', word: 'star' },
+    { id: 'hat', word: 'hat' },
+  ];
+  const WORD = Object.fromEntries(PICTURES.map(p => [p.id, p.word]));
+
+  // Difficulty ladder: more dice means a longer story that links more ideas.
+  // Which pictures come up is content variety only; the celebration never changes.
+  const TIERS = [
+    { dice: 1 },                   // one picture: name it, say something about it
+    { dice: 2 },                   // two pictures: connect them
+    { dice: 3 },                   // three pictures: a beginning, middle and end
+  ];
+
+  const FONT = 'ui-rounded, "Arial Rounded MT Bold", "Nunito", system-ui, -apple-system, sans-serif';
+  const TAU = Math.PI * 2;
+  const reduceMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+
+  // ---------------------------------------------------------------------
+  // Small helpers
+  // ---------------------------------------------------------------------
+  const now = () => performance.now();
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const easeOutCubic = t => 1 - Math.pow(1 - t, 3);
+  const easeOutBack = t => 1 + 2.2 * Math.pow(t - 1, 3) + 1.2 * Math.pow(t - 1, 2);
+  const log = (...args) => console.log('[StoryDice]', ...args);
+  const rollMs = () => (reduceMotion ? CONFIG.ROLL_MS_REDUCED : CONFIG.ROLL_MS);
+
+  function shuffle(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }
+
+  // Mix a hex colour toward black (amt < 0) or white (amt > 0).
+  const shadeCache = new Map();
+  function shade(hex, amt) {
+    const key = hex + amt;
+    if (shadeCache.has(key)) return shadeCache.get(key);
+    const n = parseInt(hex.slice(1), 16);
+    const target = amt < 0 ? 0 : 255;
+    const p = Math.abs(amt);
+    const c = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map(v => Math.round(lerp(v, target, p)));
+    const out = `rgb(${c[0]},${c[1]},${c[2]})`;
+    shadeCache.set(key, out);
+    return out;
+  }
+
+  // "the cat", "the cat and the moon", "the cat, the moon and the boat"
+  function storyList(pics) {
+    const parts = pics.map(id => 'the ' + WORD[id]);
+    if (parts.length <= 1) return parts.join('');
+    return parts.slice(0, -1).join(', ') + ' and ' + parts[parts.length - 1];
+  }
+
+  // ---------------------------------------------------------------------
+  // Canvas setup
+  // ---------------------------------------------------------------------
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  let W = 0, H = 0, DPR = 1;
+
+  // Layout values recomputed on every resize.
+  const L = { m: 16, s: 100 };
+
+  // ---------------------------------------------------------------------
+  // Game state
+  // ---------------------------------------------------------------------
+  const state = {
+    phase: 'start',          // 'start' | 'play' | 'celebrate' | 'between' | 'end'
+    round: 0,                // rounds completed this session
+    tier: 0,                 // index into TIERS
+    dice: [],
+    done: { visible: false, t0: 0, x: 0, y: 0, r: 40, pressT0: -1e9 },
+    lastPics: [],            // previous round's pictures, avoided for variety
+    lastInteraction: 0,
+    roundStart: 0,
+    roundTaps: 0,            // every tap on a die this round
+    roundHints: 0,           // times the stronger idle hint was needed this round
+    hintShown: false,        // the hint already counted for this idle stretch
+    readyAt: 0,              // time to reveal the done button and invite the story
+    celebrateStart: 0,
+    particles: [],
+  };
+
+  // ---------------------------------------------------------------------
+  // Local progress tracking (localStorage, never leaves the device)
+  // ---------------------------------------------------------------------
+  function freshProgress() {
+    return { version: 1, gamesCompleted: 0, roundsCompleted: 0, storiesTold: 0, picturesExplored: 0, lastPlayed: null, sessions: [] };
+  }
+
+  function loadProgress() {
+    try {
+      const raw = window.localStorage.getItem(CONFIG.STORAGE_KEY);
+      if (raw) {
+        const data = JSON.parse(raw);
+        if (data && data.version === 1 && Array.isArray(data.sessions)) return data;
+      }
+    } catch (e) {
+      console.warn('[StoryDice] Progress could not be loaded (storage unavailable):', e && e.message);
+    }
+    return freshProgress();
+  }
+
+  function saveProgress() {
+    try {
+      window.localStorage.setItem(CONFIG.STORAGE_KEY, JSON.stringify(progress));
+      log('Progress saved', { gamesCompleted: progress.gamesCompleted, roundsCompleted: progress.roundsCompleted });
+    } catch (e) {
+      console.warn('[StoryDice] Progress could not be saved (storage unavailable):', e && e.message);
+    }
+  }
+
+  const progress = loadProgress();
+  let session = null; // created on the first round of this app launch
+
+  function ensureSession() {
+    if (session) return;
+    session = { startedAt: new Date().toISOString(), finished: false, rounds: [] };
+    progress.sessions.push(session);
+    if (progress.sessions.length > 30) progress.sessions.splice(0, progress.sessions.length - 30);
+  }
+
+  // ---------------------------------------------------------------------
+  // Audio: Web Audio tones + optional spoken words
+  // ---------------------------------------------------------------------
+  let actx = null;
+
+  // Browsers only allow audio after a user gesture, so this runs on every pointer down.
+  function unlockAudio() {
+    if (!actx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) { try { actx = new AC(); } catch (e) { actx = null; } }
+    }
+    if (actx && actx.state === 'suspended') actx.resume();
+  }
+
+  function tone(freq, delay, dur, vol = 0.16, type = 'sine') {
+    if (!actx) return;
+    const t = actx.currentTime + delay;
+    const osc = actx.createOscillator();
+    const gain = actx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(vol, t + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    osc.connect(gain).connect(actx.destination);
+    osc.start(t);
+    osc.stop(t + dur + 0.05);
+  }
+
+  // Each die position always plays the same note: predictable feedback.
+  const DIE_NOTE = [523.25, 659.25, 783.99];
+  const playRattle = () => { for (let i = 0; i < 6; i++) tone(300 + (i % 2) * 80, i * 0.09, 0.05, 0.04, 'triangle'); };
+  const playLand = i => { tone(196, 0, 0.12, 0.09, 'triangle'); tone(DIE_NOTE[i % 3], 0.04, 0.3, 0.1); };
+  const playWord = i => tone(DIE_NOTE[i % 3] * 1.5, 0, 0.18, 0.07);
+  const playReady = () => { tone(587.33, 0, 0.3, 0.1); tone(880, 0.1, 0.4, 0.08); };
+  const playRoundDone = () => [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => tone(f, i * 0.12, 0.5, 0.12));
+
+  // Spoken words via the Web Speech API. Android WebView usually lacks it,
+  // so this quietly does nothing there and the tones carry the feedback.
+  function say(text) {
+    try {
+      if (!('speechSynthesis' in window)) return;
+      window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'en-US';
+      u.rate = 0.85;
+      u.pitch = 1.15;
+      window.speechSynthesis.speak(u);
+    } catch (e) { /* speech is optional */ }
+  }
+
+  // ---------------------------------------------------------------------
+  // Rounds and difficulty
+  // ---------------------------------------------------------------------
+  function startRound() {
+    ensureSession();
+    const n = TIERS[state.tier].dice;
+
+    // No duplicate pictures in one roll; skip last round's pictures when we can.
+    let pool = PICTURES.map(p => p.id).filter(id => !state.lastPics.includes(id));
+    if (pool.length < n) pool = PICTURES.map(p => p.id);
+    const pics = shuffle(pool).slice(0, n);
+    const colors = shuffle(COLORS.dice.slice());
+
+    state.dice = pics.map((pic, i) => ({
+      idx: i, pic, color: colors[i % colors.length],
+      state: 'rest',           // 'rest' | 'roll' | 'landed'
+      heard: false,            // tapped once after landing (word spoken)
+      t0: 0, seed: 0,
+      landT: -1e9, tapT: -1e9, cheerT0: -1e9,
+      x: 0, y: 0, s: 100,
+    }));
+    state.done.visible = false;
+    state.done.pressT0 = -1e9;
+    state.readyAt = 0;
+    state.roundTaps = 0;
+    state.roundHints = 0;
+    state.hintShown = false;
+    state.particles = [];
+    computeLayout();
+
+    state.phase = 'play';
+    state.roundStart = now();
+    state.lastInteraction = now();
+    if (state.round === 0) say(n === 1 ? 'Tap the die to roll it.' : 'Tap the dice to roll them.');
+    else say(n === 1 ? 'Roll the die!' : 'Roll the dice!');
+    log(`Round ${state.round + 1}/${CONFIG.ROUNDS} started at level ${state.tier + 1}: ${n} ${n === 1 ? 'die' : 'dice'}`);
+  }
+
+  function rollDie(d, t) {
+    d.state = 'roll';
+    d.t0 = t;
+    d.seed = Math.floor(Math.random() * PICTURES.length);
+    playRattle();
+    log(`Die ${d.idx + 1} rolled`);
+  }
+
+  // Sound, squash and the final picture all appear on the same frame.
+  function landDie(d, t) {
+    d.state = 'landed';
+    d.landT = t;
+    playLand(d.idx);
+    log(`Die ${d.idx + 1} landed on: ${WORD[d.pic]}`);
+  }
+
+  function hearDie(d, t) {
+    d.tapT = t;
+    say(WORD[d.pic]);
+    playWord(d.idx);
+    if (!d.heard) {
+      d.heard = true;
+      log(`Picture explored: ${WORD[d.pic]}`);
+      if (state.dice.every(x => x.state === 'landed' && x.heard)) state.readyAt = t + CONFIG.INVITE_DELAY_MS;
+    }
+  }
+
+  // Every picture explored: reveal the button and invite the story.
+  function revealDone(t) {
+    state.readyAt = 0;
+    state.done.visible = true;
+    state.done.t0 = t;
+    playReady();
+    say(`Tell a story about ${storyList(state.dice.map(d => d.pic))}!`);
+    log('All pictures explored: story invited, done button shown');
+  }
+
+  const doneArmed = t => state.done.visible && t - state.done.t0 >= CONFIG.DONE_ARM_MS;
+
+  function completeRound() {
+    const t = now();
+    const ms = t - state.roundStart;
+    const pics = state.dice.map(d => d.pic);
+    const record = {
+      level: state.tier + 1,
+      dice: pics.length,
+      pictures: pics.map(id => WORD[id]),
+      attempts: state.roundTaps,
+      slips: 0,                // open-ended: there is nothing to get wrong
+      hints: state.roundHints,
+      seconds: Math.round(ms / 100) / 10,
+    };
+
+    session.rounds.push(record);
+    progress.roundsCompleted++;
+    progress.storiesTold++;
+    progress.picturesExplored += pics.length;
+    progress.lastPlayed = new Date().toISOString();
+    state.lastPics = pics;
+    state.round++;
+    log('Level completed: story told', record);
+
+    const finalRound = state.round >= CONFIG.ROUNDS;
+    if (finalRound) {
+      session.finished = true;
+      progress.gamesCompleted++;
+    } else {
+      // Praise the effort and the process (growth mindset).
+      say('You told a story with every picture!');
+    }
+    saveProgress();
+    adjustDifficulty(record);
+
+    // Same celebration every time: chord, button squish, dice hop, sparkles.
+    playRoundDone();
+    state.done.pressT0 = t;
+    state.dice.forEach(d => { d.cheerT0 = t; spawnParticles(d.x, d.y - d.s * 0.5, d.color, d.s, t); });
+    state.phase = 'celebrate';
+    state.celebrateStart = t;
+  }
+
+  // Simple DDA: no hint needed -> one more die; needed the hint again and again -> one fewer.
+  function adjustDifficulty(record) {
+    const before = state.tier;
+    if (record.hints === 0) state.tier = Math.min(TIERS.length - 1, state.tier + 1);
+    else if (record.hints >= 2) state.tier = Math.max(0, state.tier - 1);
+    if (state.tier !== before) log(`Difficulty ${state.tier > before ? 'up' : 'down'}: level ${before + 1} -> ${state.tier + 1}`);
+  }
+
+  function enterEnd() {
+    state.phase = 'end';
+    say('Great job! Time to play outside!');
+    log('Session finished: end screen shown, no replay offered');
+  }
+
+  // ---------------------------------------------------------------------
+  // Layout
+  // ---------------------------------------------------------------------
+  // Possible row arrangements for n dice (dice per row, top to bottom).
+  const ARRANGEMENTS = { 1: [[1]], 2: [[2], [1, 1]], 3: [[3], [2, 1], [1, 1, 1]] };
+  const PITCH = 1.38;          // centre-to-centre distance in die sizes (keeps tap zones apart)
+
+  function computeLayout() {
+    const minDim = Math.min(W, H);
+    const m = clamp(minDim * 0.045, 12, 36);
+    L.m = m;
+
+    // The done button sits at the bottom centre.
+    const B = clamp(minDim * 0.1, 38, 72);
+    state.done.r = B;
+    state.done.x = W / 2;
+    state.done.y = H - m - B * 1.1;
+
+    // Dice share the area above it; the top strip stays clear for the home button.
+    const ax = m, ay = Math.max(m, CONFIG.HOME_RESERVE_PX);
+    const aw = W - 2 * m;
+    const ah = Math.max(80, state.done.y - B * 1.55 - ay);
+    const n = Math.max(1, state.dice.length);
+
+    let best = null;
+    for (const rows of ARRANGEMENTS[clamp(n, 1, 3)]) {
+      const widest = Math.max(...rows);
+      const s = Math.min(aw / (widest * PITCH), ah / (rows.length * PITCH), minDim * 0.42, 240);
+      if (!best || s > best.s + 0.5) best = { rows, s };
+    }
+    const s = Math.max(40, best.s);
+    L.s = s;
+
+    let i = 0;
+    best.rows.forEach((count, r) => {
+      const cy = ay + ah * (r + 0.5) / best.rows.length;
+      for (let c = 0; c < count && i < state.dice.length; c++, i++) {
+        const d = state.dice[i];
+        d.s = s;
+        d.x = ax + aw / 2 + (c - (count - 1) / 2) * s * PITCH;
+        d.y = cy;
+      }
+    });
+  }
+
+  // Forgiving pick: the nearest die within 1.3x its half-size (square zone).
+  function pickDie(p) {
+    let best = null, bestD = Infinity;
+    for (const d of state.dice) {
+      const half = d.s * 0.5 * 1.3;
+      if (Math.abs(p.x - d.x) <= half && Math.abs(p.y - d.y) <= half) {
+        const dist = Math.hypot(p.x - d.x, p.y - d.y);
+        if (dist < bestD) { best = d; bestD = dist; }
+      }
+    }
+    return best;
+  }
+
+  const hitDone = p => Math.hypot(p.x - state.done.x, p.y - state.done.y) <= state.done.r * 1.4;
+
+  // ---------------------------------------------------------------------
+  // Input: touch + mouse (taps only in this game)
+  // ---------------------------------------------------------------------
+  let activeTouch = null;
+  let mouseDown = false;
+  let parentTimer = null;
+
+  function toCanvas(clientX, clientY) {
+    const r = canvas.getBoundingClientRect();
+    return { x: clientX - r.left, y: clientY - r.top };
+  }
+
+  function findTouch(list, id) {
+    for (let i = 0; i < list.length; i++) if (list[i].identifier === id) return list[i];
+    return null;
+  }
+
+  function cancelParentHold() {
+    if (parentTimer) { clearTimeout(parentTimer); parentTimer = null; }
+  }
+
+  function onDown(p) {
+    unlockAudio();
+    const t = now();
+    state.lastInteraction = t;
+    state.hintShown = false;
+
+    if (state.phase === 'start' || state.phase === 'between') {
+      const g = starGeom();
+      if (Math.hypot(p.x - g.cx, p.y - g.cy) <= g.R * 1.8) { startRound(); return; }
+    } else if (state.phase === 'play') {
+      if (doneArmed(t) && hitDone(p)) { completeRound(); return; }
+      const d = pickDie(p);
+      if (d) {
+        state.roundTaps++;
+        if (d.state === 'rest') rollDie(d, t);
+        else if (d.state === 'landed') hearDie(d, t);
+        // A tumbling die ignores taps; once landed it never rolls again.
+        return;
+      }
+    }
+
+    // Hidden parent view: hold the top-left corner still for 3 seconds.
+    if (p.x < CONFIG.PARENT_CORNER_PX && p.y < CONFIG.PARENT_CORNER_PX) {
+      cancelParentHold();
+      parentTimer = setTimeout(openParent, CONFIG.PARENT_HOLD_MS);
+    }
+  }
+
+  function onMove(p) {
+    if (parentTimer && (p.x >= CONFIG.PARENT_CORNER_PX || p.y >= CONFIG.PARENT_CORNER_PX)) cancelParentHold();
+  }
+
+  function onUp() {
+    cancelParentHold();
+  }
+
+  canvas.addEventListener('touchstart', e => {
+    e.preventDefault();
+    if (activeTouch !== null) return;          // one finger at a time
+    const t = e.changedTouches[0];
+    activeTouch = t.identifier;
+    onDown(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  canvas.addEventListener('touchmove', e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (t) onMove(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  const endTouch = e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (!t) return;
+    activeTouch = null;
+    onUp(toCanvas(t.clientX, t.clientY));
+  };
+  canvas.addEventListener('touchend', endTouch, { passive: false });
+  canvas.addEventListener('touchcancel', endTouch, { passive: false });
+
+  canvas.addEventListener('mousedown', e => { mouseDown = true; onDown(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mousemove', e => { if (mouseDown) onMove(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mouseup', e => {
+    if (!mouseDown) return;
+    mouseDown = false;
+    onUp(toCanvas(e.clientX, e.clientY));
+  });
+
+  // ---------------------------------------------------------------------
+  // Parent view (hidden, local data only)
+  // ---------------------------------------------------------------------
+  const parentEl = document.getElementById('parent');
+  const parentBody = document.getElementById('parentBody');
+
+  function el(tag, text) {
+    const node = document.createElement(tag);
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  const fmtWhen = iso => {
+    const when = new Date(iso);
+    return when.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' ' +
+      when.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+  };
+
+  function openParent() {
+    parentTimer = null;
+    parentBody.textContent = '';
+    parentBody.appendChild(el('div', `Full games finished: ${progress.gamesCompleted}`));
+    parentBody.appendChild(el('div', `Stories told: ${progress.storiesTold}`));
+    parentBody.appendChild(el('div', `Pictures explored: ${progress.picturesExplored}`));
+
+    // Newest stories first, so a parent can ask "tell me the cat and moon story again".
+    const stories = [];
+    for (let i = progress.sessions.length - 1; i >= 0 && stories.length < CONFIG.PARENT_STORY_ROWS; i--) {
+      const s = progress.sessions[i];
+      for (let j = s.rounds.length - 1; j >= 0 && stories.length < CONFIG.PARENT_STORY_ROWS; j--) {
+        stories.push({ when: s.startedAt, round: j + 1, pictures: s.rounds[j].pictures || [] });
+      }
+    }
+    if (stories.length) {
+      parentBody.appendChild(el('h3', 'Recent story pictures'));
+      const table = el('table');
+      const head = el('tr');
+      ['Session', 'Round', 'Pictures'].forEach(h => head.appendChild(el('th', h)));
+      table.appendChild(head);
+      stories.forEach(st => {
+        const tr = el('tr');
+        tr.appendChild(el('td', fmtWhen(st.when)));
+        tr.appendChild(el('td', String(st.round)));
+        tr.appendChild(el('td', st.pictures.join(', ')));
+        table.appendChild(tr);
+      });
+      parentBody.appendChild(table);
+      parentBody.appendChild(el('p', 'Try asking your child to retell one of these stories.'));
+    }
+    parentEl.hidden = false;
+    log('Parent view opened', progress);
+  }
+
+  parentEl.addEventListener('click', () => { parentEl.hidden = true; });
+
+  // Read-only debug hooks for the Android/desktop console.
+  window.StoryDice = {
+    progress: () => JSON.parse(JSON.stringify(progress)),
+    state: () => ({
+      phase: state.phase,
+      round: state.round,
+      level: state.tier + 1,
+      star: (() => { const g = starGeom(); return { x: g.cx, y: g.cy, r: g.R }; })(),
+      dice: state.dice.map(d => ({ picture: d.pic, word: WORD[d.pic], state: d.state, heard: d.heard, x: d.x, y: d.y, size: d.s })),
+      doneButton: { visible: state.done.visible, tappable: doneArmed(now()), x: state.done.x, y: state.done.y, r: state.done.r },
+    }),
+  };
+
+  // ---------------------------------------------------------------------
+  // Drawing primitives
+  // ---------------------------------------------------------------------
+  function roundRectPath(x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  // The helpers below draw in a 200 x 200 "picture space" centred on 0,0
+  // (drawPicture scales it), so line widths are in picture units.
+  function circle(x, y, r) { ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); }
+  function addCircle(x, y, r) { ctx.moveTo(x + r, y); ctx.arc(x, y, r, 0, TAU); }
+
+  // Fill the current path with a soft darker outline of the same hue (fill must be hex).
+  function paint(fill, lw = 6) {
+    ctx.fillStyle = fill;
+    ctx.fill();
+    ctx.lineWidth = lw;
+    ctx.strokeStyle = shade(fill, -0.3);
+    ctx.stroke();
+  }
+
+  // Union of overlapping parts with one outer outline: stroke wide, then fill over it.
+  function blob(fill, addParts) {
+    ctx.beginPath();
+    addParts();
+    ctx.lineWidth = 12;
+    ctx.strokeStyle = shade(fill, -0.3);
+    ctx.stroke();
+    ctx.fillStyle = fill;
+    ctx.fill();
+  }
+
+  function dot(x, y, r, fill) { circle(x, y, r); ctx.fillStyle = fill; ctx.fill(); }
+
+  function eyes(x, y, gap, r) { dot(x - gap, y, r, COLORS.ink); dot(x + gap, y, r, COLORS.ink); }
+
+  function smile(x, y, r, lw) {
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0.15 * Math.PI, 0.85 * Math.PI);
+    ctx.strokeStyle = COLORS.ink;
+    ctx.lineWidth = lw;
+    ctx.stroke();
+  }
+
+  function cheeks(x, y, gap, rx, ry) {
+    ctx.globalAlpha = 0.4;
+    ctx.fillStyle = COLORS.cheek;
+    ctx.beginPath(); ctx.ellipse(x - gap, y, rx, ry, 0, 0, TAU); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(x + gap, y, rx, ry, 0, 0, TAU); ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  function line(x0, y0, x1, y1, color, lw) {
+    ctx.beginPath();
+    ctx.moveTo(x0, y0);
+    ctx.lineTo(x1, y1);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = lw;
+    ctx.stroke();
+  }
+
+  function drawStar(cx, cy, R, fill, face) {
+    ctx.save();
+    ctx.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const rad = i % 2 === 0 ? R : R * 0.5;
+      const a = -Math.PI / 2 + i * Math.PI / 5;
+      const x = cx + rad * Math.cos(a), y = cy + rad * Math.sin(a);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    ctx.lineJoin = 'round';
+    if (fill) {
+      ctx.fillStyle = fill;
+      ctx.fill();
+      ctx.strokeStyle = fill;            // same-colour stroke rounds the tips
+      ctx.lineWidth = Math.max(2, R * 0.16);
+      ctx.stroke();
+    } else {
+      ctx.strokeStyle = 'rgba(74, 64, 54, 0.25)';
+      ctx.lineWidth = Math.max(2, R * 0.14);
+      ctx.stroke();
+    }
+
+    if (face) {
+      ctx.fillStyle = COLORS.ink;
+      ctx.beginPath(); ctx.arc(cx - R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.arc(cx + R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.strokeStyle = COLORS.ink;
+      ctx.lineWidth = Math.max(2, R * 0.05);
+      ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.arc(cx, cy + R * 0.06, R * 0.17, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+      ctx.globalAlpha = 0.35;
+      ctx.fillStyle = COLORS.cheek;
+      ctx.beginPath(); ctx.ellipse(cx - R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(cx + R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // ---------------------------------------------------------------------
+  // Pictures (all procedural, drawn in picture space, radius ~90)
+  // ---------------------------------------------------------------------
+  const PIC_DRAW = {
+    sun() {
+      ctx.lineCap = 'round';
+      for (let i = 0; i < 8; i++) {
+        const a = i * TAU / 8 + TAU / 16;
+        line(Math.cos(a) * 62, Math.sin(a) * 62, Math.cos(a) * 84, Math.sin(a) * 84, '#F2B542', 10);
+      }
+      circle(0, 0, 50); paint('#F6C85F');
+      eyes(0, -8, 16, 5);
+      smile(0, 2, 18, 5);
+      cheeks(0, 10, 30, 8, 5);
+    },
+
+    cat() {
+      const fur = '#F2B880';
+      for (const sx of [-1, 1]) {
+        ctx.beginPath(); ctx.moveTo(sx * 50, -6); ctx.lineTo(sx * 44, -66); ctx.lineTo(sx * 8, -38); ctx.closePath(); paint(fur);
+        ctx.beginPath(); ctx.moveTo(sx * 38, -22); ctx.lineTo(sx * 38, -50); ctx.lineTo(sx * 20, -36); ctx.closePath();
+        ctx.fillStyle = '#E8B4C8'; ctx.fill();
+      }
+      ctx.beginPath(); ctx.ellipse(0, 10, 60, 50, 0, 0, TAU); paint(fur);
+      for (const x of [-12, 0, 12]) line(x, -34, x, -22, shade(fur, -0.18), 5);
+      eyes(0, 2, 22, 6);
+      ctx.beginPath(); ctx.moveTo(-7, 16); ctx.lineTo(7, 16); ctx.lineTo(0, 24); ctx.closePath();
+      ctx.fillStyle = '#E8A0B4'; ctx.fill();
+      ctx.beginPath(); ctx.arc(-6, 26, 6, 0, Math.PI); ctx.moveTo(12, 26); ctx.arc(6, 26, 6, 0, Math.PI);
+      ctx.strokeStyle = COLORS.ink; ctx.lineWidth = 4; ctx.stroke();
+      for (const sx of [-1, 1]) {
+        line(sx * 32, 18, sx * 80, 10, shade(fur, -0.35), 3);
+        line(sx * 32, 26, sx * 78, 32, shade(fur, -0.35), 3);
+      }
+      cheeks(0, 22, 36, 9, 6);
+    },
+
+    tree() {
+      ctx.beginPath(); roundRectPath(-13, 6, 26, 78, 8); paint('#B98A62');
+      blob('#9CCB9A', () => { addCircle(-36, -4, 34); addCircle(36, -4, 34); addCircle(0, -36, 46); addCircle(0, 6, 30); });
+      dot(-26, -22, 7, '#F2A88A'); dot(22, -40, 7, '#F2A88A'); dot(14, 4, 7, '#F2A88A');
+    },
+
+    boat() {
+      ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(-86, 74);
+      for (let i = 0; i < 4; i++) ctx.quadraticCurveTo(-86 + i * 43 + 21, 64, -86 + (i + 1) * 43, 74);
+      ctx.strokeStyle = '#8FB8DE'; ctx.lineWidth = 6; ctx.stroke();
+      line(0, 28, 0, -74, '#B98A62', 7);
+      ctx.lineJoin = 'round';
+      ctx.beginPath(); ctx.moveTo(-6, -50); ctx.lineTo(-6, 14); ctx.lineTo(-50, 14); ctx.closePath(); paint('#F2A88A');
+      ctx.beginPath(); ctx.moveTo(7, -68); ctx.lineTo(7, 14); ctx.lineTo(64, 14); ctx.closePath(); paint('#FFF3D6');
+      ctx.beginPath(); ctx.moveTo(3, -76); ctx.lineTo(28, -68); ctx.lineTo(3, -60); ctx.closePath(); paint('#F6C85F', 4);
+      ctx.beginPath(); ctx.moveTo(-80, 24); ctx.lineTo(80, 24); ctx.lineTo(56, 62); ctx.lineTo(-56, 62); ctx.closePath(); paint('#8FB8DE');
+      for (const x of [-28, 0, 28]) { circle(x, 42, 7); paint('#FFFDF8', 4); }
+    },
+
+    cake() {
+      ctx.beginPath(); ctx.ellipse(0, 68, 82, 13, 0, 0, TAU); paint('#EDE5D6');
+      ctx.beginPath(); roundRectPath(-62, -6, 124, 72, 12); paint('#E8B4C8');
+      // Sprinkles.
+      ctx.lineCap = 'round';
+      [[-40, 30, '#8FB8DE'], [-14, 46, '#F6C85F'], [16, 30, '#9CCB9A'], [40, 48, '#8FB8DE'], [-36, 54, '#9CCB9A'], [8, 56, '#F2A88A']]
+        .forEach(([x, y, c], i) => line(x - 5, y + (i % 2 ? 3 : -3), x + 5, y + (i % 2 ? -3 : 3), c, 5));
+      // Frosting band with drips.
+      blob('#FFF3D6', () => {
+        roundRectPath(-68, -18, 136, 26, 13);
+        addCircle(-42, 10, 9); addCircle(-6, 14, 10); addCircle(30, 9, 8); addCircle(56, 12, 7);
+      });
+      ctx.beginPath(); roundRectPath(-7, -58, 14, 42, 4); paint('#8FB8DE', 4);
+      line(-7, -44, 7, -50, '#FFFDF8', 3); line(-7, -30, 7, -36, '#FFFDF8', 3);
+      ctx.beginPath(); ctx.moveTo(0, -88); ctx.quadraticCurveTo(13, -70, 0, -62); ctx.quadraticCurveTo(-13, -70, 0, -88);
+      paint('#F6C85F', 4);
+    },
+
+    moon() {
+      const c = '#F4D35E';
+      circle(-8, 4, 62); paint(c);
+      // Cut the crescent with the panel colour, then outline the cut edge.
+      ctx.save();
+      circle(-8, 4, 65); ctx.clip();
+      circle(28, -20, 52);
+      ctx.fillStyle = COLORS.face; ctx.fill();
+      ctx.lineWidth = 6; ctx.strokeStyle = shade(c, -0.3); ctx.stroke();
+      ctx.restore();
+      ctx.beginPath(); ctx.arc(-38, -2, 7, 0.1 * Math.PI, 0.9 * Math.PI);
+      ctx.strokeStyle = COLORS.ink; ctx.lineWidth = 4.5; ctx.lineCap = 'round'; ctx.stroke();
+      smile(-30, 18, 12, 4.5);
+      cheeks(-44, 24, 0, 8, 5);
+      drawStar(48, 32, 13, '#F6C85F', false);
+      drawStar(62, -62, 9, '#F6C85F', false);
+    },
+
+    dog() {
+      const fur = '#E3C29B', ear = '#A9805C';
+      for (const sx of [-1, 1]) { ctx.beginPath(); ctx.ellipse(sx * 50, 2, 18, 38, sx * 0.35, 0, TAU); paint(ear); }
+      circle(0, 0, 52); paint(fur);
+      ctx.beginPath(); ctx.ellipse(22, -16, 15, 13, 0, 0, TAU); ctx.fillStyle = shade(fur, -0.12); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(0, 24, 31, 22, 0, 0, TAU); paint('#F6E6D0', 4);
+      ctx.beginPath(); ctx.ellipse(0, 46, 9, 11, 0, 0, Math.PI); ctx.fillStyle = '#E8A0B4'; ctx.fill();
+      eyes(0, -12, 20, 6);
+      ctx.beginPath(); ctx.ellipse(0, 14, 11, 8, 0, 0, TAU); ctx.fillStyle = COLORS.ink; ctx.fill();
+      line(0, 20, 0, 30, COLORS.ink, 4);
+      ctx.beginPath(); ctx.arc(-8, 30, 8, 0, Math.PI * 0.9); ctx.moveTo(16, 30); ctx.arc(8, 30, 8, 0, Math.PI, false);
+      ctx.strokeStyle = COLORS.ink; ctx.lineWidth = 4; ctx.stroke();
+    },
+
+    house() {
+      ctx.lineJoin = 'round';
+      ctx.beginPath(); roundRectPath(26, -62, 18, 40, 3); paint('#B98A62');
+      ctx.beginPath(); roundRectPath(-56, -12, 112, 84, 6); paint('#F6E0B5');
+      ctx.beginPath(); ctx.moveTo(-74, -6); ctx.lineTo(0, -72); ctx.lineTo(74, -6); ctx.closePath(); paint('#F2A88A');
+      ctx.beginPath(); roundRectPath(-15, 26, 30, 46, 8); paint('#B98A62');
+      dot(8, 50, 3.5, '#F6C85F');
+      for (const x of [-46, 20]) {
+        ctx.beginPath(); roundRectPath(x, 4, 26, 24, 4); paint('#BFE0F2', 5);
+        line(x + 13, 6, x + 13, 26, shade('#BFE0F2', -0.3), 3);
+        line(x + 2, 16, x + 24, 16, shade('#BFE0F2', -0.3), 3);
+      }
+    },
+
+    cloud() {
+      const drop = (x, y) => {
+        ctx.beginPath();
+        ctx.moveTo(x, y - 14);
+        ctx.bezierCurveTo(x + 12, y, x + 10, y + 12, x, y + 12);
+        ctx.bezierCurveTo(x - 10, y + 12, x - 12, y, x, y - 14);
+        paint('#8FB8DE', 4);
+      };
+      drop(-38, 50); drop(0, 64); drop(38, 50); drop(-18, 82); drop(20, 84);
+      blob('#C9D6E3', () => {
+        addCircle(-40, -8, 28); addCircle(0, -28, 38); addCircle(40, -8, 28);
+        roundRectPath(-66, -8, 132, 34, 17);
+      });
+      eyes(0, -6, 16, 5);
+      smile(0, 2, 10, 4);
+    },
+
+    ball() {
+      const bands = ['#F2A88A', '#FFFDF8', '#8FB8DE', '#FFFDF8', '#F4D35E', '#FFFDF8'];
+      ctx.save();
+      circle(0, 0, 62); ctx.clip();
+      bands.forEach((c, i) => {
+        ctx.beginPath(); ctx.moveTo(0, 0);
+        ctx.arc(0, 0, 66, -Math.PI / 2 + i * TAU / 6, -Math.PI / 2 + (i + 1) * TAU / 6);
+        ctx.closePath(); ctx.fillStyle = c; ctx.fill();
+      });
+      ctx.restore();
+      circle(0, 0, 62); ctx.lineWidth = 6; ctx.strokeStyle = 'rgba(74, 64, 54, 0.4)'; ctx.stroke();
+      circle(0, 0, 11); paint('#FFFDF8', 4);
+      ctx.globalAlpha = 0.5; ctx.fillStyle = '#fff';
+      ctx.beginPath(); ctx.ellipse(-26, -30, 14, 8, -0.7, 0, TAU); ctx.fill();
+      ctx.globalAlpha = 1;
+    },
+
+    bird() {
+      const b = '#8FB8DE';
+      ctx.lineCap = 'round';
+      line(-8, 42, -12, 64, '#E99A5A', 5); line(12, 42, 14, 64, '#E99A5A', 5);
+      line(-22, 64, -2, 64, '#E99A5A', 5); line(4, 64, 24, 64, '#E99A5A', 5);
+      ctx.beginPath(); ctx.moveTo(-46, 4); ctx.lineTo(-86, -16); ctx.lineTo(-80, 24); ctx.closePath(); paint('#6E9CC6');
+      ctx.beginPath(); ctx.ellipse(0, 8, 56, 42, 0, 0, TAU); paint(b);
+      ctx.beginPath(); ctx.ellipse(10, 22, 30, 20, 0, 0, TAU); ctx.fillStyle = '#E6F0F8'; ctx.fill();
+      ctx.beginPath(); ctx.ellipse(-14, 8, 28, 16, -0.4, 0, TAU); paint('#6E9CC6', 4);
+      ctx.lineJoin = 'round';
+      ctx.beginPath(); ctx.moveTo(50, -6); ctx.lineTo(74, 4); ctx.lineTo(50, 14); ctx.closePath(); paint('#F6B26B', 4);
+      dot(32, -8, 6, COLORS.ink);
+      cheeks(36, 8, 0, 7, 5);
+    },
+
+    flower() {
+      ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(0, 6); ctx.quadraticCurveTo(-8, 50, 0, 88);
+      ctx.strokeStyle = '#7FB77E'; ctx.lineWidth = 8; ctx.stroke();
+      ctx.beginPath(); ctx.ellipse(-22, 58, 22, 10, -0.5, 0, TAU); paint('#9CCB9A', 4);
+      ctx.beginPath(); ctx.ellipse(20, 48, 18, 9, 0.5, 0, TAU); paint('#9CCB9A', 4);
+      for (let i = 0; i < 6; i++) {
+        const a = i * TAU / 6;
+        circle(Math.cos(a) * 33, -20 + Math.sin(a) * 33, 22); paint('#E8B4C8', 5);
+      }
+      circle(0, -20, 21); paint('#F6C85F', 5);
+      eyes(0, -24, 8, 3.5);
+      smile(0, -20, 8, 3.5);
+    },
+
+    car() {
+      const c = '#F2A88A';
+      ctx.lineJoin = 'round';
+      ctx.beginPath(); ctx.moveTo(-46, -4); ctx.lineTo(-30, -46); ctx.lineTo(30, -46); ctx.lineTo(50, -4); ctx.closePath(); paint(c);
+      ctx.beginPath(); ctx.moveTo(-32, -8); ctx.lineTo(-22, -36); ctx.lineTo(-4, -36); ctx.lineTo(-4, -8); ctx.closePath(); paint('#DDEFFA', 4);
+      ctx.beginPath(); ctx.moveTo(4, -8); ctx.lineTo(4, -36); ctx.lineTo(24, -36); ctx.lineTo(38, -8); ctx.closePath(); paint('#DDEFFA', 4);
+      ctx.beginPath(); roundRectPath(-82, -10, 164, 46, 18); paint(c);
+      line(0, -6, 0, 30, shade(c, -0.25), 4);
+      dot(72, 6, 7, '#F6E08A');
+      dot(-75, 6, 5, '#E8B4C8');
+      for (const x of [-46, 46]) { circle(x, 38, 21); paint('#6B5E52'); dot(x, 38, 8, '#EDE5D6'); }
+    },
+
+    fish() {
+      const f = '#F6A96B';
+      ctx.lineJoin = 'round';
+      ctx.beginPath(); ctx.moveTo(-40, 2); ctx.lineTo(-82, -32); ctx.quadraticCurveTo(-68, 2, -82, 36); ctx.closePath(); paint(f);
+      ctx.beginPath(); ctx.moveTo(-8, -34); ctx.quadraticCurveTo(8, -62, 30, -32); ctx.closePath(); paint(f);
+      ctx.beginPath(); ctx.ellipse(6, 2, 56, 38, 0, 0, TAU); paint(f);
+      ctx.save();
+      ctx.beginPath(); ctx.ellipse(6, 2, 53, 35, 0, 0, TAU); ctx.clip();
+      for (const x of [-22, -4]) { ctx.beginPath(); ctx.ellipse(x, 2, 6, 40, 0, 0, TAU); ctx.fillStyle = '#F8C79A'; ctx.fill(); }
+      ctx.restore();
+      circle(34, -8, 11); paint('#FFFDF8', 4);
+      dot(36, -8, 5.5, COLORS.ink);
+      ctx.beginPath(); ctx.arc(40, 14, 9, 0.2 * Math.PI, 0.8 * Math.PI);
+      ctx.strokeStyle = COLORS.ink; ctx.lineWidth = 4; ctx.lineCap = 'round'; ctx.stroke();
+      circle(72, -46, 8); ctx.strokeStyle = '#8FB8DE'; ctx.lineWidth = 4; ctx.stroke();
+      circle(82, -70, 5); ctx.stroke();
+    },
+
+    star() {
+      drawStar(0, 4, 72, COLORS.star, true);
+    },
+
+    hat() {
+      const straw = '#E9C98B';
+      ctx.beginPath(); ctx.ellipse(0, 34, 86, 22, 0, 0, TAU); paint(straw);
+      const crown = () => { ctx.beginPath(); ctx.moveTo(-46, 36); ctx.bezierCurveTo(-48, -44, 48, -44, 46, 36); ctx.closePath(); };
+      crown(); paint(straw);
+      ctx.save();
+      crown(); ctx.clip();
+      ctx.fillStyle = '#E8B4C8'; ctx.fillRect(-60, 6, 120, 18);
+      ctx.restore();
+      crown(); ctx.lineWidth = 6; ctx.strokeStyle = shade(straw, -0.3); ctx.stroke();
+      for (let i = 0; i < 5; i++) {
+        const a = i * TAU / 5;
+        circle(28 + Math.cos(a) * 8, 14 + Math.sin(a) * 8, 6); ctx.fillStyle = '#FFFDF8'; ctx.fill();
+      }
+      dot(28, 14, 5, '#F6C85F');
+    },
+  };
+
+  function drawPicture(id, cx, cy, r) {
+    const fn = PIC_DRAW[id];
+    if (!fn) return;
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.scale(r / 100, r / 100);
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    fn();
+    ctx.restore();
+  }
+
+  // A soft foam die. Rest dice show pips; landed dice show their picture.
+  function drawDie(d, t, pulse, glow) {
+    let hop = 0, rot = 0, sx = 1, sy = 1;
+    let face = d.state === 'rest' ? null : d.pic;
+
+    if (d.state === 'roll') {
+      const p = clamp((t - d.t0) / rollMs(), 0, 1);
+      const bounce = Math.abs(Math.sin(p * Math.PI * 2)) * Math.pow(1 - p, 1.2);
+      hop = bounce * d.s * (reduceMotion ? 0.12 : 0.45);
+      rot = reduceMotion ? 0 : (1 - easeOutCubic(p)) * TAU * 1.25 * (d.idx % 2 ? -1 : 1);
+      // The face flicks through pictures while tumbling, then settles on the real one.
+      if (p < 0.8) face = PICTURES[(d.seed + Math.floor((t - d.t0) / CONFIG.FLICK_MS) * 5) % PICTURES.length].id;
+    }
+
+    const lp = (t - d.landT) / CONFIG.LAND_MS;
+    if (lp >= 0 && lp < 1) { const k = Math.sin(Math.PI * lp); sx += 0.1 * k; sy -= 0.12 * k; }
+    const tp = (t - d.tapT) / CONFIG.TAP_MS;
+    if (tp >= 0 && tp < 1) { const k = Math.sin(Math.PI * tp); sx -= 0.05 * k; sy += 0.07 * k; }
+    const cp = (t - d.cheerT0) / CONFIG.CHEER_MS;
+    if (cp >= 0 && cp < 1) hop += Math.sin(Math.PI * cp) * d.s * (reduceMotion ? 0.06 : 0.22);
+
+    const s = d.s * pulse;
+    const h = s / 2;
+
+    // Ground shadow shrinks as the die leaves the floor.
+    ctx.globalAlpha = 0.12 * (1 - clamp(hop / d.s, 0, 0.6));
+    ctx.fillStyle = COLORS.ink;
+    ctx.beginPath();
+    ctx.ellipse(d.x, d.y + d.s * 0.6, d.s * 0.46 * (1 - clamp(hop / d.s, 0, 0.5)), d.s * 0.07, 0, 0, TAU);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+
+    ctx.save();
+    ctx.translate(d.x, d.y - hop);
+    ctx.rotate(rot);
+    ctx.translate(0, h);
+    ctx.scale(sx, sy);
+    ctx.translate(0, -h);
+
+    // Scaffolding hint: a soft glow around the die to tap next.
+    if (glow > 0) {
+      const g = s * (0.08 + 0.1 * glow);
+      ctx.globalAlpha = 0.25 + 0.35 * glow;
+      ctx.fillStyle = shade(d.color, 0.35);
+      ctx.beginPath();
+      roundRectPath(-h - g, -h - g, s + g * 2, s + g * 2 + s * 0.07, s * 0.22 + g);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    // Side (depth), top, highlight, then the cream picture panel.
+    ctx.beginPath(); roundRectPath(-h, -h + s * 0.07, s, s, s * 0.22);
+    ctx.fillStyle = shade(d.color, -0.2); ctx.fill();
+    ctx.beginPath(); roundRectPath(-h, -h, s, s, s * 0.22);
+    ctx.fillStyle = d.color; ctx.fill();
+    ctx.globalAlpha = 0.35; ctx.fillStyle = '#fff';
+    ctx.beginPath(); ctx.ellipse(-h * 0.55, -h * 0.84, s * 0.16, s * 0.05, -0.15, 0, TAU); ctx.fill();
+    ctx.globalAlpha = 1;
+
+    const ph = h * 0.78;
+    ctx.beginPath(); roundRectPath(-ph, -ph, ph * 2, ph * 2, s * 0.15);
+    ctx.fillStyle = COLORS.face; ctx.fill();
+
+    if (face) {
+      drawPicture(face, 0, 0, s * 0.34);
+    } else {
+      // Five soft pips: unmistakably a die waiting to be rolled.
+      ctx.fillStyle = shade(d.color, -0.08);
+      const o = ph * 0.52, pr = s * 0.065;
+      [[-o, -o], [o, -o], [0, 0], [-o, o], [o, o]].forEach(([x, y]) => { ctx.beginPath(); ctx.arc(x, y, pr, 0, TAU); ctx.fill(); });
+    }
+    ctx.restore();
+  }
+
+  // Expanding ring that says "tap here" without words.
+  function drawTapRipple(x, y, size, color, t) {
+    const k = ((t % 1400) / 1400);
+    ctx.globalAlpha = 0.45 * (1 - k);
+    ctx.strokeStyle = shade(color, -0.15);
+    ctx.lineWidth = Math.max(3, size * 0.04);
+    ctx.beginPath();
+    ctx.arc(x, y, size * (0.3 + 0.55 * easeOutCubic(k)), 0, TAU);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  // "I told my story": a big green button with a speech bubble (no text).
+  function drawDoneButton(t, pulse) {
+    const b = state.done;
+    const ap = clamp((t - b.t0) / CONFIG.DONE_APPEAR_MS, 0, 1);
+    let k = (reduceMotion ? ap : easeOutBack(ap)) * pulse;
+    const pp = (t - b.pressT0) / 300;
+    if (pp >= 0 && pp < 1) k *= 1 - 0.12 * Math.sin(Math.PI * pp);
+    const r = b.r * k;
+    if (r <= 1) return;
+
+    ctx.save();
+    ctx.translate(b.x, b.y);
+    ctx.fillStyle = shade(COLORS.done, -0.22);
+    ctx.beginPath(); ctx.arc(0, r * 0.08, r, 0, TAU); ctx.fill();
+    ctx.fillStyle = COLORS.done;
+    ctx.beginPath(); ctx.arc(0, 0, r, 0, TAU); ctx.fill();
+    ctx.globalAlpha = 0.3; ctx.fillStyle = '#fff';
+    ctx.beginPath(); ctx.ellipse(-r * 0.35, -r * 0.55, r * 0.3, r * 0.12, -0.5, 0, TAU); ctx.fill();
+    ctx.globalAlpha = 1;
+
+    // Speech bubble with its tail, then three "talking" dots.
+    ctx.beginPath();
+    roundRectPath(-r * 0.52, -r * 0.44, r * 1.04, r * 0.7, r * 0.26);
+    ctx.moveTo(-r * 0.26, r * 0.2);
+    ctx.lineTo(-r * 0.4, r * 0.5);
+    ctx.lineTo(-r * 0.02, r * 0.22);
+    ctx.closePath();
+    ctx.fillStyle = COLORS.face;
+    ctx.fill();
+    ctx.fillStyle = shade(COLORS.done, -0.4);
+    for (const x of [-0.25, 0, 0.25]) { ctx.beginPath(); ctx.arc(x * r, -r * 0.09, r * 0.075, 0, TAU); ctx.fill(); }
+    ctx.restore();
+  }
+
+  // Same ring of sparkles from every die, every time (no random rewards).
+  function spawnParticles(cx, cy, color, size, t) {
+    for (let i = 0; i < 10; i++) {
+      const a = -Math.PI / 2 + (i - 4.5) * 0.3;
+      state.particles.push({ x0: cx, y0: cy, dx: Math.cos(a), dy: Math.sin(a), dist: size * 0.75, t0: t, life: 900, color: i % 2 ? COLORS.star : shade(color, 0.1), r: size * 0.045 });
+    }
+  }
+
+  function drawParticles(t) {
+    state.particles = state.particles.filter(p => t - p.t0 < p.life);
+    for (const p of state.particles) {
+      const k = (t - p.t0) / p.life;
+      const e = easeOutCubic(k);
+      ctx.globalAlpha = 1 - k;
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x0 + p.dx * p.dist * e, p.y0 + p.dy * p.dist * e, p.r * (1 - k * 0.5), 0, TAU);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------------------------------------------------------------------
+  // Screens
+  // ---------------------------------------------------------------------
+  function starGeom() {
+    return { cx: W / 2, cy: H * 0.42, R: Math.min(W, H) * 0.2 };
+  }
+
+  // Start and between-round screen: one big pulsing star to tap, plus 5 slots
+  // that fill up so the child can see the end coming.
+  function drawStarScreen(t) {
+    const { cx, cy, R } = starGeom();
+    const amp = reduceMotion ? 0.03 : 0.07;
+    const k = 1 + amp * (0.5 - 0.5 * Math.cos(TAU * t / 1400));
+    drawStar(cx, cy, R * k, COLORS.star, true);
+
+    const sr = R * 0.16, gap = sr * 2.8, y = cy + R * 1.35;
+    for (let i = 0; i < CONFIG.ROUNDS; i++) {
+      drawStar(cx + (i - (CONFIG.ROUNDS - 1) / 2) * gap, y, sr, i < state.round ? COLORS.star : null, false);
+    }
+  }
+
+  function fitFont(text, weight, size, maxW) {
+    ctx.font = `${weight} ${size}px ${FONT}`;
+    while (size > 12 && ctx.measureText(text).width > maxW) {
+      size -= 1;
+      ctx.font = `${weight} ${size}px ${FONT}`;
+    }
+    return size;
+  }
+
+  // Static end screen. No buttons: the session is over.
+  function drawEnd() {
+    const gh = H * 0.14;
+    ctx.fillStyle = COLORS.grass;
+    ctx.beginPath();
+    ctx.moveTo(0, H - gh);
+    ctx.quadraticCurveTo(W / 2, H - gh * 1.5, W, H - gh);
+    ctx.lineTo(W, H);
+    ctx.lineTo(0, H);
+    ctx.closePath();
+    ctx.fill();
+
+    const R = Math.min(W, H) * 0.2;
+    const cy = H * 0.36;
+    drawStar(W / 2, cy, R, COLORS.star, true);
+
+    const big = clamp(Math.min(W, H) * 0.1, 26, 68);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = COLORS.ink;
+    const top = cy + R * 1.25;
+    fitFont('Great Job!', 800, big, W * 0.9);
+    ctx.fillText('Great Job!', W / 2, top + big * 0.5);
+    fitFont('Time to play outside!', 700, Math.round(big * 0.62), W * 0.9);
+    ctx.fillText('Time to play outside!', W / 2, top + big * 1.55);
+  }
+
+  // The thing to do next: roll a resting die, then hear an unexplored picture.
+  function nextDie() {
+    return state.dice.find(d => d.state === 'rest') ||
+      state.dice.find(d => d.state === 'landed' && !d.heard) || null;
+  }
+
+  // Which die to pulse, and whether to add the stronger glow + ripple hint.
+  function guidance(t) {
+    const out = { target: null, pulse: 1, glow: 0 };
+    if (state.phase !== 'play' || state.done.visible || state.readyAt) return out;
+    const idle = t - state.lastInteraction;
+    if (idle <= CONFIG.IDLE_PULSE_MS) return out;
+    out.target = nextDie();
+    if (!out.target) return out;
+    const amp = reduceMotion ? 0.04 : 0.08;
+    const wave = 0.5 - 0.5 * Math.cos(TAU * (idle - CONFIG.IDLE_PULSE_MS) / 1300);
+    out.pulse = 1 + amp * wave;
+    if (idle > CONFIG.HINT_MS) out.glow = wave;
+    return out;
+  }
+
+  function drawPlay(t) {
+    const g = guidance(t);
+    for (const d of state.dice) {
+      if (d === g.target && g.glow > 0) drawTapRipple(d.x, d.y, d.s * 1.3, d.color, t);
+      drawDie(d, t, d === g.target ? g.pulse : 1, d === g.target ? g.glow : 0);
+    }
+    if (state.done.visible) {
+      // The done button keeps pulsing gently: it is the one thing left to do.
+      const amp = reduceMotion ? 0.03 : 0.07;
+      const pulse = state.phase === 'play' ? 1 + amp * (0.5 - 0.5 * Math.cos(TAU * (t - state.done.t0) / 1300)) : 1;
+      drawDoneButton(t, pulse);
+    }
+    drawParticles(t);
+  }
+
+  // ---------------------------------------------------------------------
+  // Main loop
+  // ---------------------------------------------------------------------
+  function update(t) {
+    if (state.phase === 'play') {
+      for (const d of state.dice) {
+        if (d.state === 'roll' && t - d.t0 >= rollMs()) landDie(d, t);
+      }
+      if (state.readyAt && t >= state.readyAt) revealDone(t);
+
+      // Count the stronger hint once per idle stretch (used for difficulty).
+      if (!state.hintShown && !state.done.visible && !state.readyAt && nextDie() &&
+          t - state.lastInteraction > CONFIG.HINT_MS) {
+        state.hintShown = true;
+        state.roundHints++;
+        log('Hint shown: glowing the next die');
+      }
+    }
+
+    if (state.phase === 'celebrate' && t - state.celebrateStart >= CONFIG.CELEBRATE_MS) {
+      if (state.round >= CONFIG.ROUNDS) enterEnd();
+      else state.phase = 'between';
+    }
+  }
+
+  function render(t) {
+    ctx.fillStyle = COLORS.bg;
+    ctx.fillRect(0, 0, W, H);
+    if (state.phase === 'start' || state.phase === 'between') drawStarScreen(t);
+    else if (state.phase === 'play' || state.phase === 'celebrate') drawPlay(t);
+    else if (state.phase === 'end') drawEnd();
+  }
+
+  let rafId = 0;
+  function frame(t) {
+    update(t);
+    render(t);
+    // The end screen is static: stop the loop entirely.
+    if (state.phase !== 'end') rafId = requestAnimationFrame(frame);
+  }
+
+  function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    DPR = Math.min(window.devicePixelRatio || 1, 2.5);
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    computeLayout();
+    if (state.phase === 'end') render(now());
+  }
+
+  window.addEventListener('resize', resize);
+  window.addEventListener('orientationchange', resize);
+
+  resize();
+  log('Game loaded', { roundsPerSession: CONFIG.ROUNDS, gamesCompletedBefore: progress.gamesCompleted });
+  rafId = requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,1316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Sharing Treats</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
+  body {
+    background: #F6F1E7;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  canvas { display: block; width: 100%; height: 100%; }
+
+  #home {
+    position: fixed; top: max(10px, env(safe-area-inset-top)); right: max(10px, env(safe-area-inset-right));
+    width: 52px; height: 52px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+    background: rgba(255, 253, 248, 0.85); box-shadow: 0 2px 8px rgba(74, 64, 54, 0.15);
+    -webkit-tap-highlight-color: transparent; z-index: 5;
+  }
+  #home:active { transform: scale(0.94); }
+
+  /* Hidden parent view: press and hold the top-left corner for 3 seconds. */
+  #parent {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: rgba(74, 64, 54, 0.55); padding: 16px; box-sizing: border-box; z-index: 10;
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #4A4036;
+  }
+  #parent[hidden] { display: none; }
+  #parent .card { background: #FFFDF8; border-radius: 16px; padding: 20px 22px; max-width: 380px; width: 100%; max-height: 100%; overflow-y: auto; box-sizing: border-box; box-shadow: 0 10px 30px rgba(0,0,0,0.18); }
+  #parent h2 { margin: 0 0 10px; font-size: 18px; }
+  #parent table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+  #parent th, #parent td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #EDE5D6; }
+  #parent .hint { margin: 12px 0 0; font-size: 12px; opacity: 0.7; }
+</style>
+</head>
+<body>
+<canvas id="game" aria-label="Sharing treats game"></canvas>
+<a id="home" href="../../index.html" aria-label="Home">
+  <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><path d="M4 11.5 12 5l8 6.5V19a1 1 0 0 1-1 1h-4.5v-5h-5v5H5a1 1 0 0 1-1-1z" fill="none" stroke="#4A4036" stroke-width="2" stroke-linejoin="round"/></svg>
+</a>
+
+<div id="parent" hidden>
+  <div class="card">
+    <h2>Progress on this device</h2>
+    <div id="parentBody"></div>
+    <p class="hint">Stored only on this device. Tap anywhere to close.</p>
+  </div>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  /* =====================================================================
+   * SHARING AND COOPERATING: "SHARING TREATS"
+   * ELOF domain: Social and Emotional Development (fairness, sharing,
+   *              noticing how others feel) + Cognition (early division:
+   *              sharing a set equally, one-to-one correspondence).
+   *
+   * Design rules this file follows (from the brief):
+   *  - Coherence: only the friends, their plates and the treats. No score,
+   *    no menus, no text.
+   *  - Control of error: a plate that already has more than another plate
+   *    will not take a treat; it glides back home. No buzzer, no red X.
+   *    The friend with fewer gives a small hopeful hop instead.
+   *  - Emotional cue: a friend with fewer treats looks gently wistful; when
+   *    the shares are equal, everyone looks happy.
+   *  - Forgiving hitboxes: each friend's whole column is the drop zone.
+   *  - Visual prompts: the next treat pulses when the child is idle; after
+   *    two slips the plates that can take a treat glow.
+   *  - Self-paced: no timers anywhere the child can see or feel.
+   *  - Natural stopping point: 5 rounds, then a static "play outside" screen
+   *    with no "play again" button.
+   * ===================================================================== */
+
+  // ---------------------------------------------------------------------
+  // Configuration
+  // ---------------------------------------------------------------------
+  const CONFIG = {
+    ROUNDS: 5,                     // hard session limit (natural stopping point)
+    STORAGE_KEY: 'sharing-cooperating.v1',
+    IDLE_PULSE_MS: 1500,           // idle time before the next treat pulses
+    TUTORIAL_HINT_MS: 5000,        // first round: idle time before the plates glow too
+    HINT_AFTER_SLIPS: 2,           // slips in a puzzle before the open plates glow
+    RETURN_MS: 380,                // rejected drop: glide-home duration
+    TO_PLATE_MS: 260,              // accepted drop: slide-onto-plate duration
+    BOUNCE_MS: 380,                // friend wiggle when a treat lands on their plate
+    HOPE_MS: 520,                  // friend with fewer: hopeful hop after a rejection
+    CHEER_MS: 1100,                // everyone cheers at the end of the round
+    CELEBRATE_MS: 2800,            // long enough for "That's fair!" to be spoken
+    FAST_MS_PER_TREAT: 3500,       // "quick" threshold for difficulty step-up
+    PARENT_HOLD_MS: 3000,          // hold time for the hidden parent view
+    PARENT_CORNER_PX: 80,
+    HOME_RESERVE_PX: 72,           // top-right corner kept clear for the home button
+    TAP_SLOP_PX: 12,               // movement below this is a tap, not a drop
+    PLACED_SCALE: 0.8,             // size of a treat once it sits on a plate
+  };
+
+  const COLORS = {
+    bg: '#F6F1E7',
+    ink: '#4A4036',
+    table: '#E9D2AE',
+    tableEdge: '#D8B98D',
+    plate: '#FFFDF8',
+    plateRim: '#EDE5D6',
+    tray: '#F4E6CC',
+    glow: '#F6C85F',
+    star: '#F6C85F',
+    grass: '#B9D7A8',
+    cheek: '#F2A88A',
+    mouth: '#9A6450',
+  };
+
+  const ANIMALS = {
+    bear:  { name: 'Bear',  fur: '#C9A27C', light: '#EAD3B8', inner: '#E3BFA0', nose: '#6B5146' },
+    bunny: { name: 'Bunny', fur: '#E9E2DC', light: '#FFFFFF', inner: '#F2C4CF', nose: '#E8A0B4' },
+    fox:   { name: 'Fox',   fur: '#F2A66B', light: '#FFF6EA', inner: '#FFE3CC', nose: '#5E4A40' },
+  };
+  const ANIMAL_IDS = Object.keys(ANIMALS);
+
+  const TREATS = {
+    apple:      { plural: 'apples' },
+    cookie:     { plural: 'cookies' },
+    strawberry: { plural: 'strawberries' },
+  };
+  const TREAT_IDS = Object.keys(TREATS);
+
+  // Difficulty ladder for dynamic difficulty adjustment (scaffolding).
+  const TIERS = [
+    { friends: 2, treats: 2 },     // one each
+    { friends: 2, treats: 4 },     // two each
+    { friends: 2, treats: 6 },     // three each
+    { friends: 3, treats: 6 },     // two each, three friends
+  ];
+
+  const NUMBER_WORDS = ['zero', 'one', 'two', 'three', 'four', 'five', 'six'];
+  const FONT = 'ui-rounded, "Arial Rounded MT Bold", "Nunito", system-ui, -apple-system, sans-serif';
+  const TAU = Math.PI * 2;
+  const reduceMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+
+  // ---------------------------------------------------------------------
+  // Small helpers
+  // ---------------------------------------------------------------------
+  const now = () => performance.now();
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const easeOutCubic = t => 1 - Math.pow(1 - t, 3);
+  const easeInOutQuad = t => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
+  const log = (...args) => console.log('[Sharing]', ...args);
+
+  function shuffle(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }
+
+  // Mix a hex colour toward black (amt < 0) or white (amt > 0).
+  const shadeCache = new Map();
+  function shade(hex, amt) {
+    const key = hex + amt;
+    if (shadeCache.has(key)) return shadeCache.get(key);
+    const n = parseInt(hex.slice(1), 16);
+    const target = amt < 0 ? 0 : 255;
+    const p = Math.abs(amt);
+    const c = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map(v => Math.round(lerp(v, target, p)));
+    const out = `rgb(${c[0]},${c[1]},${c[2]})`;
+    shadeCache.set(key, out);
+    return out;
+  }
+
+  // ---------------------------------------------------------------------
+  // Canvas setup
+  // ---------------------------------------------------------------------
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  let W = 0, H = 0, DPR = 1;
+
+  // Layout values recomputed on every resize.
+  const L = { m: 16, s: 24, cr: 40, tableY: 200, pileX: 200, pileY: 400, tray: { rx: 100, ry: 40 } };
+
+  // ---------------------------------------------------------------------
+  // Game state
+  // ---------------------------------------------------------------------
+  const state = {
+    phase: 'start',          // 'start' | 'play' | 'celebrate' | 'between' | 'end'
+    round: 0,                // rounds completed this session
+    tier: 0,                 // index into TIERS
+    kind: 'apple',           // this round's treat
+    friends: [],
+    treats: [],
+    drag: null,              // { obj, dx, dy, sx, sy, moved }
+    lastInteraction: 0,
+    roundStart: 0,
+    roundSlips: 0,           // rejected drops this round (unfair plate)
+    roundAttempts: 0,        // every drop on a plate, accepted or not
+    placedThisRound: 0,
+    completeAt: 0,           // time to fire completeRound()
+    celebrateStart: 0,
+    particles: [],
+  };
+
+  // ---------------------------------------------------------------------
+  // Local progress tracking (localStorage, never leaves the device)
+  // ---------------------------------------------------------------------
+  function freshProgress() {
+    return { version: 1, gamesCompleted: 0, roundsCompleted: 0, treatsShared: 0, slips: 0, lastPlayed: null, sessions: [] };
+  }
+
+  function loadProgress() {
+    try {
+      const raw = window.localStorage.getItem(CONFIG.STORAGE_KEY);
+      if (raw) {
+        const data = JSON.parse(raw);
+        if (data && data.version === 1 && Array.isArray(data.sessions)) return data;
+      }
+    } catch (e) {
+      console.warn('[Sharing] Progress could not be loaded (storage unavailable):', e && e.message);
+    }
+    return freshProgress();
+  }
+
+  function saveProgress() {
+    try {
+      window.localStorage.setItem(CONFIG.STORAGE_KEY, JSON.stringify(progress));
+      log('Progress saved', { gamesCompleted: progress.gamesCompleted, roundsCompleted: progress.roundsCompleted });
+    } catch (e) {
+      console.warn('[Sharing] Progress could not be saved (storage unavailable):', e && e.message);
+    }
+  }
+
+  const progress = loadProgress();
+  let session = null; // created on the first round of this app launch
+
+  function ensureSession() {
+    if (session) return;
+    session = { startedAt: new Date().toISOString(), finished: false, rounds: [] };
+    progress.sessions.push(session);
+    if (progress.sessions.length > 30) progress.sessions.splice(0, progress.sessions.length - 30);
+  }
+
+  // ---------------------------------------------------------------------
+  // Audio: Web Audio tones + optional spoken words
+  // ---------------------------------------------------------------------
+  let actx = null;
+
+  // Browsers only allow audio after a user gesture, so this runs on every pointer down.
+  function unlockAudio() {
+    if (!actx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) { try { actx = new AC(); } catch (e) { actx = null; } }
+    }
+    if (actx && actx.state === 'suspended') actx.resume();
+  }
+
+  function tone(freq, delay, dur, vol = 0.16, type = 'sine') {
+    if (!actx) return;
+    const t = actx.currentTime + delay;
+    const osc = actx.createOscillator();
+    const gain = actx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(vol, t + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    osc.connect(gain).connect(actx.destination);
+    osc.start(t);
+    osc.stop(t + dur + 0.05);
+  }
+
+  // The note rises with the number of treats on that plate: a plate's 2nd treat
+  // always sounds the same, so the ear can hear the shares evening out.
+  const COUNT_NOTE = [0, 523.25, 659.25, 783.99];
+  const playPickup = () => tone(440, 0, 0.08, 0.05, 'triangle');
+  const playPlace = n => { const f = COUNT_NOTE[clamp(n, 1, 3)]; tone(f, 0, 0.3); tone(f * 1.5, 0.06, 0.35, 0.08); };
+  const playReturn = () => tone(330, 0, 0.12, 0.05, 'triangle');
+  const playRoundDone = () => [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => tone(f, i * 0.12, 0.5, 0.12));
+
+  // Spoken words via the Web Speech API. Android WebView usually lacks it,
+  // so this quietly does nothing there and the tones carry the feedback.
+  function say(text) {
+    try {
+      if (!('speechSynthesis' in window)) return;
+      window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'en-US';
+      u.rate = 0.85;
+      u.pitch = 1.15;
+      window.speechSynthesis.speak(u);
+    } catch (e) { /* speech is optional */ }
+  }
+
+  // ---------------------------------------------------------------------
+  // Rounds and difficulty
+  // ---------------------------------------------------------------------
+  function startRound() {
+    ensureSession();
+    const tier = TIERS[state.tier];
+
+    // A different treat from last round, for variety.
+    const kinds = TREAT_IDS.filter(k => k !== state.kind || state.round === 0);
+    state.kind = kinds[Math.floor(Math.random() * kinds.length)];
+
+    const animals = shuffle(ANIMAL_IDS.slice()).slice(0, tier.friends);
+    state.friends = animals.map((animal, i) => ({
+      animal, idx: i, count: 0,
+      x: 0, headY: 0, cellX: 0, cellW: 0,
+      plateX: 0, plateY: 0, plateRx: 0, plateRy: 0,
+      zone: { x0: 0, y0: 0, x1: 0, y1: 0 },
+      bounceT0: -1e9, hopeT0: -1e9, cheerT0: -1e9,
+    }));
+
+    state.treats = [];
+    for (let i = 0; i < tier.treats; i++) {
+      state.treats.push({
+        id: i, kind: state.kind, pileSlot: i,
+        jx: Math.random() * 2 - 1,   // fixed jitter so homes stay put across resizes
+        jy: Math.random() * 2 - 1,
+        tilt: (Math.random() * 2 - 1) * 0.25,
+        x: 0, y: 0, homeX: 0, homeY: 0, scale: 1,
+        state: 'idle',             // 'idle' | 'drag' | 'return' | 'toPlate' | 'placed'
+        anim: null, friend: null, slot: -1,
+      });
+    }
+
+    state.roundSlips = 0;
+    state.roundAttempts = 0;
+    state.placedThisRound = 0;
+    state.completeAt = 0;
+    state.particles = [];
+    state.drag = null;
+    computeLayout();
+
+    state.phase = 'play';
+    state.roundStart = now();
+    state.lastInteraction = now();
+    const plural = TREATS[state.kind].plural;
+    if (state.round === 0) say(`Share the ${plural} with your friends. Make it fair!`);
+    else say(`Share the ${plural}!`);
+    log(`Round ${state.round + 1}/${CONFIG.ROUNDS} started at level ${state.tier + 1}: ${tier.treats} ${plural} for ${animals.join(', ')}`);
+  }
+
+  function completeRound() {
+    const t = now();
+    const n = state.treats.length;
+    const ms = t - state.roundStart;
+    const record = {
+      level: state.tier + 1,
+      friends: state.friends.length,
+      treats: n,
+      kind: state.kind,
+      attempts: state.roundAttempts,
+      slips: state.roundSlips,
+      seconds: Math.round(ms / 100) / 10,
+    };
+
+    session.rounds.push(record);
+    progress.roundsCompleted++;
+    progress.treatsShared += n;
+    progress.slips += state.roundSlips;
+    progress.lastPlayed = new Date().toISOString();
+    state.round++;
+    log('Level completed: shared fairly', record);
+
+    if (state.round >= CONFIG.ROUNDS) {
+      session.finished = true;
+      progress.gamesCompleted++;
+    }
+    saveProgress();
+    adjustDifficulty(record, ms);
+
+    // Same celebration every time: everyone cheers, the same chord, the same words.
+    say("Now everyone has the same. That's fair!");
+    playRoundDone();
+    state.friends.forEach(f => { f.cheerT0 = t; spawnParticles(f, t); });
+    state.phase = 'celebrate';
+    state.celebrateStart = t;
+  }
+
+  // Simple DDA: quick and clean -> one step harder; a real struggle -> one step easier.
+  function adjustDifficulty(record, ms) {
+    const fast = ms / record.treats <= CONFIG.FAST_MS_PER_TREAT;
+    const before = state.tier;
+    if (record.slips === 0 && fast) {
+      state.tier = Math.min(TIERS.length - 1, state.tier + 1);
+    } else if (record.slips >= Math.max(3, Math.ceil(record.treats / 2))) {
+      state.tier = Math.max(0, state.tier - 1);
+    }
+    if (state.tier !== before) log(`Difficulty ${state.tier > before ? 'up' : 'down'}: level ${before + 1} -> ${state.tier + 1}`);
+  }
+
+  function enterEnd() {
+    state.phase = 'end';
+    say('Great job! Time to play outside!');
+    log('Session finished: end screen shown, no replay offered');
+  }
+
+  // ---------------------------------------------------------------------
+  // Fairness
+  // ---------------------------------------------------------------------
+  // A plate takes a treat only if it does not already have more than another plate.
+  function accepts(f) {
+    return state.friends.every(o => o === f || f.count <= o.count);
+  }
+
+  const maxCount = () => state.friends.reduce((a, f) => Math.max(a, f.count), 0);
+
+  // 'hopeful' (nothing shared yet), 'wistful' (has fewer), 'happy' (has the most), 'cheer'.
+  function moodOf(f) {
+    if (state.phase === 'celebrate') return 'cheer';
+    const max = maxCount();
+    if (max === 0) return 'hopeful';
+    return f.count < max ? 'wistful' : 'happy';
+  }
+
+  // ---------------------------------------------------------------------
+  // Layout
+  // ---------------------------------------------------------------------
+  function computeLayout() {
+    const minDim = Math.min(W, H);
+    const m = clamp(minDim * 0.045, 12, 36);
+    L.m = m;
+    const n = Math.max(1, state.friends.length);
+    const treats = Math.max(1, state.treats.length);
+    const perPlate = Math.ceil(treats / n);
+
+    // Portrait: keep the whole top strip free for the home button.
+    // Landscape (height is precious): use the top strip but keep the friends left of the button.
+    const landscape = W > H;
+    const top = landscape ? m : Math.max(m, CONFIG.HOME_RESERVE_PX);
+    const rowX0 = m, rowX1 = landscape ? W - Math.max(m, CONFIG.HOME_RESERVE_PX) : W - m;
+    const avail = H - top - m;
+    const charBand = avail * 0.36, plateBand = avail * 0.22, pileBand = avail - charBand - plateBand;
+    const cw = (rowX1 - rowX0) / n;
+
+    // Friend head radius: room above for bunny ears (about 3 radii in total).
+    L.cr = Math.max(16, Math.min(cw * 0.32, charBand / 3.0, 92));
+    L.tableY = top + charBand;
+    const plateRx = Math.max(24, Math.min(cw * 0.44, plateBand * 1.25, 160));
+    const plateRy = plateRx * 0.36;
+    const plateY = L.tableY + plateBand * 0.52;
+
+    // Treat radius: fits a full plate, and the pile in its band.
+    const pileCols = treats <= 3 ? treats : Math.ceil(treats / 2);
+    const pileRows = treats <= 3 ? 1 : 2;
+    let s = Math.min(
+      plateRx * 0.85 / (perPlate * 0.68 * CONFIG.PLACED_SCALE + 0.5),
+      (W - 2 * m) / (pileCols * 2.5),
+      pileBand * 0.8 / (pileRows * 2.2),
+      minDim * 0.075,
+      48);
+    s = Math.max(20, s);
+    L.s = s;
+    L.pileX = (rowX0 + rowX1) / 2;      // under the friends, never under the home button
+    L.pileY = L.tableY + plateBand + pileBand * 0.5;
+    L.tray = { rx: pileCols * 1.25 * s + s * 0.9, ry: pileRows * 1.1 * s + s * 0.55 };
+
+    const pileTop = L.pileY - L.tray.ry;
+    state.friends.forEach((f, i) => {
+      f.cellX = rowX0 + i * cw;
+      f.cellW = cw;
+      f.x = f.cellX + cw / 2;
+      f.headY = L.tableY - L.cr * 1.12;
+      f.plateX = f.x;
+      f.plateY = plateY;
+      f.plateRx = plateRx;
+      f.plateRy = plateRy;
+      // The friend's whole column, from above the ears to just short of the pile.
+      const plateBottom = plateY + plateRy;
+      f.zone = {
+        x0: f.cellX, x1: f.cellX + cw,
+        y0: Math.max(landscape ? 0 : CONFIG.HOME_RESERVE_PX, f.headY - L.cr * 2.2),
+        y1: Math.min(plateBottom + s * 1.3, (plateBottom + pileTop) / 2),
+      };
+    });
+
+    // Pile: one row, or two neat rows of a few treats each, on a round tray.
+    state.treats.forEach(o => {
+      const i = o.pileSlot;
+      const row = pileRows === 1 ? 0 : (i < pileCols ? 0 : 1);
+      const inRow = pileRows === 1 ? treats : (row === 0 ? pileCols : treats - pileCols);
+      const col = row === 0 ? i : i - pileCols;
+      o.homeX = L.pileX + (col - (inRow - 1) / 2) * s * 2.5 + o.jx * s * 0.15;
+      o.homeY = L.pileY + (row - (pileRows - 1) / 2) * s * 2.2 + o.jy * s * 0.12;
+    });
+    relayoutTreats();
+  }
+
+  // Keep every treat where it belongs after a resize or rotation.
+  function relayoutTreats() {
+    for (const o of state.treats) {
+      if (o.state === 'idle') {
+        o.x = o.homeX; o.y = o.homeY;
+      } else if (o.state === 'return' && o.anim) {
+        o.anim.tx = o.homeX; o.anim.ty = o.homeY;
+      } else if (o.state === 'toPlate' && o.anim) {
+        const p = plateSlotPos(o.friend, o.slot);
+        o.anim.tx = p.x; o.anim.ty = p.y;
+      } else if (o.state === 'placed') {
+        const p = plateSlotPos(o.friend, o.slot);
+        o.x = p.x; o.y = p.y;
+      } else if (o.state === 'drag') {
+        o.x = clamp(o.x, 0, W); o.y = clamp(o.y, 0, H);
+      }
+    }
+  }
+
+  // Where the n-th treat sits on a plate: side by side, centred.
+  function plateSlotPos(f, slot) {
+    const per = Math.ceil(state.treats.length / Math.max(1, state.friends.length));
+    const gap = L.s * CONFIG.PLACED_SCALE * 1.7;
+    return { x: f.plateX + (slot - (per - 1) / 2) * gap, y: f.plateY - f.plateRy * 0.2 };
+  }
+
+  function findDropFriend(o) {
+    return state.friends.find(f => o.x >= f.zone.x0 && o.x <= f.zone.x1 && o.y >= f.zone.y0 && o.y <= f.zone.y1) || null;
+  }
+
+  // ---------------------------------------------------------------------
+  // Drag and drop
+  // ---------------------------------------------------------------------
+  // Forgiving pick: the nearest treat within 1.5x its radius.
+  function pickTreat(p) {
+    let best = null, bestD = Infinity;
+    for (const o of state.treats) {
+      if (o.state !== 'idle' && o.state !== 'return') continue;
+      const d = Math.hypot(p.x - o.x, p.y - o.y);
+      if (d <= L.s * 1.5 && d < bestD) { best = o; bestD = d; }
+    }
+    return best;
+  }
+
+  function beginDrag(o, p) {
+    o.state = 'drag';
+    o.anim = null;
+    o.scale = 1;
+    state.drag = { obj: o, dx: o.x - p.x, dy: o.y - p.y, sx: p.x, sy: p.y, moved: 0 };
+    // Draw the held treat on top of the others.
+    state.treats.splice(state.treats.indexOf(o), 1);
+    state.treats.push(o);
+    playPickup();
+    log('Picked up', o.kind);
+  }
+
+  function dropTreat() {
+    const o = state.drag.obj;
+    const wasTap = state.drag.moved < CONFIG.TAP_SLOP_PX;
+    state.drag = null;
+    const f = wasTap ? null : findDropFriend(o);
+
+    if (f) {
+      state.roundAttempts++;
+      if (accepts(f)) { acceptTreat(o, f); return; }
+      // Fairness as control of error: this plate already has more. The treat goes home,
+      // and the friends with fewer give a small hopeful hop (where it could go instead).
+      state.roundSlips++;
+      const t = now();
+      state.friends.forEach(x => { if (x !== f && accepts(x)) x.hopeT0 = t; });
+      playReturn();
+      log(`Item rejected: ${ANIMALS[f.animal].name} already has more (${state.friends.map(x => x.count).join(' / ')}), gliding home`);
+    }
+    sendHome(o);
+  }
+
+  function acceptTreat(o, f) {
+    const target = plateSlotPos(f, f.count);
+    o.state = 'toPlate';
+    o.friend = f;
+    o.slot = f.count++;
+    o.anim = { fx: o.x, fy: o.y, tx: target.x, ty: target.y, fs: o.scale, ts: CONFIG.PLACED_SCALE, t0: now(), dur: CONFIG.TO_PLATE_MS, ease: easeInOutQuad };
+  }
+
+  // Montessori control of error: the treat simply glides back to the tray.
+  function sendHome(o) {
+    o.state = 'return';
+    o.anim = { fx: o.x, fy: o.y, tx: o.homeX, ty: o.homeY, fs: o.scale, ts: 1, t0: now(), dur: CONFIG.RETURN_MS, ease: easeOutCubic };
+  }
+
+  // Called when a treat finishes sliding onto a plate.
+  // Sound, friend wiggle and the treat settling all happen on the same frame.
+  function landOnPlate(o, t) {
+    o.state = 'placed';
+    const f = o.friend;
+    f.bounceT0 = t;
+    const onPlate = o.slot + 1;
+    playPlace(onPlate);
+    say(NUMBER_WORDS[onPlate] || String(onPlate));
+    state.placedThisRound++;
+    log(`Item successfully placed: ${o.kind} -> ${ANIMALS[f.animal].name} (${state.friends.map(x => x.count).join(' / ')})`);
+    // A short pause lets the last count word finish before "That's fair!".
+    if (state.treats.every(x => x.state === 'placed')) state.completeAt = t + 700;
+  }
+
+  // ---------------------------------------------------------------------
+  // Input: touch + mouse
+  // ---------------------------------------------------------------------
+  let activeTouch = null;
+  let mouseDown = false;
+  let parentTimer = null;
+
+  function toCanvas(clientX, clientY) {
+    const r = canvas.getBoundingClientRect();
+    return { x: clientX - r.left, y: clientY - r.top };
+  }
+
+  function findTouch(list, id) {
+    for (let i = 0; i < list.length; i++) if (list[i].identifier === id) return list[i];
+    return null;
+  }
+
+  function cancelParentHold() {
+    if (parentTimer) { clearTimeout(parentTimer); parentTimer = null; }
+  }
+
+  function onDown(p) {
+    unlockAudio();
+    state.lastInteraction = now();
+
+    if (state.phase === 'start' || state.phase === 'between') {
+      const g = starGeom();
+      if (Math.hypot(p.x - g.cx, p.y - g.cy) <= g.R * 1.8) { startRound(); return; }
+    } else if (state.phase === 'play') {
+      const o = pickTreat(p);
+      if (o) { beginDrag(o, p); return; }
+    }
+
+    // Hidden parent view: hold the top-left corner still for 3 seconds.
+    if (p.x < CONFIG.PARENT_CORNER_PX && p.y < CONFIG.PARENT_CORNER_PX) {
+      cancelParentHold();
+      parentTimer = setTimeout(openParent, CONFIG.PARENT_HOLD_MS);
+    }
+  }
+
+  function onMove(p) {
+    if (parentTimer && (p.x >= CONFIG.PARENT_CORNER_PX || p.y >= CONFIG.PARENT_CORNER_PX)) cancelParentHold();
+    if (!state.drag) return;
+    state.lastInteraction = now();
+    const d = state.drag;
+    d.moved = Math.max(d.moved, Math.hypot(p.x - d.sx, p.y - d.sy));
+    d.obj.x = clamp(p.x + d.dx, 0, W);
+    d.obj.y = clamp(p.y + d.dy, 0, H);
+  }
+
+  function onUp() {
+    cancelParentHold();
+    if (state.drag) dropTreat();
+  }
+
+  canvas.addEventListener('touchstart', e => {
+    e.preventDefault();
+    if (activeTouch !== null) return;          // one finger at a time
+    const t = e.changedTouches[0];
+    activeTouch = t.identifier;
+    onDown(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  canvas.addEventListener('touchmove', e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (t) onMove(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  const endTouch = e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (!t) return;
+    activeTouch = null;
+    onUp(toCanvas(t.clientX, t.clientY));
+  };
+  canvas.addEventListener('touchend', endTouch, { passive: false });
+  canvas.addEventListener('touchcancel', endTouch, { passive: false });
+
+  canvas.addEventListener('mousedown', e => { mouseDown = true; onDown(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mousemove', e => { if (mouseDown) onMove(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mouseup', e => {
+    if (!mouseDown) return;
+    mouseDown = false;
+    onUp(toCanvas(e.clientX, e.clientY));
+  });
+
+  // ---------------------------------------------------------------------
+  // Parent view (hidden, local data only)
+  // ---------------------------------------------------------------------
+  const parentEl = document.getElementById('parent');
+  const parentBody = document.getElementById('parentBody');
+
+  function el(tag, text) {
+    const node = document.createElement(tag);
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function openParent() {
+    parentTimer = null;
+    const rounds = progress.sessions.reduce((a, s) => a + s.rounds.length, 0);
+    const clean = progress.sessions.reduce((a, s) => a + s.rounds.filter(r => r.slips === 0).length, 0);
+
+    parentBody.textContent = '';
+    parentBody.appendChild(el('div', `Full games finished: ${progress.gamesCompleted}`));
+    parentBody.appendChild(el('div', `Sharing puzzles finished: ${progress.roundsCompleted}`));
+    parentBody.appendChild(el('div', `Treats shared: ${progress.treatsShared}`));
+    parentBody.appendChild(el('div', `Shared fairly with no take-backs: ${rounds ? Math.round(100 * clean / rounds) : 0}%`));
+
+    const recent = progress.sessions.slice(-6).reverse();
+    if (recent.length) {
+      const table = el('table');
+      const head = el('tr');
+      ['When', 'Rounds', 'Top level', 'Slips'].forEach(h => head.appendChild(el('th', h)));
+      table.appendChild(head);
+      recent.forEach(s => {
+        const tr = el('tr');
+        const when = new Date(s.startedAt);
+        tr.appendChild(el('td', when.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' ' +
+          when.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })));
+        tr.appendChild(el('td', `${s.rounds.length}/${CONFIG.ROUNDS}`));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => Math.max(a, r.level), 0) || '-')));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => a + r.slips, 0))));
+        table.appendChild(tr);
+      });
+      parentBody.appendChild(table);
+    }
+    parentBody.appendChild(el('p', 'Levels: 1 = 2 treats for 2 friends, 2 = 4 for 2, 3 = 6 for 2, 4 = 6 for 3. ' +
+      'A slip is a treat offered to a friend who already had more.'));
+    parentEl.hidden = false;
+    log('Parent view opened', progress);
+  }
+
+  parentEl.addEventListener('click', () => { parentEl.hidden = true; });
+
+  // Read-only debug hooks for the Android/desktop console.
+  window.SharingTreats = {
+    progress: () => JSON.parse(JSON.stringify(progress)),
+    state: () => {
+      const g = starGeom();
+      return {
+        phase: state.phase,
+        round: state.round,
+        level: state.tier + 1,
+        kind: state.kind,
+        star: { x: g.cx, y: g.cy, r: g.R },
+        friends: state.friends.map(f => ({ animal: f.animal, count: f.count, accepts: accepts(f), mood: moodOf(f), x: f.plateX, y: f.plateY, zone: Object.assign({}, f.zone) })),
+        treats: state.treats.map(o => ({ id: o.id, kind: o.kind, state: o.state, x: o.x, y: o.y, r: L.s, onPlateOf: o.friend ? o.friend.animal : null })),
+      };
+    },
+  };
+
+  // ---------------------------------------------------------------------
+  // Drawing primitives
+  // ---------------------------------------------------------------------
+  function roundRectPath(x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  function circle(x, y, r) { ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); }
+
+  // Fill the current path with a soft darker outline of the same hue (fill must be hex).
+  function paint(fill, lw) {
+    ctx.fillStyle = fill;
+    ctx.fill();
+    ctx.lineWidth = lw;
+    ctx.strokeStyle = shade(fill, -0.28);
+    ctx.stroke();
+  }
+
+  function stroke(color, lw) {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = lw;
+    ctx.stroke();
+  }
+
+  function drawStar(cx, cy, R, fill, face) {
+    ctx.save();
+    ctx.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const rad = i % 2 === 0 ? R : R * 0.5;
+      const a = -Math.PI / 2 + i * Math.PI / 5;
+      const x = cx + rad * Math.cos(a), y = cy + rad * Math.sin(a);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    ctx.lineJoin = 'round';
+    if (fill) {
+      ctx.fillStyle = fill;
+      ctx.fill();
+      ctx.strokeStyle = fill;            // same-colour stroke rounds the tips
+      ctx.lineWidth = Math.max(2, R * 0.16);
+      ctx.stroke();
+    } else {
+      ctx.strokeStyle = 'rgba(74, 64, 54, 0.25)';
+      ctx.lineWidth = Math.max(2, R * 0.14);
+      ctx.stroke();
+    }
+
+    if (face) {
+      ctx.fillStyle = COLORS.ink;
+      ctx.beginPath(); ctx.arc(cx - R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.arc(cx + R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.strokeStyle = COLORS.ink;
+      ctx.lineWidth = Math.max(2, R * 0.05);
+      ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.arc(cx, cy + R * 0.06, R * 0.17, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+      ctx.globalAlpha = 0.35;
+      ctx.fillStyle = COLORS.cheek;
+      ctx.beginPath(); ctx.ellipse(cx - R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(cx + R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // ---------------------------------------------------------------------
+  // Treats (radius r, centred on x, y)
+  // ---------------------------------------------------------------------
+  function drawTreat(kind, x, y, r, tilt, lifted) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(tilt);
+    if (lifted) {
+      ctx.shadowColor = 'rgba(60, 45, 30, 0.22)';
+      ctx.shadowBlur = r * 0.5;
+      ctx.shadowOffsetY = r * 0.25;
+    }
+    const lw = Math.max(1.5, r * 0.09);
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+
+    if (kind === 'apple') {
+      ctx.beginPath();
+      ctx.moveTo(0, -r * 0.62);
+      ctx.bezierCurveTo(r * 0.5, -r * 1.05, r * 1.12, -r * 0.45, r * 0.9, r * 0.25);
+      ctx.bezierCurveTo(r * 0.75, r * 0.85, r * 0.3, r * 1.0, 0, r * 0.82);
+      ctx.bezierCurveTo(-r * 0.3, r * 1.0, -r * 0.75, r * 0.85, -r * 0.9, r * 0.25);
+      ctx.bezierCurveTo(-r * 1.12, -r * 0.45, -r * 0.5, -r * 1.05, 0, -r * 0.62);
+      ctx.closePath();
+      paint('#EE8E7C', lw);
+      ctx.shadowColor = 'transparent';
+      ctx.beginPath(); ctx.moveTo(0, -r * 0.55); ctx.quadraticCurveTo(r * 0.05, -r * 0.85, r * 0.18, -r * 1.02);
+      stroke('#8A6A52', lw * 1.1);
+      ctx.beginPath(); ctx.ellipse(r * 0.38, -r * 0.82, r * 0.26, r * 0.12, -0.5, 0, TAU);
+      paint('#9CCB9A', lw * 0.8);
+      ctx.globalAlpha = 0.45; ctx.fillStyle = '#fff';
+      ctx.beginPath(); ctx.ellipse(-r * 0.42, -r * 0.2, r * 0.13, r * 0.24, 0.35, 0, TAU); ctx.fill();
+    } else if (kind === 'cookie') {
+      // Slightly wobbly round edge so it reads as a real cookie.
+      ctx.beginPath();
+      for (let i = 0; i <= 16; i++) {
+        const a = i * TAU / 16;
+        const rr = r * (0.92 + (i % 2 ? 0.05 : 0));
+        const px = Math.cos(a) * rr, py = Math.sin(a) * rr;
+        if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      }
+      ctx.closePath();
+      paint('#E2B57A', lw);
+      ctx.shadowColor = 'transparent';
+      ctx.fillStyle = '#8A5A44';
+      [[-0.35, -0.3], [0.3, -0.38], [0.05, 0.05], [-0.42, 0.3], [0.4, 0.28], [0.02, 0.52], [-0.05, -0.62]].forEach(([cx, cy], i) => {
+        ctx.beginPath(); ctx.ellipse(cx * r, cy * r, r * 0.11, r * 0.085, i, 0, TAU); ctx.fill();
+      });
+      ctx.globalAlpha = 0.3; ctx.fillStyle = '#fff';
+      ctx.beginPath(); ctx.ellipse(-r * 0.3, -r * 0.55, r * 0.22, r * 0.08, -0.4, 0, TAU); ctx.fill();
+    } else {
+      // Strawberry: rounded heart-like berry, seeds and a leafy cap.
+      ctx.beginPath();
+      ctx.moveTo(0, r * 1.0);
+      ctx.bezierCurveTo(-r * 0.6, r * 0.75, -r * 1.05, r * 0.05, -r * 0.82, -r * 0.42);
+      ctx.bezierCurveTo(-r * 0.6, -r * 0.8, r * 0.6, -r * 0.8, r * 0.82, -r * 0.42);
+      ctx.bezierCurveTo(r * 1.05, r * 0.05, r * 0.6, r * 0.75, 0, r * 1.0);
+      ctx.closePath();
+      paint('#F07F86', lw);
+      ctx.shadowColor = 'transparent';
+      ctx.fillStyle = '#FFF3C4';
+      [[-0.4, -0.2], [0, -0.28], [0.4, -0.2], [-0.25, 0.15], [0.25, 0.15], [0, 0.48], [-0.5, 0.2], [0.5, 0.2]].forEach(([cx, cy]) => {
+        ctx.beginPath(); ctx.ellipse(cx * r, cy * r, r * 0.06, r * 0.09, 0, 0, TAU); ctx.fill();
+      });
+      ctx.beginPath();
+      for (let i = 0; i < 5; i++) {
+        const a = Math.PI + (i + 0.5) * Math.PI / 5;
+        ctx.moveTo(0, -r * 0.62);
+        ctx.quadraticCurveTo(Math.cos(a) * r * 0.25, -r * 0.62 + Math.sin(a) * r * 0.1 + r * 0.06, Math.cos(a) * r * 0.6, -r * 0.62 - Math.sin(a) * r * 0.25);
+      }
+      stroke('#7FB77E', lw * 1.6);
+      ctx.beginPath(); ctx.moveTo(0, -r * 0.65); ctx.lineTo(r * 0.06, -r * 0.95); stroke('#7FB77E', lw * 1.2);
+    }
+    ctx.restore();
+  }
+
+  function drawTreatObj(o, k, lifted) {
+    const r = L.s * o.scale * k * (lifted ? 1.12 : 1);
+    drawTreat(o.kind, o.x, o.y, r, o.state === 'placed' || o.state === 'toPlate' ? 0 : o.tilt, lifted);
+  }
+
+  // ---------------------------------------------------------------------
+  // Friends (bear, bunny, fox), drawn behind the table edge
+  // ---------------------------------------------------------------------
+  function friendLift(f, t) {
+    const amp = reduceMotion ? 0.3 : 1;
+    let lift = 0;
+    const bp = (t - f.bounceT0) / CONFIG.BOUNCE_MS;
+    if (bp >= 0 && bp < 1) lift += Math.sin(Math.PI * bp) * L.cr * 0.12 * amp;
+    const hp = (t - f.hopeT0) / CONFIG.HOPE_MS;
+    if (hp >= 0 && hp < 1) lift += Math.sin(Math.PI * hp) * L.cr * 0.18 * amp;
+    const cp = (t - f.cheerT0) / CONFIG.CHEER_MS;
+    if (cp >= 0 && cp < 1) lift += Math.abs(Math.sin(TAU * cp)) * L.cr * 0.28 * amp;
+    return lift;
+  }
+
+  function drawEars(A, f, x, y, r, mood) {
+    const lw = Math.max(1.5, r * 0.06);
+    if (f.animal === 'bear') {
+      for (const s of [-1, 1]) {
+        circle(x + s * r * 0.7, y - r * 0.7, r * 0.32); paint(A.fur, lw);
+        circle(x + s * r * 0.7, y - r * 0.7, r * 0.17); ctx.fillStyle = A.inner; ctx.fill();
+      }
+    } else if (f.animal === 'bunny') {
+      // Long ears: upright when happy, drooping a little when wistful.
+      const droop = mood === 'wistful' ? 0.55 : mood === 'cheer' ? 0.05 : 0.15;
+      for (const s of [-1, 1]) {
+        ctx.save();
+        ctx.translate(x + s * r * 0.36, y - r * 0.78);
+        ctx.rotate(s * droop);
+        ctx.beginPath(); ctx.ellipse(0, -r * 0.6, r * 0.22, r * 0.68, 0, 0, TAU); paint(A.fur, lw);
+        ctx.beginPath(); ctx.ellipse(0, -r * 0.58, r * 0.11, r * 0.5, 0, 0, TAU); ctx.fillStyle = A.inner; ctx.fill();
+        ctx.restore();
+      }
+    } else {
+      const lower = mood === 'wistful' ? 0.35 : 0;
+      for (const s of [-1, 1]) {
+        ctx.save();
+        ctx.translate(x + s * r * 0.55, y - r * 0.62);
+        ctx.rotate(s * (0.25 + lower));
+        ctx.beginPath(); ctx.moveTo(-r * 0.3, r * 0.1); ctx.lineTo(0, -r * 0.62); ctx.lineTo(r * 0.3, r * 0.1); ctx.closePath();
+        ctx.lineJoin = 'round'; paint(A.fur, lw);
+        ctx.beginPath(); ctx.moveTo(-r * 0.15, 0); ctx.lineTo(0, -r * 0.42); ctx.lineTo(r * 0.15, 0); ctx.closePath();
+        ctx.fillStyle = A.inner; ctx.fill();
+        ctx.beginPath(); ctx.moveTo(-r * 0.11, -r * 0.4); ctx.lineTo(0, -r * 0.62); ctx.lineTo(r * 0.11, -r * 0.4); ctx.closePath();
+        ctx.fillStyle = '#7A5A48'; ctx.fill();
+        ctx.restore();
+      }
+    }
+  }
+
+  // Face expression by mood. Wistful is gentle: eyes toward the treats, a small flat mouth.
+  function drawAnimalFace(A, x, y, r, mood) {
+    const ink = COLORS.ink;
+    const lw = Math.max(1.5, r * 0.065);
+    const ex = r * 0.34, ey = y - r * 0.08;
+    ctx.save();
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    if (mood === 'cheer') {
+      for (const s of [-1, 1]) {
+        ctx.beginPath(); ctx.arc(x + s * ex, ey + r * 0.05, r * 0.12, Math.PI * 1.15, Math.PI * 1.85); stroke(ink, lw * 1.1);
+      }
+    } else {
+      const look = mood === 'wistful' ? r * 0.06 : 0;
+      for (const s of [-1, 1]) {
+        circle(x + s * ex, ey + look, r * 0.085); ctx.fillStyle = ink; ctx.fill();
+        circle(x + s * ex + r * 0.03, ey + look - r * 0.03, r * 0.028); ctx.fillStyle = '#fff'; ctx.fill();
+      }
+      if (mood === 'wistful') {
+        for (const s of [-1, 1]) {
+          ctx.beginPath();
+          ctx.moveTo(x + s * (ex + r * 0.13), ey - r * 0.12);
+          ctx.lineTo(x + s * (ex - r * 0.1), ey - r * 0.2);
+          stroke(ink, lw * 0.8);
+        }
+      }
+    }
+
+    // Nose and mouth on the muzzle.
+    const ny = y + r * 0.2;
+    ctx.beginPath(); ctx.ellipse(x, ny, r * 0.11, r * 0.075, 0, 0, TAU); ctx.fillStyle = A.nose; ctx.fill();
+    const my = ny + r * 0.12;
+    if (mood === 'cheer') {
+      ctx.beginPath();
+      ctx.moveTo(x - r * 0.2, my);
+      ctx.quadraticCurveTo(x, my + r * 0.42, x + r * 0.2, my);
+      ctx.closePath();
+      ctx.fillStyle = COLORS.mouth; ctx.fill(); stroke(ink, lw);
+    } else if (mood === 'wistful') {
+      ctx.beginPath(); ctx.arc(x, my + r * 0.2, r * 0.12, Math.PI * 1.25, Math.PI * 1.75); stroke(ink, lw);
+    } else {
+      // Happy / hopeful: the little "w" smile, wider when happy.
+      const w = mood === 'happy' ? 0.13 : 0.09;
+      ctx.beginPath();
+      ctx.arc(x - r * w, my, r * w, 0.1 * Math.PI, 0.95 * Math.PI);
+      ctx.moveTo(x + r * w * 2, my);
+      ctx.arc(x + r * w, my, r * w, 0.05 * Math.PI, 0.9 * Math.PI);
+      stroke(ink, lw);
+    }
+
+    const cheekA = mood === 'wistful' ? 0.18 : mood === 'hopeful' ? 0.3 : 0.5;
+    ctx.globalAlpha = cheekA;
+    ctx.fillStyle = COLORS.cheek;
+    for (const s of [-1, 1]) { ctx.beginPath(); ctx.ellipse(x + s * r * 0.58, y + r * 0.18, r * 0.13, r * 0.08, 0, 0, TAU); ctx.fill(); }
+    ctx.restore();
+  }
+
+  function drawFriend(f, t) {
+    const A = ANIMALS[f.animal];
+    const r = L.cr;
+    const mood = moodOf(f);
+    const x = f.x, y = f.headY - friendLift(f, t);
+    const lw = Math.max(1.5, r * 0.06);
+
+    // Shoulders (their lower half is hidden by the table edge).
+    ctx.beginPath(); ctx.ellipse(x, L.tableY + r * 0.15, r * 0.95, r * 0.9, 0, 0, TAU);
+    paint(A.fur, lw);
+    if (f.animal !== 'bear') {
+      ctx.beginPath(); ctx.ellipse(x, L.tableY + r * 0.1, r * 0.5, r * 0.55, 0, 0, TAU);
+      ctx.fillStyle = A.light; ctx.fill();
+    }
+
+    // Cheering paws go up behind the head.
+    if (mood === 'cheer') {
+      for (const s of [-1, 1]) {
+        ctx.beginPath(); ctx.ellipse(x + s * r * 1.02, y - r * 0.15, r * 0.2, r * 0.26, s * 0.4, 0, TAU);
+        paint(A.fur, lw);
+      }
+    }
+
+    drawEars(A, f, x, y, r, mood);
+    circle(x, y, r); paint(A.fur, lw);
+
+    // Muzzle / face markings per animal.
+    if (f.animal === 'bear') {
+      ctx.beginPath(); ctx.ellipse(x, y + r * 0.3, r * 0.42, r * 0.3, 0, 0, TAU); ctx.fillStyle = A.light; ctx.fill();
+    } else if (f.animal === 'bunny') {
+      for (const s of [-1, 1]) { ctx.beginPath(); ctx.ellipse(x + s * r * 0.13, y + r * 0.32, r * 0.17, r * 0.14, 0, 0, TAU); ctx.fillStyle = A.light; ctx.fill(); }
+    } else {
+      ctx.beginPath();
+      ctx.moveTo(x - r * 0.95, y + r * 0.05);
+      ctx.quadraticCurveTo(x - r * 0.4, y + r * 0.05, x, y + r * 0.62);
+      ctx.quadraticCurveTo(x + r * 0.4, y + r * 0.05, x + r * 0.95, y + r * 0.05);
+      ctx.quadraticCurveTo(x + r * 0.8, y + r * 0.75, x, y + r * 0.98);
+      ctx.quadraticCurveTo(x - r * 0.8, y + r * 0.75, x - r * 0.95, y + r * 0.05);
+      ctx.fillStyle = A.light; ctx.fill();
+    }
+    ctx.globalAlpha = 0.28; ctx.fillStyle = '#fff';
+    ctx.beginPath(); ctx.ellipse(x - r * 0.42, y - r * 0.52, r * 0.2, r * 0.08, -0.6, 0, TAU); ctx.fill();
+    ctx.globalAlpha = 1;
+
+    drawAnimalFace(A, x, y, r, mood);
+  }
+
+  // Paws resting on the table edge, in front of it (not while cheering).
+  function drawPaws(f) {
+    if (moodOf(f) === 'cheer') return;
+    const A = ANIMALS[f.animal];
+    const r = L.cr;
+    for (const s of [-1, 1]) {
+      ctx.beginPath(); ctx.ellipse(f.x + s * r * 0.62, L.tableY + r * 0.04, r * 0.2, r * 0.13, 0, 0, TAU);
+      paint(A.fur, Math.max(1.5, r * 0.05));
+    }
+  }
+
+  function drawTable() {
+    const y = L.tableY;
+    ctx.fillStyle = COLORS.table;
+    ctx.fillRect(0, y, W, H - y);
+    ctx.fillStyle = COLORS.tableEdge;
+    ctx.fillRect(0, y - 2, W, Math.max(6, L.m * 0.45));
+    // Soft wood grain.
+    ctx.globalAlpha = 0.25;
+    ctx.strokeStyle = shade(COLORS.table, -0.12);
+    ctx.lineWidth = 2;
+    ctx.lineCap = 'round';
+    for (let i = 1; i <= 4; i++) {
+      const gy = y + (H - y) * i / 5;
+      ctx.beginPath();
+      ctx.moveTo(W * 0.05, gy);
+      ctx.bezierCurveTo(W * 0.3, gy - 6, W * 0.6, gy + 6, W * 0.95, gy);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // A plate; glows when it can take the next treat (scaffolding hint).
+  function drawPlate(f, t, hovered, glow) {
+    const k = hovered ? 1.05 : 1;
+    const rx = f.plateRx * k, ry = f.plateRy * k;
+    let squash = 1;
+    const bp = (t - f.bounceT0) / CONFIG.BOUNCE_MS;
+    if (bp >= 0 && bp < 1) squash = 1 - 0.06 * Math.sin(Math.PI * bp);
+
+    if (glow > 0) {
+      ctx.globalAlpha = 0.25 + 0.4 * glow;
+      ctx.fillStyle = COLORS.glow;
+      ctx.beginPath(); ctx.ellipse(f.plateX, f.plateY, rx * (1.12 + 0.06 * glow), ry * (1.3 + 0.12 * glow), 0, 0, TAU); ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+    ctx.globalAlpha = 0.15; ctx.fillStyle = COLORS.ink;
+    ctx.beginPath(); ctx.ellipse(f.plateX, f.plateY + ry * 0.28, rx * 0.98, ry * 0.95, 0, 0, TAU); ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.beginPath(); ctx.ellipse(f.plateX, f.plateY, rx, ry * squash, 0, 0, TAU);
+    ctx.fillStyle = COLORS.plate; ctx.fill();
+    ctx.lineWidth = Math.max(1.5, rx * 0.025); ctx.strokeStyle = shade(COLORS.plateRim, -0.12); ctx.stroke();
+    ctx.beginPath(); ctx.ellipse(f.plateX, f.plateY + ry * 0.05, rx * 0.7, ry * 0.62 * squash, 0, 0, TAU);
+    ctx.lineWidth = Math.max(1.5, rx * 0.02); ctx.strokeStyle = COLORS.plateRim; ctx.stroke();
+  }
+
+  function drawTray() {
+    const { rx, ry } = L.tray;
+    ctx.globalAlpha = 0.15; ctx.fillStyle = COLORS.ink;
+    ctx.beginPath(); ctx.ellipse(L.pileX, L.pileY + ry * 0.12, rx, ry, 0, 0, TAU); ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.beginPath(); ctx.ellipse(L.pileX, L.pileY, rx, ry, 0, 0, TAU);
+    paint(COLORS.tray, Math.max(2, L.s * 0.1));
+    ctx.beginPath(); ctx.ellipse(L.pileX, L.pileY, rx * 0.9, ry * 0.86, 0, 0, TAU);
+    ctx.lineWidth = Math.max(1.5, L.s * 0.06); ctx.strokeStyle = shade(COLORS.tray, -0.1); ctx.stroke();
+  }
+
+  // Same ring of sparkles from every plate, every time (no random rewards).
+  function spawnParticles(f, t) {
+    for (let i = 0; i < 10; i++) {
+      const a = -Math.PI / 2 + (i - 4.5) * 0.3;
+      state.particles.push({ x0: f.plateX, y0: f.plateY - f.plateRy, dx: Math.cos(a), dy: Math.sin(a), dist: f.plateRx * 0.9, t0: t, life: 1000, color: i % 2 ? COLORS.star : '#E8B4C8' });
+    }
+  }
+
+  function drawParticles(t) {
+    state.particles = state.particles.filter(p => t - p.t0 < p.life);
+    for (const p of state.particles) {
+      const k = (t - p.t0) / p.life;
+      const e = easeOutCubic(k);
+      ctx.globalAlpha = 1 - k;
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x0 + p.dx * p.dist * e, p.y0 + p.dy * p.dist * e, L.s * 0.16 * (1 - k * 0.5), 0, TAU);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------------------------------------------------------------------
+  // Screens
+  // ---------------------------------------------------------------------
+  function starGeom() {
+    return { cx: W / 2, cy: H * 0.42, R: Math.min(W, H) * 0.2 };
+  }
+
+  // Start and between-round screen: one big pulsing star to tap, plus 5 slots
+  // that fill up so the child can see the end coming.
+  function drawStarScreen(t) {
+    const { cx, cy, R } = starGeom();
+    const amp = reduceMotion ? 0.03 : 0.07;
+    const k = 1 + amp * (0.5 - 0.5 * Math.cos(TAU * t / 1400));
+    drawStar(cx, cy, R * k, COLORS.star, true);
+
+    const sr = R * 0.16, gap = sr * 2.8, y = cy + R * 1.35;
+    for (let i = 0; i < CONFIG.ROUNDS; i++) {
+      drawStar(cx + (i - (CONFIG.ROUNDS - 1) / 2) * gap, y, sr, i < state.round ? COLORS.star : null, false);
+    }
+  }
+
+  function fitFont(text, weight, size, maxW) {
+    ctx.font = `${weight} ${size}px ${FONT}`;
+    while (size > 12 && ctx.measureText(text).width > maxW) {
+      size -= 1;
+      ctx.font = `${weight} ${size}px ${FONT}`;
+    }
+    return size;
+  }
+
+  // Static end screen. No buttons: the session is over.
+  function drawEnd() {
+    const gh = H * 0.14;
+    ctx.fillStyle = COLORS.grass;
+    ctx.beginPath();
+    ctx.moveTo(0, H - gh);
+    ctx.quadraticCurveTo(W / 2, H - gh * 1.5, W, H - gh);
+    ctx.lineTo(W, H);
+    ctx.lineTo(0, H);
+    ctx.closePath();
+    ctx.fill();
+
+    const R = Math.min(W, H) * 0.2;
+    const cy = H * 0.36;
+    drawStar(W / 2, cy, R, COLORS.star, true);
+
+    const big = clamp(Math.min(W, H) * 0.1, 26, 68);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = COLORS.ink;
+    const top = cy + R * 1.25;
+    fitFont('Great Job!', 800, big, W * 0.9);
+    ctx.fillText('Great Job!', W / 2, top + big * 0.5);
+    fitFont('Time to play outside!', 700, Math.round(big * 0.62), W * 0.9);
+    ctx.fillText('Time to play outside!', W / 2, top + big * 1.55);
+  }
+
+  // Which treat to pulse and whether the open plates glow right now.
+  function guidance(t) {
+    const out = { target: null, pulse: 1, glowPlates: false, glow: 0 };
+    if (state.phase !== 'play') return out;
+    const amp = reduceMotion ? 0.05 : 0.12;
+    const struggling = state.roundSlips >= CONFIG.HINT_AFTER_SLIPS;
+
+    if (state.drag) {
+      if (struggling) { out.glowPlates = true; out.glow = 0.5 + 0.5 * Math.sin(TAU * t / 1300); }
+      return out;
+    }
+
+    const idle = t - state.lastInteraction;
+    if (idle <= CONFIG.IDLE_PULSE_MS) return out;
+    out.target = state.treats.find(o => o.state === 'idle') || null;
+    if (!out.target) return out;
+    const wave = 0.5 - 0.5 * Math.cos(TAU * (idle - CONFIG.IDLE_PULSE_MS) / 1300);
+    out.pulse = 1 + amp * wave;
+
+    // Scaffolding: glow the plates that can take a treat after repeated slips,
+    // or in the very first round if the child has not found the mechanic yet.
+    const tutorial = state.round === 0 && state.placedThisRound === 0 && idle > CONFIG.TUTORIAL_HINT_MS;
+    if (struggling || tutorial) { out.glowPlates = true; out.glow = wave; }
+    return out;
+  }
+
+  function drawPlay(t) {
+    const g = guidance(t);
+    const hover = state.drag && state.drag.moved >= CONFIG.TAP_SLOP_PX ? findDropFriend(state.drag.obj) : null;
+
+    for (const f of state.friends) drawFriend(f, t);
+    drawTable();
+    for (const f of state.friends) drawPaws(f);
+    for (const f of state.friends) drawPlate(f, t, f === hover, g.glowPlates && accepts(f) ? g.glow : 0);
+    drawTray();
+
+    for (const o of state.treats) {
+      if (o.state === 'placed' || o.state === 'toPlate') drawTreatObj(o, 1, false);
+    }
+    for (const o of state.treats) {
+      if (o.state === 'idle' || o.state === 'return') drawTreatObj(o, o === g.target ? g.pulse : 1, false);
+    }
+    if (state.drag) drawTreatObj(state.drag.obj, 1, true);
+    drawParticles(t);
+  }
+
+  // ---------------------------------------------------------------------
+  // Main loop
+  // ---------------------------------------------------------------------
+  function update(t) {
+    for (const o of state.treats) {
+      const a = o.anim;
+      if (!a) continue;
+      const p = clamp((t - a.t0) / a.dur, 0, 1);
+      const e = a.ease(p);
+      o.x = lerp(a.fx, a.tx, e);
+      o.y = lerp(a.fy, a.ty, e);
+      o.scale = lerp(a.fs, a.ts, e);
+      if (p >= 1) {
+        o.anim = null;
+        if (o.state === 'return') o.state = 'idle';
+        else if (o.state === 'toPlate') landOnPlate(o, t);
+      }
+    }
+
+    if (state.phase === 'play' && state.completeAt && t >= state.completeAt) {
+      state.completeAt = 0;
+      completeRound();
+    }
+
+    if (state.phase === 'celebrate' && t - state.celebrateStart >= CONFIG.CELEBRATE_MS) {
+      if (state.round >= CONFIG.ROUNDS) enterEnd();
+      else state.phase = 'between';
+    }
+  }
+
+  function render(t) {
+    ctx.fillStyle = COLORS.bg;
+    ctx.fillRect(0, 0, W, H);
+    if (state.phase === 'start' || state.phase === 'between') drawStarScreen(t);
+    else if (state.phase === 'play' || state.phase === 'celebrate') drawPlay(t);
+    else if (state.phase === 'end') drawEnd();
+  }
+
+  let rafId = 0;
+  function frame(t) {
+    update(t);
+    render(t);
+    // The end screen is static: stop the loop entirely.
+    if (state.phase !== 'end') rafId = requestAnimationFrame(frame);
+  }
+
+  function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    DPR = Math.min(window.devicePixelRatio || 1, 2.5);
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    computeLayout();
+    if (state.phase === 'end') render(now());
+  }
+
+  window.addEventListener('resize', resize);
+  window.addEventListener('orientationchange', resize);
+
+  resize();
+  log('Game loaded', { roundsPerSession: CONFIG.ROUNDS, gamesCompletedBefore: progress.gamesCompleted });
+  rafId = requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

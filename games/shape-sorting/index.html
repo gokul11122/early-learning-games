@@ -1,0 +1,1036 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Shape Sorting Bins</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
+  body {
+    background: #F6F1E7;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  canvas { display: block; width: 100%; height: 100%; }
+
+  /* Hidden parent view: press and hold the top-left corner for 3 seconds. */
+  #parent {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: rgba(74, 64, 54, 0.55); padding: 16px; box-sizing: border-box;
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #4A4036;
+  }
+  #parent[hidden] { display: none; }
+  #parent .card { background: #FFFDF8; border-radius: 16px; padding: 20px 22px; max-width: 380px; width: 100%; box-shadow: 0 10px 30px rgba(0,0,0,0.18); }
+  #parent h2 { margin: 0 0 10px; font-size: 18px; }
+  #parent table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+  #parent th, #parent td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #EDE5D6; }
+  #parent .hint { margin: 12px 0 0; font-size: 12px; opacity: 0.7; }
+
+  /* Home button: always visible so the child (or parent) can leave at any time. */
+  #home {
+    position: fixed; top: max(10px, env(safe-area-inset-top)); right: max(10px, env(safe-area-inset-right));
+    width: 52px; height: 52px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+    background: rgba(255, 253, 248, 0.85); box-shadow: 0 2px 8px rgba(74, 64, 54, 0.15);
+    -webkit-tap-highlight-color: transparent; z-index: 5;
+  }
+  #home:active { transform: scale(0.94); }
+</style>
+</head>
+<body>
+<canvas id="game" aria-label="Shape sorting game"></canvas>
+<a id="home" href="../../index.html" aria-label="Home">
+  <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><path d="M4 11.5 12 5l8 6.5V19a1 1 0 0 1-1 1h-4.5v-5h-5v5H5a1 1 0 0 1-1-1z" fill="none" stroke="#4A4036" stroke-width="2" stroke-linejoin="round"/></svg>
+</a>
+
+<div id="parent" hidden>
+  <div class="card">
+    <h2>Progress on this device</h2>
+    <div id="parentBody"></div>
+    <p class="hint">Stored only on this device. Tap anywhere to close.</p>
+  </div>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  /* =====================================================================
+   * SHAPE SORTING SENSORY BINS
+   * ELOF domain: Cognition (emergent mathematical thinking: classification)
+   *              + Perceptual/Motor (fine motor drag-and-drop).
+   *
+   * Design rules this file follows (from the brief):
+   *  - Coherence: only shapes and bins on screen. No score, no menus, no text
+   *    during play.
+   *  - Control of error: a shape dropped on the wrong bin glides back home.
+   *    No buzzer, no red X. The rejection itself is the feedback.
+   *  - Forgiving hitboxes: drop zones are far larger than the shapes.
+   *  - Visual prompts: the next shape pulses gently when the child is idle.
+   *  - Self-paced: no timers anywhere the child can see or feel.
+   *  - Natural stopping point: 5 rounds, then a static "play outside" screen
+   *    with no "play again" button.
+   * ===================================================================== */
+
+  // ---------------------------------------------------------------------
+  // Configuration
+  // ---------------------------------------------------------------------
+  const CONFIG = {
+    ROUNDS: 5,                     // hard session limit (natural stopping point)
+    STORAGE_KEY: 'shapeSortingBins.v1',
+    IDLE_PULSE_MS: 1500,           // idle time before the next shape pulses
+    TUTORIAL_HINT_MS: 5000,        // first round: idle time before the right bin glows too
+    RETURN_MS: 380,                // wrong drop: glide-home duration
+    TO_BIN_MS: 240,                // right drop: slide-into-bin duration
+    BOUNCE_MS: 320,                // bin squash when a shape lands
+    CELEBRATE_MS: 1500,            // round-complete celebration length
+    FAST_MS_PER_SHAPE: 4000,       // "quick" threshold for difficulty step-up
+    PARENT_HOLD_MS: 3000,          // hold time for the hidden parent view
+    PARENT_CORNER_PX: 80,
+    TAP_SLOP_PX: 12,               // movement below this is a tap, not a drop
+    PLACED_SCALE: 0.55,            // size of a shape once it sits in a bin
+  };
+
+  const COLORS = {
+    bg: '#F6F1E7',
+    ink: '#4A4036',
+    circle: '#8FB8DE',             // soft blue
+    square: '#9CCB9A',             // soft green
+    triangle: '#F2A88A',           // soft coral
+    neutrals: ['#F4D35E', '#B8A9D9', '#E8B4C8', '#A8D5D1'], // never a bin colour
+    star: '#F6C85F',
+    grass: '#B9D7A8',
+    cheek: '#F2A88A',
+  };
+
+  const SHAPES = ['circle', 'square', 'triangle'];
+  const SIZE_STEPS = [0.78, 1, 1.15];
+  const FONT = 'ui-rounded, "Arial Rounded MT Bold", "Nunito", system-ui, -apple-system, sans-serif';
+
+  // Difficulty ladder for dynamic difficulty adjustment (scaffolding).
+  // Colour matching the bin is an extra cue; removing it makes the child sort by shape alone.
+  const TIERS = [
+    { types: 2, perType: 2, colorMatch: true,  sizeVary: false }, // 4 shapes, colour + shape cue
+    { types: 3, perType: 2, colorMatch: true,  sizeVary: false }, // 6 shapes, colour + shape cue
+    { types: 3, perType: 2, colorMatch: false, sizeVary: false }, // 6 shapes, shape cue only
+    { types: 3, perType: 3, colorMatch: false, sizeVary: true  }, // 9 shapes, mixed sizes
+  ];
+
+  const TAU = Math.PI * 2;
+  const reduceMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+
+  // ---------------------------------------------------------------------
+  // Small helpers
+  // ---------------------------------------------------------------------
+  const now = () => performance.now();
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const easeOutCubic = t => 1 - Math.pow(1 - t, 3);
+  const easeInOutQuad = t => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
+  const log = (...args) => console.log('[ShapeSort]', ...args);
+
+  function shuffle(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }
+
+  // Mix a hex colour toward black (amt < 0) or white (amt > 0).
+  const shadeCache = new Map();
+  function shade(hex, amt) {
+    const key = hex + amt;
+    if (shadeCache.has(key)) return shadeCache.get(key);
+    const n = parseInt(hex.slice(1), 16);
+    const target = amt < 0 ? 0 : 255;
+    const p = Math.abs(amt);
+    const c = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map(v => Math.round(lerp(v, target, p)));
+    const out = `rgb(${c[0]},${c[1]},${c[2]})`;
+    shadeCache.set(key, out);
+    return out;
+  }
+
+  // ---------------------------------------------------------------------
+  // Canvas setup
+  // ---------------------------------------------------------------------
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  let W = 0, H = 0, DPR = 1;
+
+  // Layout values recomputed on every resize.
+  const L = { m: 16, s: 40 };
+
+  // ---------------------------------------------------------------------
+  // Game state
+  // ---------------------------------------------------------------------
+  const state = {
+    phase: 'start',          // 'start' | 'play' | 'celebrate' | 'between' | 'end'
+    round: 0,                // rounds completed this session
+    tier: 0,                 // index into TIERS
+    bins: [],
+    objects: [],
+    drag: null,              // { obj, dx, dy, sx, sy }
+    lastInteraction: 0,
+    roundStart: 0,
+    roundErrors: 0,          // wrong-bin drops this round
+    placedThisRound: 0,
+    completeAt: 0,           // time to fire completeRound()
+    celebrateStart: 0,
+    particles: [],
+  };
+
+  // ---------------------------------------------------------------------
+  // Local progress tracking (localStorage, never leaves the device)
+  // ---------------------------------------------------------------------
+  function freshProgress() {
+    return { version: 1, gamesCompleted: 0, roundsCompleted: 0, placements: 0, wrongDrops: 0, lastPlayed: null, sessions: [] };
+  }
+
+  function loadProgress() {
+    try {
+      const raw = window.localStorage.getItem(CONFIG.STORAGE_KEY);
+      if (raw) {
+        const data = JSON.parse(raw);
+        if (data && data.version === 1 && Array.isArray(data.sessions)) return data;
+      }
+    } catch (e) {
+      console.warn('[ShapeSort] Progress could not be loaded (storage unavailable):', e && e.message);
+    }
+    return freshProgress();
+  }
+
+  function saveProgress() {
+    try {
+      window.localStorage.setItem(CONFIG.STORAGE_KEY, JSON.stringify(progress));
+      log('Progress saved', { gamesCompleted: progress.gamesCompleted, roundsCompleted: progress.roundsCompleted });
+    } catch (e) {
+      console.warn('[ShapeSort] Progress could not be saved (storage unavailable):', e && e.message);
+    }
+  }
+
+  const progress = loadProgress();
+  let session = null; // created on the first round of this app launch
+
+  function ensureSession() {
+    if (session) return;
+    session = { startedAt: new Date().toISOString(), finished: false, rounds: [] };
+    progress.sessions.push(session);
+    if (progress.sessions.length > 30) progress.sessions.splice(0, progress.sessions.length - 30);
+  }
+
+  // ---------------------------------------------------------------------
+  // Audio: Web Audio tones + optional spoken words
+  // ---------------------------------------------------------------------
+  let actx = null;
+
+  // Browsers only allow audio after a user gesture, so this runs on every pointer down.
+  function unlockAudio() {
+    if (!actx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) { try { actx = new AC(); } catch (e) { actx = null; } }
+    }
+    if (actx && actx.state === 'suspended') actx.resume();
+  }
+
+  function tone(freq, delay, dur, vol = 0.16, type = 'sine') {
+    if (!actx) return;
+    const t = actx.currentTime + delay;
+    const osc = actx.createOscillator();
+    const gain = actx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(vol, t + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    osc.connect(gain).connect(actx.destination);
+    osc.start(t);
+    osc.stop(t + dur + 0.05);
+  }
+
+  // Each bin always plays the same note: predictable, proportional feedback.
+  const BIN_NOTE = { circle: 523.25, square: 659.25, triangle: 783.99 };
+  const playPickup = () => tone(440, 0, 0.08, 0.05, 'triangle');
+  const playChime = type => { const f = BIN_NOTE[type]; tone(f, 0, 0.35); tone(f * 1.5, 0.07, 0.4, 0.1); };
+  const playRoundDone = () => [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => tone(f, i * 0.12, 0.5, 0.12));
+
+  // Spoken words via the Web Speech API. Android WebView usually lacks it,
+  // so this quietly does nothing there and the tones carry the feedback.
+  function say(text) {
+    try {
+      if (!('speechSynthesis' in window)) return;
+      window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'en-US';
+      u.rate = 0.85;
+      u.pitch = 1.15;
+      window.speechSynthesis.speak(u);
+    } catch (e) { /* speech is optional */ }
+  }
+
+  // ---------------------------------------------------------------------
+  // Rounds and difficulty
+  // ---------------------------------------------------------------------
+  function startRound() {
+    ensureSession();
+    const tier = TIERS[state.tier];
+    const types = tier.types === 3
+      ? SHAPES.slice()
+      : shuffle(SHAPES.slice()).slice(0, tier.types).sort((a, b) => SHAPES.indexOf(a) - SHAPES.indexOf(b));
+
+    state.bins = types.map(type => ({ type, count: 0, capacity: tier.perType, bounceT0: -1e9, x: 0, y: 0, w: 0, h: 0 }));
+
+    const objects = [];
+    let neutral = Math.floor(Math.random() * COLORS.neutrals.length);
+    types.forEach(type => {
+      for (let k = 0; k < tier.perType; k++) {
+        objects.push({
+          type,
+          color: tier.colorMatch ? COLORS[type] : COLORS.neutrals[neutral++ % COLORS.neutrals.length],
+          sizeMul: tier.sizeVary ? SIZE_STEPS[k % SIZE_STEPS.length] : 1,
+          jx: Math.random() * 2 - 1,   // fixed jitter so homes stay put across resizes
+          jy: Math.random() * 2 - 1,
+          x: 0, y: 0, homeX: 0, homeY: 0, scale: 1,
+          state: 'idle',             // 'idle' | 'drag' | 'return' | 'toBin' | 'placed'
+          anim: null, animP: 0,
+          errors: 0, bin: null, binSlot: -1,
+        });
+      }
+    });
+    shuffle(objects).forEach((o, i) => { o.homeSlot = i; });
+
+    state.objects = objects;
+    state.roundErrors = 0;
+    state.placedThisRound = 0;
+    state.completeAt = 0;
+    state.particles = [];
+    state.drag = null;
+    computeLayout();
+
+    state.phase = 'play';
+    state.roundStart = now();
+    state.lastInteraction = now();
+    if (state.round === 0) say('Put each shape in its home.');
+    log(`Round ${state.round + 1}/${CONFIG.ROUNDS} started at level ${state.tier + 1}: ${types.join(', ')} x${tier.perType}`);
+  }
+
+  function completeRound() {
+    const t = now();
+    const n = state.objects.length;
+    const withErrors = state.objects.filter(o => o.errors > 0).length;
+    const ms = t - state.roundStart;
+    const record = {
+      level: state.tier + 1,
+      shapes: n,
+      firstTry: n - withErrors,
+      wrongDrops: state.roundErrors,
+      seconds: Math.round(ms / 100) / 10,
+    };
+
+    session.rounds.push(record);
+    progress.roundsCompleted++;
+    progress.placements += n;
+    progress.wrongDrops += state.roundErrors;
+    progress.lastPlayed = new Date().toISOString();
+    state.round++;
+    log('Level completed', record);
+
+    const finalRound = state.round >= CONFIG.ROUNDS;
+    if (finalRound) {
+      session.finished = true;
+      progress.gamesCompleted++;
+    } else {
+      // Praise the effort, not the child's "smartness" (growth mindset).
+      say(state.roundErrors > 0 ? 'You kept trying, and you did it!' : 'You sorted every shape!');
+    }
+    saveProgress();
+    adjustDifficulty(record, ms);
+
+    playRoundDone();
+    state.bins.forEach(b => { b.bounceT0 = t; spawnParticles(b, t); });
+    state.phase = 'celebrate';
+    state.celebrateStart = t;
+  }
+
+  // Simple DDA: quick and clean -> one step harder; a real struggle -> one step easier.
+  function adjustDifficulty(record, ms) {
+    const fast = ms / record.shapes <= CONFIG.FAST_MS_PER_SHAPE;
+    const before = state.tier;
+    if (record.firstTry === record.shapes && fast) {
+      state.tier = Math.min(TIERS.length - 1, state.tier + 1);
+    } else if (record.wrongDrops >= Math.max(3, Math.ceil(record.shapes / 2))) {
+      state.tier = Math.max(0, state.tier - 1);
+    }
+    if (state.tier !== before) log(`Difficulty ${state.tier > before ? 'up' : 'down'}: level ${before + 1} -> ${state.tier + 1}`);
+  }
+
+  function enterEnd() {
+    state.phase = 'end';
+    say('Great job! Time to play outside!');
+    log('Session finished: end screen shown, no replay offered');
+  }
+
+  // ---------------------------------------------------------------------
+  // Layout
+  // ---------------------------------------------------------------------
+  function computeLayout() {
+    const minDim = Math.min(W, H);
+    const m = clamp(minDim * 0.045, 12, 36);
+    const k = state.bins.length || 3;
+
+    // Bins sit along the bottom edge.
+    const binW = Math.min((W - m * (k + 1)) / k, H * 0.34, 300);
+    const binH = binW * 0.82;
+    const rowW = k * binW + (k - 1) * m;
+    const x0 = (W - rowW) / 2;
+    const binY = H - m - binH;
+    state.bins.forEach((b, i) => { b.x = x0 + i * (binW + m); b.y = binY; b.w = binW; b.h = binH; });
+
+    // Shapes are spread on a grid in the area above the bins.
+    const ax = m, ay = Math.max(m, 64);   // leave room for the home button
+    const aw = W - 2 * m;
+    const ah = Math.max(60, binY - m * 1.4 - ay);
+    const n = Math.max(1, state.objects.length);
+    const rows = Math.ceil(n / clamp(Math.round(Math.sqrt(n * aw / ah)), 1, n));
+    const cols = Math.ceil(n / rows);
+    const cw = aw / cols, ch = ah / rows;
+
+    // Shape radius. binW >= 2.6 * s keeps every drop zone far wider than a shape.
+    let s = clamp(minDim * 0.09, 22, 72);
+    s = Math.min(s, binW / 2.6, cw * 0.36, ch * 0.36);
+    L.m = m;
+    L.s = s;
+
+    state.objects.forEach(o => {
+      const i = o.homeSlot;
+      const row = Math.floor(i / cols);
+      const inRow = row === rows - 1 ? n - row * cols : cols;
+      const col = i - row * cols;
+      const rowOffset = (cols - inRow) * cw / 2;   // centre a short last row
+      o.homeX = ax + rowOffset + cw * (col + 0.5) + o.jx * cw * 0.08;
+      o.homeY = ay + ch * (row + 0.5) + o.jy * ch * 0.08;
+    });
+    relayoutObjects();
+  }
+
+  // Keep every shape where it belongs after a resize or rotation.
+  function relayoutObjects() {
+    for (const o of state.objects) {
+      if (o.state === 'idle') {
+        o.x = o.homeX; o.y = o.homeY;
+      } else if (o.state === 'return' && o.anim) {
+        o.anim.tx = o.homeX; o.anim.ty = o.homeY;
+      } else if (o.state === 'toBin' && o.anim) {
+        const p = binSlotPos(o.bin, o.binSlot);
+        o.anim.tx = p.x; o.anim.ty = p.y;
+      } else if (o.state === 'placed') {
+        const p = binSlotPos(o.bin, o.binSlot);
+        o.x = p.x; o.y = p.y;
+      } else if (o.state === 'drag') {
+        o.x = clamp(o.x, 0, W); o.y = clamp(o.y, 0, H);
+      }
+    }
+  }
+
+  // Where the n-th shape rests inside a bin: on the rim, lower half hidden by the front.
+  function binSlotPos(bin, index) {
+    return { x: bin.x + bin.w * (index + 0.5) / bin.capacity, y: bin.y + bin.h * 0.12 };
+  }
+
+  // Generous drop zone: the bin plus wide margins. Nearest bin wins on overlap.
+  function findDropBin(o) {
+    let best = null, bestD = Infinity;
+    for (const b of state.bins) {
+      const padX = Math.max(L.s * 0.7, b.w * 0.15);
+      const padTop = L.s * 1.3;
+      if (o.x >= b.x - padX && o.x <= b.x + b.w + padX && o.y >= b.y - padTop && o.y <= b.y + b.h + L.m) {
+        const d = Math.hypot(o.x - (b.x + b.w / 2), o.y - (b.y + b.h / 2));
+        if (d < bestD) { best = b; bestD = d; }
+      }
+    }
+    return best;
+  }
+
+  const binFor = type => state.bins.find(b => b.type === type) || null;
+
+  // ---------------------------------------------------------------------
+  // Drag and drop
+  // ---------------------------------------------------------------------
+  // Forgiving pick: the nearest shape within 1.5x its radius.
+  function pickObject(p) {
+    let best = null, bestD = Infinity;
+    for (const o of state.objects) {
+      if (o.state !== 'idle' && o.state !== 'return') continue;
+      const d = Math.hypot(p.x - o.x, p.y - o.y);
+      if (d <= L.s * o.sizeMul * 1.5 && d < bestD) { best = o; bestD = d; }
+    }
+    return best;
+  }
+
+  function beginDrag(o, p) {
+    o.state = 'drag';
+    o.anim = null;
+    o.scale = 1;
+    state.drag = { obj: o, dx: o.x - p.x, dy: o.y - p.y, sx: p.x, sy: p.y, moved: 0 };
+    // Draw the held shape on top of the others.
+    state.objects.splice(state.objects.indexOf(o), 1);
+    state.objects.push(o);
+    playPickup();
+    say(o.type);
+    log('Picked up', o.type);
+  }
+
+  function dropObject(p) {
+    const o = state.drag.obj;
+    const wasTap = state.drag.moved < CONFIG.TAP_SLOP_PX;
+    state.drag = null;
+    const bin = wasTap ? null : findDropBin(o);
+
+    if (bin && bin.type === o.type) {
+      acceptObject(o, bin);
+    } else {
+      if (bin) {
+        o.errors++;
+        state.roundErrors++;
+        log(`Item rejected: ${o.type} dropped on ${bin.type} bin, gliding home`);
+      }
+      sendHome(o);
+    }
+  }
+
+  function acceptObject(o, bin) {
+    const target = binSlotPos(bin, bin.count);
+    o.state = 'toBin';
+    o.bin = bin;
+    o.binSlot = bin.count++;
+    o.anim = { fx: o.x, fy: o.y, tx: target.x, ty: target.y, fs: o.scale, ts: CONFIG.PLACED_SCALE, t0: now(), dur: CONFIG.TO_BIN_MS, ease: easeInOutQuad };
+    o.animP = 0;
+  }
+
+  // Montessori control of error: the shape simply glides back to where it started.
+  function sendHome(o) {
+    o.state = 'return';
+    o.anim = { fx: o.x, fy: o.y, tx: o.homeX, ty: o.homeY, fs: o.scale, ts: 1, t0: now(), dur: CONFIG.RETURN_MS, ease: easeOutCubic };
+    o.animP = 0;
+  }
+
+  // Called when a shape finishes sliding into the right bin.
+  // Sound, bin bounce and the shape settling all happen on the same frame (temporal contiguity).
+  function landInBin(o, t) {
+    o.state = 'placed';
+    o.bin.bounceT0 = t;
+    playChime(o.type);
+    state.placedThisRound++;
+    log(`Item successfully placed: ${o.type} -> ${o.bin.type} bin`);
+    if (state.objects.every(x => x.state === 'placed')) state.completeAt = t + 250;
+  }
+
+  // ---------------------------------------------------------------------
+  // Input: touch + mouse
+  // ---------------------------------------------------------------------
+  let activeTouch = null;
+  let mouseDown = false;
+  let parentTimer = null;
+
+  function toCanvas(clientX, clientY) {
+    const r = canvas.getBoundingClientRect();
+    return { x: clientX - r.left, y: clientY - r.top };
+  }
+
+  function findTouch(list, id) {
+    for (let i = 0; i < list.length; i++) if (list[i].identifier === id) return list[i];
+    return null;
+  }
+
+  function cancelParentHold() {
+    if (parentTimer) { clearTimeout(parentTimer); parentTimer = null; }
+  }
+
+  function onDown(p) {
+    unlockAudio();
+    state.lastInteraction = now();
+
+    if (state.phase === 'start' || state.phase === 'between') {
+      const g = starGeom();
+      if (Math.hypot(p.x - g.cx, p.y - g.cy) <= g.R * 1.8) { startRound(); return; }
+    } else if (state.phase === 'play') {
+      const o = pickObject(p);
+      if (o) { beginDrag(o, p); return; }
+    }
+
+    // Hidden parent view: hold the top-left corner still for 3 seconds.
+    if (p.x < CONFIG.PARENT_CORNER_PX && p.y < CONFIG.PARENT_CORNER_PX) {
+      cancelParentHold();
+      parentTimer = setTimeout(openParent, CONFIG.PARENT_HOLD_MS);
+    }
+  }
+
+  function onMove(p) {
+    if (parentTimer && (p.x >= CONFIG.PARENT_CORNER_PX || p.y >= CONFIG.PARENT_CORNER_PX)) cancelParentHold();
+    if (!state.drag) return;
+    state.lastInteraction = now();
+    const d = state.drag;
+    d.moved = Math.max(d.moved, Math.hypot(p.x - d.sx, p.y - d.sy));
+    d.obj.x = clamp(p.x + d.dx, 0, W);
+    d.obj.y = clamp(p.y + d.dy, 0, H);
+  }
+
+  function onUp(p) {
+    cancelParentHold();
+    if (state.drag) dropObject(p);
+  }
+
+  canvas.addEventListener('touchstart', e => {
+    e.preventDefault();
+    if (activeTouch !== null) return;          // one finger at a time
+    const t = e.changedTouches[0];
+    activeTouch = t.identifier;
+    onDown(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  canvas.addEventListener('touchmove', e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (t) onMove(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  const endTouch = e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (!t) return;
+    activeTouch = null;
+    onUp(toCanvas(t.clientX, t.clientY));
+  };
+  canvas.addEventListener('touchend', endTouch, { passive: false });
+  canvas.addEventListener('touchcancel', endTouch, { passive: false });
+
+  canvas.addEventListener('mousedown', e => { mouseDown = true; onDown(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mousemove', e => { if (mouseDown) onMove(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mouseup', e => {
+    if (!mouseDown) return;
+    mouseDown = false;
+    onUp(toCanvas(e.clientX, e.clientY));
+  });
+
+  // ---------------------------------------------------------------------
+  // Parent view (hidden, local data only)
+  // ---------------------------------------------------------------------
+  const parentEl = document.getElementById('parent');
+  const parentBody = document.getElementById('parentBody');
+
+  function el(tag, text) {
+    const node = document.createElement(tag);
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function openParent() {
+    parentTimer = null;
+    const shapes = progress.sessions.reduce((a, s) => a + s.rounds.reduce((b, r) => b + r.shapes, 0), 0);
+    const firstTry = progress.sessions.reduce((a, s) => a + s.rounds.reduce((b, r) => b + r.firstTry, 0), 0);
+
+    parentBody.textContent = '';
+    parentBody.appendChild(el('div', `Full games finished: ${progress.gamesCompleted}`));
+    parentBody.appendChild(el('div', `Rounds finished: ${progress.roundsCompleted}`));
+    parentBody.appendChild(el('div', `Shapes sorted: ${progress.placements}`));
+    parentBody.appendChild(el('div', `Sorted on the first try: ${shapes ? Math.round(100 * firstTry / shapes) : 0}%`));
+
+    const recent = progress.sessions.slice(-6).reverse();
+    if (recent.length) {
+      const table = el('table');
+      const head = el('tr');
+      ['When', 'Rounds', 'Top level', 'Slips'].forEach(h => head.appendChild(el('th', h)));
+      table.appendChild(head);
+      recent.forEach(s => {
+        const tr = el('tr');
+        const when = new Date(s.startedAt);
+        tr.appendChild(el('td', when.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' ' +
+          when.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })));
+        tr.appendChild(el('td', `${s.rounds.length}/${CONFIG.ROUNDS}`));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => Math.max(a, r.level), 0) || '-')));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => a + r.wrongDrops, 0))));
+        table.appendChild(tr);
+      });
+      parentBody.appendChild(table);
+    }
+    parentEl.hidden = false;
+    log('Parent view opened', progress);
+  }
+
+  parentEl.addEventListener('click', () => { parentEl.hidden = true; });
+
+  // Read-only debug hooks for the Android/desktop console.
+  window.ShapeSort = {
+    progress: () => JSON.parse(JSON.stringify(progress)),
+    state: () => ({
+      phase: state.phase,
+      round: state.round,
+      level: state.tier + 1,
+      bins: state.bins.map(b => ({ type: b.type, x: b.x + b.w / 2, y: b.y + b.h / 2 })),
+      shapes: state.objects.map(o => ({ type: o.type, state: o.state, x: o.x, y: o.y })),
+    }),
+  };
+
+  // ---------------------------------------------------------------------
+  // Drawing primitives
+  // ---------------------------------------------------------------------
+  function roundRectPath(x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  // Every shape fits inside radius r so they read as the same size.
+  function shapePath(type, x, y, r) {
+    ctx.beginPath();
+    if (type === 'circle') {
+      ctx.arc(x, y, r, 0, TAU);
+    } else if (type === 'square') {
+      const h = r * 0.86;
+      roundRectPath(x - h, y - h, h * 2, h * 2, r * 0.2);
+    } else {
+      // Equilateral triangle, shifted down so it looks centred.
+      const R = r * 1.12, cy = y + R * 0.25;
+      for (let k = 0; k < 3; k++) {
+        const a = -Math.PI / 2 + k * TAU / 3;
+        const px = x + R * Math.cos(a), py = cy + R * Math.sin(a);
+        if (k === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      }
+      ctx.closePath();
+    }
+  }
+
+  function drawShape(type, x, y, r, fill, lifted) {
+    ctx.save();
+    if (lifted) {
+      ctx.shadowColor = 'rgba(60, 45, 30, 0.22)';
+      ctx.shadowBlur = r * 0.5;
+      ctx.shadowOffsetY = r * 0.25;
+    }
+    shapePath(type, x, y, r);
+    ctx.fillStyle = fill;
+    ctx.fill();
+    ctx.shadowColor = 'transparent';
+    ctx.lineJoin = 'round';
+    ctx.lineWidth = Math.max(2, r * 0.12);
+    ctx.strokeStyle = shade(fill, -0.28);
+    ctx.stroke();
+
+    // Small soft highlight so shapes feel touchable.
+    const hx = type === 'triangle' ? x - r * 0.15 : x - r * 0.3;
+    const hy = type === 'triangle' ? y - r * 0.05 : y - r * 0.35;
+    ctx.globalAlpha = 0.35;
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.ellipse(hx, hy, r * 0.22, r * 0.12, -0.6, 0, TAU);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function drawObject(o, scaleK, lifted) {
+    const r = L.s * o.sizeMul * o.scale * scaleK * (lifted ? 1.12 : 1);
+    drawShape(o.type, o.x, o.y, r, o.color, lifted);
+  }
+
+  // A bin: dark opening at the back, its sorted shapes, then the front with a shape-shaped slot.
+  function drawBin(b, t, hovered, glow, drawContents) {
+    const col = COLORS[b.type];
+    const cx = b.x + b.w / 2;
+    const base = b.y + b.h;
+    const lip = b.y + b.h * 0.12;
+
+    let sx = 1, sy = 1;
+    const bp = (t - b.bounceT0) / CONFIG.BOUNCE_MS;
+    if (bp >= 0 && bp < 1) {
+      const k = Math.sin(Math.PI * bp);
+      sx += 0.06 * k;
+      sy -= 0.08 * k;
+    }
+    if (hovered) { sx *= 1.05; sy *= 1.05; }
+
+    ctx.save();
+    ctx.translate(cx, base);
+    ctx.scale(sx, sy);
+    ctx.translate(-cx, -base);
+
+    // Scaffolding hint: a soft glow around the right bin.
+    if (glow > 0) {
+      const g = L.s * (0.25 + 0.25 * glow);
+      ctx.globalAlpha = 0.25 + 0.35 * glow;
+      ctx.fillStyle = shade(col, 0.35);
+      ctx.beginPath();
+      roundRectPath(b.x - g, b.y - g, b.w + g * 2, b.h + g * 2, b.w * 0.14 + g);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    // Opening at the back.
+    ctx.beginPath();
+    roundRectPath(b.x + b.w * 0.03, b.y, b.w * 0.94, b.h * 0.26, b.h * 0.12);
+    ctx.fillStyle = shade(col, -0.42);
+    ctx.fill();
+
+    drawContents();
+
+    // Front body.
+    ctx.beginPath();
+    roundRectPath(b.x, lip, b.w, base - lip, b.w * 0.12);
+    ctx.fillStyle = col;
+    ctx.fill();
+    ctx.lineWidth = Math.max(2, b.w * 0.02);
+    ctx.strokeStyle = shade(col, -0.25);
+    ctx.stroke();
+
+    // The slot that says which shape lives here.
+    const bodyH = base - lip;
+    const ir = Math.min(b.w, bodyH) * 0.25;
+    shapePath(b.type, cx, lip + bodyH * 0.52, ir);
+    ctx.fillStyle = shade(col, -0.2);
+    ctx.fill();
+    ctx.lineJoin = 'round';
+    ctx.lineWidth = Math.max(2, ir * 0.12);
+    ctx.strokeStyle = shade(col, -0.38);
+    ctx.stroke();
+
+    ctx.restore();
+  }
+
+  function drawStar(cx, cy, R, fill, face) {
+    ctx.save();
+    ctx.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const rad = i % 2 === 0 ? R : R * 0.5;
+      const a = -Math.PI / 2 + i * Math.PI / 5;
+      const x = cx + rad * Math.cos(a), y = cy + rad * Math.sin(a);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    ctx.lineJoin = 'round';
+    if (fill) {
+      ctx.fillStyle = fill;
+      ctx.fill();
+      ctx.strokeStyle = fill;            // same-colour stroke rounds the tips
+      ctx.lineWidth = Math.max(2, R * 0.16);
+      ctx.stroke();
+    } else {
+      ctx.strokeStyle = 'rgba(74, 64, 54, 0.25)';
+      ctx.lineWidth = Math.max(2, R * 0.14);
+      ctx.stroke();
+    }
+
+    if (face) {
+      ctx.fillStyle = COLORS.ink;
+      ctx.beginPath(); ctx.arc(cx - R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.arc(cx + R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.strokeStyle = COLORS.ink;
+      ctx.lineWidth = Math.max(2, R * 0.05);
+      ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.arc(cx, cy + R * 0.06, R * 0.17, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+      ctx.globalAlpha = 0.35;
+      ctx.fillStyle = COLORS.cheek;
+      ctx.beginPath(); ctx.ellipse(cx - R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(cx + R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // Same ring of sparkles from every bin, every time (no random rewards).
+  function spawnParticles(b, t) {
+    const cx = b.x + b.w / 2, cy = b.y;
+    for (let i = 0; i < 10; i++) {
+      const a = -Math.PI / 2 + (i - 4.5) * 0.3;
+      state.particles.push({ x0: cx, y0: cy, dx: Math.cos(a), dy: Math.sin(a), dist: b.w * 0.6, t0: t, life: 900, color: i % 2 ? COLORS.star : shade(COLORS[b.type], 0.1) });
+    }
+  }
+
+  function drawParticles(t) {
+    state.particles = state.particles.filter(p => t - p.t0 < p.life);
+    for (const p of state.particles) {
+      const k = (t - p.t0) / p.life;
+      const e = easeOutCubic(k);
+      ctx.globalAlpha = 1 - k;
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x0 + p.dx * p.dist * e, p.y0 + p.dy * p.dist * e, L.s * 0.13 * (1 - k * 0.5), 0, TAU);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------------------------------------------------------------------
+  // Screens
+  // ---------------------------------------------------------------------
+  function starGeom() {
+    return { cx: W / 2, cy: H * 0.42, R: Math.min(W, H) * 0.2 };
+  }
+
+  // Start and between-round screen: one big pulsing star to tap, plus 5 slots
+  // that fill up so the child can see the end coming.
+  function drawStarScreen(t) {
+    const { cx, cy, R } = starGeom();
+    const amp = reduceMotion ? 0.03 : 0.07;
+    const k = 1 + amp * (0.5 - 0.5 * Math.cos(TAU * t / 1400));
+    drawStar(cx, cy, R * k, COLORS.star, true);
+
+    const sr = R * 0.16, gap = sr * 2.8, y = cy + R * 1.35;
+    for (let i = 0; i < CONFIG.ROUNDS; i++) {
+      drawStar(cx + (i - (CONFIG.ROUNDS - 1) / 2) * gap, y, sr, i < state.round ? COLORS.star : null, false);
+    }
+  }
+
+  function fitFont(text, weight, size, maxW) {
+    ctx.font = `${weight} ${size}px ${FONT}`;
+    while (size > 12 && ctx.measureText(text).width > maxW) {
+      size -= 1;
+      ctx.font = `${weight} ${size}px ${FONT}`;
+    }
+    return size;
+  }
+
+  // Static end screen. No buttons: the session is over.
+  function drawEnd() {
+    const gh = H * 0.14;
+    ctx.fillStyle = COLORS.grass;
+    ctx.beginPath();
+    ctx.moveTo(0, H - gh);
+    ctx.quadraticCurveTo(W / 2, H - gh * 1.5, W, H - gh);
+    ctx.lineTo(W, H);
+    ctx.lineTo(0, H);
+    ctx.closePath();
+    ctx.fill();
+
+    const R = Math.min(W, H) * 0.2;
+    const cy = H * 0.36;
+    drawStar(W / 2, cy, R, COLORS.star, true);
+
+    const big = clamp(Math.min(W, H) * 0.1, 26, 68);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = COLORS.ink;
+    const top = cy + R * 1.25;
+    fitFont('Great Job!', 800, big, W * 0.9);
+    ctx.fillText('Great Job!', W / 2, top + big * 0.5);
+    fitFont('Time to play outside!', 700, Math.round(big * 0.62), W * 0.9);
+    ctx.fillText('Time to play outside!', W / 2, top + big * 1.55);
+  }
+
+  // Which shape to pulse and which bin (if any) to glow right now.
+  function guidance(t) {
+    const out = { target: null, pulse: 1, hintBin: null, glow: 0 };
+    if (state.phase !== 'play') return out;
+    const amp = reduceMotion ? 0.05 : 0.12;
+
+    if (state.drag) {
+      const o = state.drag.obj;
+      if (o.errors >= 2) { out.hintBin = binFor(o.type); out.glow = 0.5 + 0.5 * Math.sin(TAU * t / 1300); }
+      return out;
+    }
+
+    const idle = t - state.lastInteraction;
+    if (idle <= CONFIG.IDLE_PULSE_MS) return out;
+    out.target = state.objects.find(o => o.state === 'idle') || null;
+    if (!out.target) return out;
+    const wave = 0.5 - 0.5 * Math.cos(TAU * (idle - CONFIG.IDLE_PULSE_MS) / 1300);
+    out.pulse = 1 + amp * wave;
+
+    // Scaffolding: glow the right bin after repeated slips, or in the very first
+    // round if the child has not found the mechanic yet.
+    const tutorial = state.round === 0 && state.placedThisRound === 0 && idle > CONFIG.TUTORIAL_HINT_MS;
+    if (out.target.errors >= 2 || tutorial) { out.hintBin = binFor(out.target.type); out.glow = wave; }
+    return out;
+  }
+
+  function drawPlay(t) {
+    const g = guidance(t);
+    const hover = state.drag ? findDropBin(state.drag.obj) : null;
+
+    for (const b of state.bins) {
+      drawBin(b, t, b === hover, b === g.hintBin ? g.glow : 0, () => {
+        for (const o of state.objects) {
+          if (o.bin === b && (o.state === 'placed' || (o.state === 'toBin' && o.animP >= 0.7))) drawObject(o, 1, false);
+        }
+      });
+    }
+    for (const o of state.objects) {
+      if (o.state === 'idle' || o.state === 'return' || (o.state === 'toBin' && o.animP < 0.7)) {
+        drawObject(o, o === g.target ? g.pulse : 1, false);
+      }
+    }
+    if (state.drag) drawObject(state.drag.obj, 1, true);
+    drawParticles(t);
+  }
+
+  // ---------------------------------------------------------------------
+  // Main loop
+  // ---------------------------------------------------------------------
+  function update(t) {
+    for (const o of state.objects) {
+      const a = o.anim;
+      if (!a) continue;
+      const p = clamp((t - a.t0) / a.dur, 0, 1);
+      const e = a.ease(p);
+      o.x = lerp(a.fx, a.tx, e);
+      o.y = lerp(a.fy, a.ty, e);
+      o.scale = lerp(a.fs, a.ts, e);
+      o.animP = p;
+      if (p >= 1) {
+        o.anim = null;
+        if (o.state === 'return') o.state = 'idle';
+        else if (o.state === 'toBin') landInBin(o, t);
+      }
+    }
+
+    if (state.phase === 'play' && state.completeAt && t >= state.completeAt) {
+      state.completeAt = 0;
+      completeRound();
+    }
+
+    if (state.phase === 'celebrate' && t - state.celebrateStart >= CONFIG.CELEBRATE_MS) {
+      if (state.round >= CONFIG.ROUNDS) enterEnd();
+      else state.phase = 'between';
+    }
+  }
+
+  function render(t) {
+    ctx.fillStyle = COLORS.bg;
+    ctx.fillRect(0, 0, W, H);
+    if (state.phase === 'start' || state.phase === 'between') drawStarScreen(t);
+    else if (state.phase === 'play' || state.phase === 'celebrate') drawPlay(t);
+    else if (state.phase === 'end') drawEnd();
+  }
+
+  let rafId = 0;
+  function frame(t) {
+    update(t);
+    render(t);
+    // The end screen is static: stop the loop entirely.
+    if (state.phase !== 'end') rafId = requestAnimationFrame(frame);
+  }
+
+  function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    DPR = Math.min(window.devicePixelRatio || 1, 2.5);
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    computeLayout();
+    if (state.phase === 'end') render(now());
+  }
+
+  window.addEventListener('resize', resize);
+  window.addEventListener('orientationchange', resize);
+
+  resize();
+  log('Game loaded', { roundsPerSession: CONFIG.ROUNDS, gamesCompletedBefore: progress.gamesCompleted });
+  rafId = requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

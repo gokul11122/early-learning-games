@@ -1,0 +1,1382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Block Stacking</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
+  body {
+    background: #F6F1E7;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  canvas { display: block; width: 100%; height: 100%; }
+
+  #home {
+    position: fixed; top: max(10px, env(safe-area-inset-top)); right: max(10px, env(safe-area-inset-right));
+    width: 52px; height: 52px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+    background: rgba(255, 253, 248, 0.85); box-shadow: 0 2px 8px rgba(74, 64, 54, 0.15);
+    -webkit-tap-highlight-color: transparent; z-index: 5;
+  }
+  #home:active { transform: scale(0.94); }
+
+  /* Hidden parent view: press and hold the top-left corner for 3 seconds. */
+  #parent {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: rgba(74, 64, 54, 0.55); padding: 16px; box-sizing: border-box; z-index: 10;
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #4A4036;
+  }
+  #parent[hidden] { display: none; }
+  #parent .card { background: #FFFDF8; border-radius: 16px; padding: 20px 22px; max-width: 380px; width: 100%; box-shadow: 0 10px 30px rgba(0,0,0,0.18); }
+  #parent h2 { margin: 0 0 10px; font-size: 18px; }
+  #parent table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+  #parent th, #parent td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #EDE5D6; }
+  #parent .hint { margin: 12px 0 0; font-size: 12px; opacity: 0.7; }
+</style>
+</head>
+<body>
+<canvas id="game" aria-label="Block stacking game"></canvas>
+<a id="home" href="../../index.html" aria-label="Home">
+  <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><path d="M4 11.5 12 5l8 6.5V19a1 1 0 0 1-1 1h-4.5v-5h-5v5H5a1 1 0 0 1-1-1z" fill="none" stroke="#4A4036" stroke-width="2" stroke-linejoin="round"/></svg>
+</a>
+
+<div id="parent" hidden>
+  <div class="card">
+    <h2>Progress on this device</h2>
+    <div id="parentBody"></div>
+    <p class="hint">Stored only on this device. Tap anywhere to close.</p>
+  </div>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  /* =====================================================================
+   * BLOCK STACKING
+   * ELOF domain: Cognition (scientific reasoning: comparing and ordering by
+   *              size, i.e. seriation) + Perceptual/Motor (drag and place).
+   *
+   * Design rules this file follows (from the brief):
+   *  - Coherence: only the blocks, the playmat they rest on and the tower
+   *    base. No score, no menus, no text during play.
+   *  - Control of error (Montessori): the tower only takes the biggest block
+   *    that is left. Any other block makes the tower give a tiny wobble and
+   *    slides back to the mat. No buzzer, no red X.
+   *  - Forgiving hitboxes: the whole tower side of the screen is the drop
+   *    zone, and even the smallest block answers to a finger-sized touch.
+   *  - Visual prompts: a dashed outline on top of the tower shows where the
+   *    next block goes; when the child is idle it pulses with the blocks.
+   *  - Self-paced: no timers anywhere the child can see or feel.
+   *  - Natural stopping point: 5 rounds, then a static "play outside" screen
+   *    with no "play again" button.
+   * ===================================================================== */
+
+  // ---------------------------------------------------------------------
+  // Configuration
+  // ---------------------------------------------------------------------
+  const CONFIG = {
+    ROUNDS: 5,                     // hard session limit (natural stopping point)
+    STORAGE_KEY: 'block-stacking.v1',
+    IDLE_PULSE_MS: 1500,           // idle time before the outline and blocks pulse
+    TUTORIAL_HINT_MS: 5000,        // first round: idle time before the right block glows
+    RETURN_MS: 420,                // wrong drop: glide-home duration
+    TO_TOWER_MS: 420,              // right drop: carry over the tower, then fall into place
+    SQUASH_MS: 520,                // landing squash-and-bounce
+    WOBBLE_MS: 620,                // sympathetic tower wobble on a wrong drop
+    COMPLETE_DELAY_MS: 380,        // last block lands -> bird sets off
+    BIRD_FLY_MS: 1300,
+    BIRD_SING_MS: 1500,
+    CELEBRATE_TAIL_MS: 300,
+    FAST_MS_PER_BLOCK: 4500,       // "quick" threshold for difficulty step-up
+    PARENT_HOLD_MS: 3000,          // hold time for the hidden parent view
+    PARENT_CORNER_PX: 80,
+    HOME_RESERVE_PX: 72,           // keep the top-right corner clear for the home button
+    TAP_SLOP_PX: 12,               // movement below this is a tap, not a drop
+    MIN_TOUCH_PX: 64,              // even the smallest block is this easy to grab
+    MAX_UNIT_PX: 340,              // width of the biggest block, at most
+  };
+  CONFIG.CELEBRATE_MS = CONFIG.BIRD_FLY_MS + CONFIG.BIRD_SING_MS + CONFIG.CELEBRATE_TAIL_MS;
+
+  const COLORS = {
+    bg: '#F6F1E7',
+    ink: '#4A4036',
+    mat: '#E8DCC4',
+    matStitch: '#F7F0E2',
+    plank: '#C9A27A',
+    wood: '#E2BC8E',               // natural wood for the "same colour" tier
+    blocks: ['#F2A88A', '#F6C85F', '#9CCB9A', '#8FB8DE', '#B8A9D9'],
+    bird: '#F2A88A',
+    birdBelly: '#FFF3E2',
+    beak: '#F2A35E',
+    star: '#F6C85F',
+    grass: '#B9D7A8',
+    cheek: '#F2A88A',
+  };
+
+  const FONT = 'ui-rounded, "Arial Rounded MT Bold", "Nunito", system-ui, -apple-system, sans-serif';
+
+  // Block proportions: width = u * size, height = u * (H_BASE + H_PER * size).
+  // Small blocks stay chunky enough to hold, but every block is both narrower and lower.
+  const H_BASE = 0.16, H_PER = 0.24;
+  const PLATFORM_W = 1.25, PLATFORM_H = 0.14, BIRD_ROOM = 0.5;   // in units of u
+
+  // Difficulty ladder for dynamic difficulty adjustment (scaffolding).
+  // sizedGhost: the outline on the tower has the exact size of the next block (an extra cue).
+  const TIERS = [
+    { sizes: [1, 0.66, 0.36],                sameColor: false, sizedGhost: true  }, // 3 very different blocks
+    { sizes: [1, 0.78, 0.57, 0.38],          sameColor: false, sizedGhost: true  }, // 4 blocks
+    { sizes: [1, 0.84, 0.68, 0.53, 0.38],    sameColor: false, sizedGhost: true  }, // 5 blocks
+    { sizes: [1, 0.89, 0.78, 0.67, 0.56],    sameColor: true,  sizedGhost: false }, // 5 same-colour blocks, closer sizes
+  ];
+
+  const TAU = Math.PI * 2;
+  const reduceMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+
+  // ---------------------------------------------------------------------
+  // Small helpers
+  // ---------------------------------------------------------------------
+  const now = () => performance.now();
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const easeOutCubic = t => 1 - Math.pow(1 - t, 3);
+  const easeInOutQuad = t => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
+  const log = (...args) => console.log('[BlockStack]', ...args);
+
+  function shuffle(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }
+
+  // Mix a hex colour toward black (amt < 0) or white (amt > 0).
+  const shadeCache = new Map();
+  function shade(hex, amt) {
+    const key = hex + amt;
+    if (shadeCache.has(key)) return shadeCache.get(key);
+    const n = parseInt(hex.slice(1), 16);
+    const target = amt < 0 ? 0 : 255;
+    const p = Math.abs(amt);
+    const c = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map(v => Math.round(lerp(v, target, p)));
+    const out = `rgb(${c[0]},${c[1]},${c[2]})`;
+    shadeCache.set(key, out);
+    return out;
+  }
+
+  const blockHFactor = f => H_BASE + H_PER * f;
+
+  // ---------------------------------------------------------------------
+  // Canvas setup
+  // ---------------------------------------------------------------------
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  let W = 0, H = 0, DPR = 1;
+
+  // Layout values recomputed on every resize.
+  const L = {
+    m: 16, u: 120,
+    tower: { x: 0, y: 0, w: 0, h: 0 },   // drop zone
+    mat: { x: 0, y: 0, w: 0, h: 0 },
+    cx: 0, groundY: 0, platTop: 0,
+  };
+
+  // ---------------------------------------------------------------------
+  // Game state
+  // ---------------------------------------------------------------------
+  const state = {
+    phase: 'start',          // 'start' | 'play' | 'celebrate' | 'between' | 'end'
+    round: 0,                // rounds completed this session
+    tier: 0,                 // index into TIERS
+    blocks: [],
+    nextRank: 0,             // rank (0 = biggest) the tower takes next
+    landed: 0,               // blocks that have settled on the tower
+    drag: null,              // { obj, dx, dy, sx, sy, moved }
+    lastInteraction: 0,
+    roundStart: 0,
+    roundSlips: 0,           // rejected tower drops this round
+    roundAttempts: 0,        // all tower drops this round
+    slotSlips: 0,            // rejected drops since the last accepted block
+    wobbleT0: -1e9,
+    completeAt: 0,           // time to fire completeRound()
+    celebrateStart: 0,
+    bird: null,              // { t0, sang }
+    particles: [],
+  };
+
+  // ---------------------------------------------------------------------
+  // Local progress tracking (localStorage, never leaves the device)
+  // ---------------------------------------------------------------------
+  function freshProgress() {
+    return { version: 1, gamesCompleted: 0, roundsCompleted: 0, blocksPlaced: 0, slips: 0, lastPlayed: null, sessions: [] };
+  }
+
+  function loadProgress() {
+    try {
+      const raw = window.localStorage.getItem(CONFIG.STORAGE_KEY);
+      if (raw) {
+        const data = JSON.parse(raw);
+        if (data && data.version === 1 && Array.isArray(data.sessions)) return data;
+      }
+    } catch (e) {
+      console.warn('[BlockStack] Progress could not be loaded (storage unavailable):', e && e.message);
+    }
+    return freshProgress();
+  }
+
+  function saveProgress() {
+    try {
+      window.localStorage.setItem(CONFIG.STORAGE_KEY, JSON.stringify(progress));
+      log('Progress saved', { gamesCompleted: progress.gamesCompleted, roundsCompleted: progress.roundsCompleted });
+    } catch (e) {
+      console.warn('[BlockStack] Progress could not be saved (storage unavailable):', e && e.message);
+    }
+  }
+
+  const progress = loadProgress();
+  let session = null; // created on the first round of this app launch
+
+  function ensureSession() {
+    if (session) return;
+    session = { startedAt: new Date().toISOString(), finished: false, rounds: [] };
+    progress.sessions.push(session);
+    if (progress.sessions.length > 30) progress.sessions.splice(0, progress.sessions.length - 30);
+  }
+
+  // ---------------------------------------------------------------------
+  // Audio: Web Audio tones + optional spoken words
+  // ---------------------------------------------------------------------
+  let actx = null;
+
+  // Browsers only allow audio after a user gesture, so this runs on every pointer down.
+  function unlockAudio() {
+    if (!actx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) { try { actx = new AC(); } catch (e) { actx = null; } }
+    }
+    if (actx && actx.state === 'suspended') actx.resume();
+  }
+
+  function tone(freq, delay, dur, vol = 0.16, type = 'sine') {
+    if (!actx) return;
+    const t = actx.currentTime + delay;
+    const osc = actx.createOscillator();
+    const gain = actx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(vol, t + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    osc.connect(gain).connect(actx.destination);
+    osc.start(t);
+    osc.stop(t + dur + 0.05);
+  }
+
+  // A pitch sweep: the building block of the wood knock and the bird's song.
+  function sweep(f0, f1, delay, dur, vol, type = 'sine') {
+    if (!actx) return;
+    const t = actx.currentTime + delay;
+    const osc = actx.createOscillator();
+    const gain = actx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(f0, t);
+    osc.frequency.exponentialRampToValueAtTime(f1, t + dur * 0.6);
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(vol, t + 0.005);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    osc.connect(gain).connect(actx.destination);
+    osc.start(t);
+    osc.stop(t + dur + 0.05);
+  }
+
+  // Wooden "tock": a short, quickly falling knock. Each storey of the tower knocks
+  // one step higher, so the child can hear the tower grow.
+  const TOCK = [330, 392, 440, 523.25, 587.33];
+  const playTock = level => {
+    const f = TOCK[Math.min(level, TOCK.length - 1)];
+    sweep(f * 1.7, f, 0, 0.16, 0.28, 'triangle');
+    tone(f * 2.76, 0, 0.06, 0.04);
+  };
+  const playPickup = () => tone(440, 0, 0.08, 0.05, 'triangle');
+  // The bird's song is the same little tune every time (no random rewards).
+  const playBirdSong = () => {
+    [[1760, 2490, 0], [1760, 2490, 0.16], [2090, 2960, 0.42], [1980, 1570, 0.6], [2350, 3140, 0.86], [2350, 3140, 1.0]]
+      .forEach(([a, b, d]) => sweep(a, b, d, 0.12, 0.07));
+  };
+
+  // Spoken words via the Web Speech API. Android WebView usually lacks it,
+  // so this quietly does nothing there and the tones carry the feedback.
+  function say(text) {
+    try {
+      if (!('speechSynthesis' in window)) return;
+      window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'en-US';
+      u.rate = 0.85;
+      u.pitch = 1.15;
+      window.speechSynthesis.speak(u);
+    } catch (e) { /* speech is optional */ }
+  }
+
+  // ---------------------------------------------------------------------
+  // Rounds and difficulty
+  // ---------------------------------------------------------------------
+  function startRound() {
+    ensureSession();
+    const tier = TIERS[state.tier];
+    const colors = shuffle(COLORS.blocks.slice());
+    // Colours are dealt at random so colour never tells the child which block is bigger.
+    state.blocks = tier.sizes.map((f, rank) => ({
+      id: rank, rank, f,
+      color: tier.sameColor ? COLORS.wood : colors[rank % colors.length],
+      seed: Math.random() * 1000,      // fixed wood grain
+      jx: Math.random() * 2 - 1,       // fixed scatter so homes stay put across resizes
+      jy: Math.random() * 2 - 1,
+      jr: (Math.random() * 2 - 1) * 0.07,
+      homeSlot: 0,
+      w: 0, h: 0, x: 0, y: 0, homeX: 0, homeY: 0,
+      state: 'idle',                   // 'idle' | 'drag' | 'return' | 'toTower' | 'placed'
+      anim: null, errors: 0, squashT0: -1e9,
+    }));
+    shuffle(state.blocks.slice()).forEach((b, i) => { b.homeSlot = i; });
+
+    state.nextRank = 0;
+    state.landed = 0;
+    state.roundSlips = 0;
+    state.roundAttempts = 0;
+    state.slotSlips = 0;
+    state.wobbleT0 = -1e9;
+    state.completeAt = 0;
+    state.bird = null;
+    state.particles = [];
+    state.drag = null;
+    computeLayout();
+
+    state.phase = 'play';
+    state.roundStart = now();
+    state.lastInteraction = now();
+    if (state.round === 0) say('Build a tower, from big to small.');
+    log(`Round ${state.round + 1}/${CONFIG.ROUNDS} started at level ${state.tier + 1}: ${tier.sizes.length} blocks${tier.sameColor ? ', same colour' : ''}`);
+  }
+
+  function completeRound() {
+    const t = now();
+    const n = state.blocks.length;
+    const ms = t - state.roundStart;
+    const record = {
+      level: state.tier + 1,
+      blocks: n,
+      firstTry: state.blocks.filter(b => b.errors === 0).length,
+      attempts: state.roundAttempts,
+      slips: state.roundSlips,
+      seconds: Math.round(ms / 100) / 10,
+    };
+
+    session.rounds.push(record);
+    progress.roundsCompleted++;
+    progress.blocksPlaced += n;
+    progress.slips += state.roundSlips;
+    progress.lastPlayed = new Date().toISOString();
+    state.round++;
+    log('Level completed', record);
+
+    const finalRound = state.round >= CONFIG.ROUNDS;
+    if (finalRound) {
+      session.finished = true;
+      progress.gamesCompleted++;
+    } else {
+      // Praise the effort, not the child's "smartness" (growth mindset).
+      say(state.roundSlips > 0 ? 'You kept trying, and you built it!' : 'You built it from big to small!');
+    }
+    saveProgress();
+    adjustDifficulty(record, ms);
+
+    // A little bird flies in and sings on top of the finished tower.
+    state.bird = { t0: t, sang: false };
+    state.phase = 'celebrate';
+    state.celebrateStart = t;
+  }
+
+  // Simple DDA: quick and clean -> one step harder; a real struggle -> one step easier.
+  function adjustDifficulty(record, ms) {
+    const fast = ms / record.blocks <= CONFIG.FAST_MS_PER_BLOCK;
+    const before = state.tier;
+    if (record.slips === 0 && fast) {
+      state.tier = Math.min(TIERS.length - 1, state.tier + 1);
+    } else if (record.slips >= Math.max(3, Math.ceil(record.blocks / 2))) {
+      state.tier = Math.max(0, state.tier - 1);
+    }
+    if (state.tier !== before) log(`Difficulty ${state.tier > before ? 'up' : 'down'}: level ${before + 1} -> ${state.tier + 1}`);
+  }
+
+  function enterEnd() {
+    state.phase = 'end';
+    say('Great job! Time to play outside!');
+    log('Session finished: end screen shown, no replay offered');
+  }
+
+  // ---------------------------------------------------------------------
+  // Layout
+  // ---------------------------------------------------------------------
+  // The tower and the playmat sit side by side or one above the other,
+  // whichever lets the blocks be biggest. The block unit u (width of the
+  // biggest block) is chosen so the whole finished tower, plus room for the
+  // bird, always fits on screen.
+  function computeLayout() {
+    const minDim = Math.min(W, H);
+    const m = clamp(minDim * 0.04, 12, 32);
+    const top = CONFIG.HOME_RESERVE_PX;
+    const tier = TIERS[state.tier];
+    const n = tier.sizes.length;
+    const stackH = tier.sizes.reduce((a, f) => a + blockHFactor(f), 0);
+    const needH = PLATFORM_H + stackH + BIRD_ROOM;
+    const maxH = blockHFactor(1);
+    const cap = Math.min(CONFIG.MAX_UNIT_PX, minDim * 0.6);
+
+    // Biggest u that lets any block rest in any cell of the mat.
+    function matUnit(a) {
+      const pad = m * 0.6;
+      const iw = a.w - pad * 2, ih = a.h - pad * 2;
+      let best = 0;
+      for (let cols = 1; cols <= n; cols++) {
+        const rows = Math.ceil(n / cols);
+        best = Math.max(best, Math.min(iw / cols * 0.85, ih / rows * 0.75 / maxH));
+      }
+      return best;
+    }
+    const towerUnit = a => Math.min(a.w / PLATFORM_W, a.h / needH);
+
+    const options = [];
+    for (const split of [0.4, 0.5, 0.6]) {
+      // Side by side: tower on the left (the home button is on the right, above the mat).
+      const tw = (W - 3 * m) * split;
+      const tower = { x: m, y: m, w: tw, h: H - 2 * m };
+      const mat = { x: 2 * m + tw, y: top, w: W - 3 * m - tw, h: H - top - m };
+      options.push({ tower, mat });
+    }
+    for (const split of [0.5, 0.6, 0.7]) {
+      // Stacked: mat on top (below the home button), tower underneath.
+      const avail = H - top - 2 * m;
+      const mat = { x: m, y: top, w: W - 2 * m, h: avail * (1 - split) };
+      const tower = { x: m, y: top + mat.h + m, w: W - 2 * m, h: avail * split };
+      options.push({ tower, mat });
+    }
+    let best = null;
+    for (const o of options) {
+      if (o.tower.w <= 0 || o.tower.h <= 0 || o.mat.w <= 0 || o.mat.h <= 0) continue;
+      o.u = Math.min(towerUnit(o.tower), matUnit(o.mat), cap);
+      if (!best || o.u > best.u + 0.5) best = o;
+    }
+    if (!best) best = { tower: { x: 0, y: 0, w: W, h: H / 2 }, mat: { x: 0, y: H / 2, w: W, h: H / 2 }, u: 40 };
+
+    const u = Math.max(20, best.u);
+    L.m = m;
+    L.u = u;
+    L.tower = best.tower;
+    L.mat = best.mat;
+    L.cx = best.tower.x + best.tower.w / 2;
+    // The tower is grounded near the bottom of its area; spare room goes above the bird.
+    L.groundY = best.tower.y + best.tower.h - Math.max(0, (best.tower.h - needH * u) * 0.25);
+    L.platTop = L.groundY - PLATFORM_H * u;
+
+    for (const b of state.blocks) { b.w = u * b.f; b.h = u * blockHFactor(b.f); }
+
+    // Mat cells: the grid shape that gives the biggest cells, short last row centred.
+    const pad = m * 0.6;
+    const ix = best.mat.x + pad, iy = best.mat.y + pad, iw = best.mat.w - pad * 2, ih = best.mat.h - pad * 2;
+    let cols = 1, cellScore = -1;
+    for (let c = 1; c <= n; c++) {
+      const r = Math.ceil(n / c);
+      const sc = Math.min(iw / c * 0.85, ih / r * 0.75 / maxH);
+      if (sc > cellScore + 0.5) { cellScore = sc; cols = c; }
+    }
+    const rows = Math.ceil(n / cols);
+    const cw = iw / cols, ch = ih / rows;
+    for (const b of state.blocks) {
+      const i = b.homeSlot;
+      const row = Math.floor(i / cols);
+      const inRow = row === rows - 1 ? n - row * cols : cols;
+      const col = i - row * cols;
+      const off = (cols - inRow) * cw / 2;
+      const slackX = Math.max(0, cw * 0.92 - b.w) / 2;
+      const slackY = Math.max(0, ch * 0.9 - b.h) / 2;
+      b.homeX = ix + off + cw * (col + 0.5) + b.jx * slackX * 0.6;
+      b.homeY = iy + ch * (row + 0.5) + b.jy * slackY * 0.6;
+    }
+    relayoutBlocks();
+  }
+
+  // Centre of the tower storey for a given rank (0 = bottom).
+  function slotPos(rank) {
+    let bottom = L.platTop;
+    for (const b of state.blocks) if (b.rank < rank) bottom -= b.h;
+    const b = blockByRank(rank);
+    return { x: L.cx, y: bottom - (b ? b.h : 0) / 2, bottom };
+  }
+
+  const blockByRank = rank => state.blocks.find(b => b.rank === rank) || null;
+
+  // Keep every block where it belongs after a resize or rotation.
+  function relayoutBlocks() {
+    for (const b of state.blocks) {
+      if (b.state === 'idle') {
+        b.x = b.homeX; b.y = b.homeY;
+      } else if (b.state === 'return' && b.anim) {
+        b.anim.tx = b.homeX; b.anim.ty = b.homeY;
+      } else if (b.state === 'toTower' && b.anim) {
+        const p = slotPos(b.rank);
+        b.anim.tx = p.x; b.anim.ty = p.y;
+      } else if (b.state === 'placed') {
+        const p = slotPos(b.rank);
+        b.x = p.x; b.y = p.y;
+      } else if (b.state === 'drag') {
+        b.x = clamp(b.x, 0, W); b.y = clamp(b.y, 0, H);
+      }
+    }
+  }
+
+  // Generous drop zone: the whole tower area plus a margin.
+  function overTower(b) {
+    const t = L.tower, pad = L.m;
+    return b.x >= t.x - pad && b.x <= t.x + t.w + pad && b.y >= t.y - pad && b.y <= t.y + t.h + pad;
+  }
+
+  // The outline that says "the next block goes here".
+  function ghostRect() {
+    if (state.phase !== 'play' || state.nextRank >= state.blocks.length) return null;
+    if (state.blocks.some(b => b.state === 'toTower')) return null;   // wait until the last one lands
+    const tier = TIERS[state.tier];
+    const next = blockByRank(state.nextRank);
+    const p = slotPos(state.nextRank);
+    let w = next.w, h = next.h;
+    if (!tier.sizedGhost) {
+      // Position only: as wide as the surface it sits on, average height.
+      const below = state.nextRank > 0 ? blockByRank(state.nextRank - 1) : null;
+      w = below ? below.w * 0.9 : L.u * 0.9;
+      h = L.u * blockHFactor(0.75);
+    }
+    return { x: p.x, y: p.bottom - h / 2, w, h };
+  }
+
+  // ---------------------------------------------------------------------
+  // Drag and drop
+  // ---------------------------------------------------------------------
+  // Forgiving pick: each block's grab area is padded to a finger-sized minimum.
+  function pickBlock(p) {
+    let best = null, bestD = Infinity;
+    for (const b of state.blocks) {
+      if (b.state !== 'idle' && b.state !== 'return') continue;
+      const hw = Math.max(b.w * 0.65, CONFIG.MIN_TOUCH_PX / 2);
+      const hh = Math.max(b.h * 0.65, CONFIG.MIN_TOUCH_PX / 2);
+      if (Math.abs(p.x - b.x) > hw || Math.abs(p.y - b.y) > hh) continue;
+      // Normalised distance so a small block next to a big one can still be picked.
+      const d = Math.hypot((p.x - b.x) / hw, (p.y - b.y) / hh);
+      if (d < bestD) { best = b; bestD = d; }
+    }
+    return best;
+  }
+
+  function beginDrag(b, p) {
+    b.state = 'drag';
+    b.anim = null;
+    state.drag = { obj: b, dx: b.x - p.x, dy: b.y - p.y, sx: p.x, sy: p.y, moved: 0 };
+    // Draw the held block on top of the others.
+    state.blocks.splice(state.blocks.indexOf(b), 1);
+    state.blocks.push(b);
+    playPickup();
+    log(`Picked up block of size ${b.f}`);
+  }
+
+  function dropBlock() {
+    const b = state.drag.obj;
+    const wasTap = state.drag.moved < CONFIG.TAP_SLOP_PX;
+    state.drag = null;
+    if (wasTap || !overTower(b)) { sendHome(b); return; }
+
+    state.roundAttempts++;
+    if (b.rank === state.nextRank) {
+      acceptBlock(b);
+    } else {
+      // Control of error: only the biggest block left fits now.
+      b.errors++;
+      state.roundSlips++;
+      state.slotSlips++;
+      state.wobbleT0 = now();
+      log(`Item rejected: block of size ${b.f} is not the biggest left (next is ${blockByRank(state.nextRank).f}), sliding home`);
+      sendHome(b);
+    }
+  }
+
+  function acceptBlock(b) {
+    const p = slotPos(b.rank);
+    state.nextRank++;
+    b.state = 'toTower';
+    b.anim = { fx: b.x, fy: b.y, tx: p.x, ty: p.y, t0: now(), dur: CONFIG.TO_TOWER_MS, kind: 'drop' };
+  }
+
+  // Montessori control of error: the block simply slides back to the mat.
+  function sendHome(b) {
+    b.state = 'return';
+    b.anim = { fx: b.x, fy: b.y, tx: b.homeX, ty: b.homeY, t0: now(), dur: CONFIG.RETURN_MS, kind: 'glide' };
+  }
+
+  // Called when a block settles on the tower.
+  // The knock, the squash and the block settling all happen on the same frame (temporal contiguity).
+  function landOnTower(b, t) {
+    b.state = 'placed';
+    b.squashT0 = t;
+    playTock(state.landed);
+    state.landed++;
+    state.slotSlips = 0;
+    state.lastInteraction = t;
+    log(`Item successfully placed: block of size ${b.f} is storey ${state.landed} of ${state.blocks.length}`);
+    if (state.landed >= state.blocks.length) state.completeAt = t + CONFIG.COMPLETE_DELAY_MS;
+  }
+
+  // Position along an animation. 'drop' carries the block above its storey, then lets it fall.
+  function animPos(a, p) {
+    if (a.kind === 'glide') {
+      const e = easeOutCubic(p);
+      return { x: lerp(a.fx, a.tx, e), y: lerp(a.fy, a.ty, e) };
+    }
+    const lift = L.u * 0.35;
+    const hoverY = Math.min(a.fy, a.ty - lift);
+    if (p < 0.6) {
+      const e = easeInOutQuad(p / 0.6);
+      return { x: lerp(a.fx, a.tx, e), y: lerp(a.fy, hoverY, e) };
+    }
+    const q = (p - 0.6) / 0.4;
+    return { x: a.tx, y: lerp(hoverY, a.ty, q * q) };
+  }
+
+  // ---------------------------------------------------------------------
+  // Input: touch + mouse
+  // ---------------------------------------------------------------------
+  let activeTouch = null;
+  let mouseDown = false;
+  let parentTimer = null;
+
+  function toCanvas(clientX, clientY) {
+    const r = canvas.getBoundingClientRect();
+    return { x: clientX - r.left, y: clientY - r.top };
+  }
+
+  function findTouch(list, id) {
+    for (let i = 0; i < list.length; i++) if (list[i].identifier === id) return list[i];
+    return null;
+  }
+
+  function cancelParentHold() {
+    if (parentTimer) { clearTimeout(parentTimer); parentTimer = null; }
+  }
+
+  function onDown(p) {
+    unlockAudio();
+    state.lastInteraction = now();
+
+    if (state.phase === 'start' || state.phase === 'between') {
+      const g = starGeom();
+      if (Math.hypot(p.x - g.cx, p.y - g.cy) <= g.R * 1.8) { startRound(); return; }
+    } else if (state.phase === 'play' && !state.drag) {
+      const b = pickBlock(p);
+      if (b) { beginDrag(b, p); return; }
+    }
+
+    // Hidden parent view: hold the top-left corner still for 3 seconds.
+    if (p.x < CONFIG.PARENT_CORNER_PX && p.y < CONFIG.PARENT_CORNER_PX) {
+      cancelParentHold();
+      parentTimer = setTimeout(openParent, CONFIG.PARENT_HOLD_MS);
+    }
+  }
+
+  function onMove(p) {
+    if (parentTimer && (p.x >= CONFIG.PARENT_CORNER_PX || p.y >= CONFIG.PARENT_CORNER_PX)) cancelParentHold();
+    if (!state.drag) return;
+    state.lastInteraction = now();
+    const d = state.drag;
+    d.moved = Math.max(d.moved, Math.hypot(p.x - d.sx, p.y - d.sy));
+    d.obj.x = clamp(p.x + d.dx, 0, W);
+    d.obj.y = clamp(p.y + d.dy, 0, H);
+  }
+
+  function onUp() {
+    cancelParentHold();
+    if (state.drag) dropBlock();
+  }
+
+  canvas.addEventListener('touchstart', e => {
+    e.preventDefault();
+    if (activeTouch !== null) return;          // one finger at a time
+    const t = e.changedTouches[0];
+    activeTouch = t.identifier;
+    onDown(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  canvas.addEventListener('touchmove', e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (t) onMove(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  const endTouch = e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (!t) return;
+    activeTouch = null;
+    onUp(toCanvas(t.clientX, t.clientY));
+  };
+  canvas.addEventListener('touchend', endTouch, { passive: false });
+  canvas.addEventListener('touchcancel', endTouch, { passive: false });
+
+  canvas.addEventListener('mousedown', e => { mouseDown = true; onDown(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mousemove', e => { if (mouseDown) onMove(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mouseup', e => {
+    if (!mouseDown) return;
+    mouseDown = false;
+    onUp(toCanvas(e.clientX, e.clientY));
+  });
+
+  // ---------------------------------------------------------------------
+  // Parent view (hidden, local data only)
+  // ---------------------------------------------------------------------
+  const parentEl = document.getElementById('parent');
+  const parentBody = document.getElementById('parentBody');
+
+  function el(tag, text) {
+    const node = document.createElement(tag);
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function openParent() {
+    parentTimer = null;
+    const blocks = progress.sessions.reduce((a, s) => a + s.rounds.reduce((b, r) => b + r.blocks, 0), 0);
+    const firstTry = progress.sessions.reduce((a, s) => a + s.rounds.reduce((b, r) => b + r.firstTry, 0), 0);
+
+    parentBody.textContent = '';
+    parentBody.appendChild(el('div', `Full games finished: ${progress.gamesCompleted}`));
+    parentBody.appendChild(el('div', `Towers built: ${progress.roundsCompleted}`));
+    parentBody.appendChild(el('div', `Blocks stacked: ${progress.blocksPlaced}`));
+    parentBody.appendChild(el('div', `Stacked on the first try: ${blocks ? Math.round(100 * firstTry / blocks) : 0}%`));
+
+    const recent = progress.sessions.slice(-6).reverse();
+    if (recent.length) {
+      const table = el('table');
+      const head = el('tr');
+      ['When', 'Towers', 'Top level', 'Slips'].forEach(h => head.appendChild(el('th', h)));
+      table.appendChild(head);
+      recent.forEach(s => {
+        const tr = el('tr');
+        const when = new Date(s.startedAt);
+        tr.appendChild(el('td', when.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' ' +
+          when.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })));
+        tr.appendChild(el('td', `${s.rounds.length}/${CONFIG.ROUNDS}`));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => Math.max(a, r.level), 0) || '-')));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => a + r.slips, 0))));
+        table.appendChild(tr);
+      });
+      parentBody.appendChild(table);
+    }
+    parentEl.hidden = false;
+    log('Parent view opened', progress);
+  }
+
+  parentEl.addEventListener('click', () => { parentEl.hidden = true; });
+
+  // Read-only debug hooks for the Android/desktop console.
+  window.BlockStack = {
+    progress: () => JSON.parse(JSON.stringify(progress)),
+    state: () => {
+      const gr = ghostRect();
+      const next = state.phase === 'play' && state.nextRank < state.blocks.length ? slotPos(state.nextRank) : null;
+      return {
+        phase: state.phase,
+        round: state.round,
+        level: state.tier + 1,
+        landed: state.landed,
+        nextRank: state.nextRank,
+        star: (state.phase === 'start' || state.phase === 'between') ? { x: starGeom().cx, y: starGeom().cy } : null,
+        tower: { x: L.tower.x, y: L.tower.y, w: L.tower.w, h: L.tower.h, groundY: L.groundY },
+        dropZone: next ? { x: next.x, y: next.y } : null,
+        ghost: gr,
+        bird: state.bird ? { landed: state.bird.sang } : null,
+        blocks: state.blocks.map(b => ({
+          id: b.id, rank: b.rank, size: b.f, x: b.x, y: b.y, w: b.w, h: b.h, state: b.state,
+          correct: b.rank === state.nextRank,
+        })),
+      };
+    },
+  };
+
+  // ---------------------------------------------------------------------
+  // Drawing primitives
+  // ---------------------------------------------------------------------
+  function roundRectPath(x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  function disc(x, y, r, fill) {
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, TAU);
+    ctx.fillStyle = fill;
+    ctx.fill();
+  }
+
+  // A painted wooden block centred on (0, 0): soft bevels, a few grain lines, a knot.
+  function blockBody(b, w, h) {
+    const r = Math.min(w, h) * 0.16;
+    const col = b.color;
+    ctx.beginPath();
+    roundRectPath(-w / 2, -h / 2, w, h, r);
+    ctx.fillStyle = col;
+    ctx.fill();
+
+    ctx.save();
+    ctx.beginPath();
+    roundRectPath(-w / 2, -h / 2, w, h, r);
+    ctx.clip();
+    // Lit top edge and shaded bottom edge give the block some depth.
+    ctx.fillStyle = shade(col, 0.22);
+    ctx.fillRect(-w / 2, -h / 2, w, h * 0.16);
+    ctx.fillStyle = shade(col, -0.1);
+    ctx.fillRect(-w / 2, h / 2 - h * 0.14, w, h * 0.14);
+    // Wood grain: gentle waves, fixed per block.
+    ctx.strokeStyle = shade(col, -0.1);
+    ctx.lineWidth = Math.max(1, h * 0.03);
+    ctx.lineCap = 'round';
+    const lines = 3;
+    for (let i = 0; i < lines; i++) {
+      const yy = -h / 2 + h * (0.3 + 0.2 * i);
+      const ph = b.seed + i * 1.7;
+      ctx.beginPath();
+      for (let k = 0; k <= 12; k++) {
+        const xx = -w / 2 + w * k / 12;
+        const wy = yy + Math.sin(ph + k * 0.9) * h * 0.035;
+        if (k === 0) ctx.moveTo(xx, wy); else ctx.lineTo(xx, wy);
+      }
+      ctx.globalAlpha = 0.55;
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 0.5;
+    const kx = (((b.seed * 7.3) % 1) - 0.5) * w * 0.5;
+    ctx.beginPath();
+    ctx.ellipse(kx, h * 0.04, h * 0.1, h * 0.06, 0, 0, TAU);
+    ctx.stroke();
+    ctx.restore();
+
+    ctx.beginPath();
+    roundRectPath(-w / 2, -h / 2, w, h, r);
+    ctx.lineJoin = 'round';
+    ctx.lineWidth = Math.max(2, Math.min(w, h) * 0.05);
+    ctx.strokeStyle = shade(col, -0.28);
+    ctx.stroke();
+  }
+
+  // Draws a block with its centre at (x, y). squash/stretch is anchored at its bottom.
+  function drawBlock(b, x, y, opts) {
+    const { lifted = false, glow = 0, sx = 1, sy = 1, rot = 0, k = 1 } = opts || {};
+    const w = b.w * k, h = b.h * k;
+    ctx.save();
+    ctx.translate(x, y + h / 2);
+    ctx.rotate(rot);
+    ctx.scale(sx, sy);
+    ctx.translate(0, -h / 2);
+
+    if (glow > 0) {
+      const g = L.u * (0.05 + 0.06 * glow);
+      ctx.globalAlpha = 0.3 + 0.4 * glow;
+      ctx.fillStyle = shade(COLORS.star, 0.3);
+      ctx.beginPath();
+      roundRectPath(-w / 2 - g, -h / 2 - g, w + g * 2, h + g * 2, Math.min(w, h) * 0.16 + g);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+    ctx.shadowColor = 'rgba(60, 45, 30, 0.22)';
+    ctx.shadowBlur = L.u * (lifted ? 0.12 : 0.04);
+    ctx.shadowOffsetY = L.u * (lifted ? 0.08 : 0.02);
+    ctx.beginPath();
+    roundRectPath(-w / 2, -h / 2, w, h, Math.min(w, h) * 0.16);
+    ctx.fillStyle = b.color;
+    ctx.fill();
+    ctx.shadowColor = 'transparent';
+    blockBody(b, w, h);
+    ctx.restore();
+  }
+
+  // The playmat: a soft rug with a stitched border.
+  function drawMat() {
+    const a = L.mat;
+    const r = Math.min(a.w, a.h) * 0.08;
+    ctx.save();
+    ctx.beginPath();
+    roundRectPath(a.x, a.y, a.w, a.h, r);
+    ctx.fillStyle = COLORS.mat;
+    ctx.fill();
+    const ins = Math.min(a.w, a.h) * 0.035 + 4;
+    ctx.beginPath();
+    roundRectPath(a.x + ins, a.y + ins, a.w - ins * 2, a.h - ins * 2, Math.max(2, r - ins * 0.6));
+    ctx.setLineDash([8, 7]);
+    ctx.lineWidth = 2.5;
+    ctx.strokeStyle = COLORS.matStitch;
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // The tower base: a low wooden plinth with a soft floor shadow.
+  function drawPlatform() {
+    const u = L.u;
+    const w = PLATFORM_W * u * 0.96, h = PLATFORM_H * u;
+    const x = L.cx - w / 2, y = L.platTop;
+    ctx.save();
+    ctx.globalAlpha = 0.18;
+    ctx.fillStyle = COLORS.ink;
+    ctx.beginPath();
+    ctx.ellipse(L.cx, L.groundY, w * 0.55, h * 0.35, 0, 0, TAU);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.beginPath();
+    roundRectPath(x, y, w, h, h * 0.35);
+    ctx.fillStyle = COLORS.plank;
+    ctx.fill();
+    ctx.fillStyle = shade(COLORS.plank, 0.2);
+    ctx.fillRect(x + h * 0.3, y + h * 0.12, w - h * 0.6, h * 0.18);
+    ctx.beginPath();
+    roundRectPath(x, y, w, h, h * 0.35);
+    ctx.lineWidth = Math.max(2, h * 0.12);
+    ctx.strokeStyle = shade(COLORS.plank, -0.28);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // Dashed outline where the next block goes. It pulses when the child is idle.
+  function drawGhost(gr, pulse, glow) {
+    if (!gr) return;
+    const w = gr.w * pulse, h = gr.h * pulse;
+    ctx.save();
+    if (glow > 0) {
+      ctx.globalAlpha = 0.2 + 0.3 * glow;
+      ctx.fillStyle = shade(COLORS.star, 0.2);
+      ctx.beginPath();
+      const g = L.u * 0.06;
+      roundRectPath(gr.x - w / 2 - g, gr.y + gr.h / 2 - h - g, w + g * 2, h + g * 2, Math.min(w, h) * 0.2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+    ctx.beginPath();
+    roundRectPath(gr.x - w / 2, gr.y + gr.h / 2 - h, w, h, Math.min(w, h) * 0.16);
+    ctx.fillStyle = 'rgba(255, 253, 248, 0.55)';
+    ctx.fill();
+    ctx.setLineDash([Math.max(5, L.u * 0.05), Math.max(4, L.u * 0.04)]);
+    ctx.lineWidth = Math.max(2, L.u * 0.018);
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = 'rgba(74, 64, 54, 0.4)';
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // A round little songbird facing left. flap: wing angle; sing: beak open 0..1.
+  function drawBird(x, y, s, flap, sing, flying) {
+    ctx.save();
+    ctx.translate(x, y);
+    const lw = Math.max(1.5, s * 0.05);
+    // Tail.
+    ctx.beginPath();
+    ctx.moveTo(s * 0.35, -s * 0.05);
+    ctx.lineTo(s * 0.78, -s * 0.32);
+    ctx.lineTo(s * 0.72, s * 0.05);
+    ctx.closePath();
+    ctx.fillStyle = shade(COLORS.bird, -0.12);
+    ctx.fill();
+    // Legs (tucked while flying).
+    if (!flying) {
+      ctx.strokeStyle = shade(COLORS.beak, -0.2);
+      ctx.lineWidth = lw;
+      ctx.lineCap = 'round';
+      for (const dx of [-0.1, 0.1]) {
+        ctx.beginPath(); ctx.moveTo(s * dx, s * 0.36); ctx.lineTo(s * dx, s * 0.5); ctx.stroke();
+      }
+    }
+    // Body and belly.
+    ctx.beginPath();
+    ctx.ellipse(0, 0, s * 0.46, s * 0.4, 0, 0, TAU);
+    ctx.fillStyle = COLORS.bird;
+    ctx.fill();
+    ctx.lineWidth = lw;
+    ctx.strokeStyle = shade(COLORS.bird, -0.25);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.ellipse(-s * 0.08, s * 0.12, s * 0.26, s * 0.22, 0, 0, TAU);
+    ctx.fillStyle = COLORS.birdBelly;
+    ctx.fill();
+    // Wing, pivoting at the shoulder.
+    ctx.save();
+    ctx.translate(s * 0.1, -s * 0.04);
+    ctx.rotate(flap);
+    ctx.beginPath();
+    ctx.ellipse(s * 0.12, 0, s * 0.24, s * 0.14, 0.35, 0, TAU);
+    ctx.fillStyle = shade(COLORS.bird, -0.1);
+    ctx.fill();
+    ctx.strokeStyle = shade(COLORS.bird, -0.28);
+    ctx.stroke();
+    ctx.restore();
+    // Beak: two halves that part while singing.
+    const open = s * 0.09 * sing;
+    ctx.fillStyle = COLORS.beak;
+    ctx.beginPath();
+    ctx.moveTo(-s * 0.4, -s * 0.12);
+    ctx.lineTo(-s * 0.64, -s * 0.06 - open);
+    ctx.lineTo(-s * 0.4, -s * 0.02);
+    ctx.closePath();
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(-s * 0.4, -s * 0.02);
+    ctx.lineTo(-s * 0.6, -s * 0.03 + open);
+    ctx.lineTo(-s * 0.4, s * 0.04);
+    ctx.closePath();
+    ctx.fill();
+    // Eye and cheek.
+    disc(-s * 0.2, -s * 0.14, s * 0.055, COLORS.ink);
+    disc(-s * 0.215, -s * 0.16, s * 0.02, '#fff');
+    ctx.globalAlpha = 0.45;
+    ctx.beginPath();
+    ctx.ellipse(-s * 0.2, s * 0.02, s * 0.07, s * 0.045, 0, 0, TAU);
+    ctx.fillStyle = COLORS.cheek;
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // A small music note that floats up from the singing bird.
+  function drawNote(x, y, s, alpha) {
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = COLORS.ink;
+    ctx.strokeStyle = COLORS.ink;
+    ctx.lineWidth = Math.max(1.5, s * 0.12);
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.ellipse(x, y, s * 0.28, s * 0.2, -0.4, 0, TAU);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(x + s * 0.24, y - s * 0.05);
+    ctx.lineTo(x + s * 0.24, y - s * 0.95);
+    ctx.quadraticCurveTo(x + s * 0.5, y - s * 0.75, x + s * 0.6, y - s * 0.5);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawStar(cx, cy, R, fill, face) {
+    ctx.save();
+    ctx.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const rad = i % 2 === 0 ? R : R * 0.5;
+      const a = -Math.PI / 2 + i * Math.PI / 5;
+      const x = cx + rad * Math.cos(a), y = cy + rad * Math.sin(a);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    ctx.lineJoin = 'round';
+    if (fill) {
+      ctx.fillStyle = fill;
+      ctx.fill();
+      ctx.strokeStyle = fill;            // same-colour stroke rounds the tips
+      ctx.lineWidth = Math.max(2, R * 0.16);
+      ctx.stroke();
+    } else {
+      ctx.strokeStyle = 'rgba(74, 64, 54, 0.25)';
+      ctx.lineWidth = Math.max(2, R * 0.14);
+      ctx.stroke();
+    }
+
+    if (face) {
+      ctx.fillStyle = COLORS.ink;
+      ctx.beginPath(); ctx.arc(cx - R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.arc(cx + R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.strokeStyle = COLORS.ink;
+      ctx.lineWidth = Math.max(2, R * 0.05);
+      ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.arc(cx, cy + R * 0.06, R * 0.17, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+      ctx.globalAlpha = 0.35;
+      ctx.fillStyle = COLORS.cheek;
+      ctx.beginPath(); ctx.ellipse(cx - R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(cx + R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // Same ring of sparkles from the tower top, every time (no random rewards).
+  function spawnParticles(x, y, t) {
+    for (let i = 0; i < 10; i++) {
+      const a = -Math.PI / 2 + (i - 4.5) * 0.32;
+      state.particles.push({ x0: x, y0: y, dx: Math.cos(a), dy: Math.sin(a), dist: L.u * 0.7, t0: t, life: 900, color: i % 2 ? COLORS.star : COLORS.blocks[i % COLORS.blocks.length] });
+    }
+  }
+
+  function drawParticles(t) {
+    state.particles = state.particles.filter(p => t - p.t0 < p.life);
+    for (const p of state.particles) {
+      const k = (t - p.t0) / p.life;
+      const e = easeOutCubic(k);
+      ctx.globalAlpha = 1 - k;
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x0 + p.dx * p.dist * e, p.y0 + p.dy * p.dist * e, L.u * 0.03 * (1 - k * 0.5), 0, TAU);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------------------------------------------------------------------
+  // Screens
+  // ---------------------------------------------------------------------
+  function starGeom() {
+    return { cx: W / 2, cy: H * 0.42, R: Math.min(W, H) * 0.2 };
+  }
+
+  // Start and between-round screen: one big pulsing star to tap, plus 5 slots
+  // that fill up so the child can see the end coming.
+  function drawStarScreen(t) {
+    const { cx, cy, R } = starGeom();
+    const amp = reduceMotion ? 0.03 : 0.07;
+    const k = 1 + amp * (0.5 - 0.5 * Math.cos(TAU * t / 1400));
+    drawStar(cx, cy, R * k, COLORS.star, true);
+
+    const sr = R * 0.16, gap = sr * 2.8, y = cy + R * 1.35;
+    for (let i = 0; i < CONFIG.ROUNDS; i++) {
+      drawStar(cx + (i - (CONFIG.ROUNDS - 1) / 2) * gap, y, sr, i < state.round ? COLORS.star : null, false);
+    }
+  }
+
+  function fitFont(text, weight, size, maxW) {
+    ctx.font = `${weight} ${size}px ${FONT}`;
+    while (size > 12 && ctx.measureText(text).width > maxW) {
+      size -= 1;
+      ctx.font = `${weight} ${size}px ${FONT}`;
+    }
+    return size;
+  }
+
+  // Static end screen. No buttons: the session is over.
+  function drawEnd() {
+    const gh = H * 0.14;
+    ctx.fillStyle = COLORS.grass;
+    ctx.beginPath();
+    ctx.moveTo(0, H - gh);
+    ctx.quadraticCurveTo(W / 2, H - gh * 1.5, W, H - gh);
+    ctx.lineTo(W, H);
+    ctx.lineTo(0, H);
+    ctx.closePath();
+    ctx.fill();
+
+    const R = Math.min(W, H) * 0.2;
+    const cy = H * 0.36;
+    drawStar(W / 2, cy, R, COLORS.star, true);
+
+    const big = clamp(Math.min(W, H) * 0.1, 26, 68);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = COLORS.ink;
+    const top = cy + R * 1.25;
+    fitFont('Great Job!', 800, big, W * 0.9);
+    ctx.fillText('Great Job!', W / 2, top + big * 0.5);
+    fitFont('Time to play outside!', 700, Math.round(big * 0.62), W * 0.9);
+    ctx.fillText('Time to play outside!', W / 2, top + big * 1.55);
+  }
+
+  // Idle pulse of the outline and blocks, and which block (if any) glows as a hint.
+  function guidance(t) {
+    const out = { pulse: 1, wave: 0, idle: false, hint: null, glow: 0, ghostGlow: 0 };
+    if (state.phase !== 'play') return out;
+    const right = state.blocks.find(b => b.rank === state.nextRank) || null;
+
+    if (state.drag) {
+      // Holding the right block after repeated slips: the outline glows to say "here".
+      if (state.slotSlips >= 2 && state.drag.obj === right) out.ghostGlow = 0.5 + 0.5 * Math.sin(TAU * t / 1300);
+      return out;
+    }
+
+    const idle = t - state.lastInteraction;
+    if (idle <= CONFIG.IDLE_PULSE_MS) return out;
+    out.idle = true;
+    out.wave = idle - CONFIG.IDLE_PULSE_MS;
+    const w = 0.5 - 0.5 * Math.cos(TAU * out.wave / 1300);
+    out.pulse = 1 + (reduceMotion ? 0.02 : 0.05) * w;
+
+    // Scaffolding: glow the biggest block left after 2 slips, or in the very first
+    // round if the child has not found the mechanic yet.
+    const tutorial = state.round === 0 && state.landed === 0 && state.roundAttempts === 0 && idle > CONFIG.TUTORIAL_HINT_MS;
+    if (right && (right.state === 'idle' || right.state === 'return') && (state.slotSlips >= 2 || tutorial)) {
+      out.hint = right;
+      out.glow = w;
+      out.ghostGlow = w * 0.6;
+    }
+    return out;
+  }
+
+  // Squash-and-bounce after landing: squash first, a little stretch, then still.
+  function squashScale(b, t) {
+    const k = (t - b.squashT0) / CONFIG.SQUASH_MS;
+    if (k < 0 || k >= 1 || reduceMotion) return { sx: 1, sy: 1 };
+    const s = Math.exp(-4.5 * k) * Math.cos(k * TAU * 1.25);
+    return { sx: 1 + 0.1 * s, sy: 1 - 0.15 * s };
+  }
+
+  // Where the bird is and what it is doing at time t.
+  function birdPose(t) {
+    const top = slotPos(state.blocks.length);   // the top surface of the finished tower
+    const s = L.u * 0.34;
+    const sitX = L.cx, sitY = top.bottom - s * 0.5;
+    const flyMs = reduceMotion ? 300 : CONFIG.BIRD_FLY_MS;
+    const k = (t - state.bird.t0) / flyMs;
+    if (k < 1) {
+      const sx = Math.min(W + s, sitX + Math.max(W * 0.6, L.u * 2)), sy = Math.max(-s, sitY - H * 0.45);
+      const cx = lerp(sx, sitX, 0.5), cy = Math.min(sy, sitY) - L.u * 0.4;
+      const e = easeInOutQuad(clamp(k, 0, 1));
+      const x = (1 - e) * (1 - e) * sx + 2 * (1 - e) * e * cx + e * e * sitX;
+      const y = (1 - e) * (1 - e) * sy + 2 * (1 - e) * e * cy + e * e * sitY;
+      return { x, y, s, flap: Math.sin(t / 60) * 0.9 - 0.3, sing: 0, flying: true, landT: state.bird.t0 + flyMs };
+    }
+    const st = t - state.bird.t0 - flyMs;
+    const sing = st < CONFIG.BIRD_SING_MS ? Math.max(0, Math.sin(st / 80)) : 0;
+    const hop = !reduceMotion && st < CONFIG.BIRD_SING_MS ? Math.abs(Math.sin(st / 260)) * s * 0.1 : 0;
+    return { x: sitX, y: sitY - hop, s, flap: 0.1, sing, flying: false, landT: state.bird.t0 + flyMs };
+  }
+
+  function drawPlay(t) {
+    const g = guidance(t);
+    drawMat();
+
+    // Blocks resting on (or gliding back to) the mat.
+    for (const b of state.blocks) {
+      if (b.state !== 'idle' && b.state !== 'return') continue;
+      let k = 1;
+      if (g.idle && b.state === 'idle' && b !== g.hint) {
+        k = 1 + (reduceMotion ? 0.015 : 0.035) * (0.5 - 0.5 * Math.cos(TAU * (g.wave - b.homeSlot * 200) / 1400));
+      }
+      drawBlock(b, b.x, b.y, { rot: b.state === 'idle' ? b.jr : 0, glow: b === g.hint ? g.glow : 0, k });
+    }
+
+    // The tower: base, settled blocks and the outline, wobbling together on a wrong drop.
+    const wk = (t - state.wobbleT0) / CONFIG.WOBBLE_MS;
+    const wobble = wk >= 0 && wk < 1 ? (reduceMotion ? 0.01 : 0.035) * Math.sin(wk * TAU * 2) * (1 - wk) : 0;
+    ctx.save();
+    ctx.translate(L.cx, L.groundY);
+    ctx.rotate(wobble);
+    ctx.translate(-L.cx, -L.groundY);
+    drawPlatform();
+    for (const b of state.blocks) {
+      if (b.state !== 'placed') continue;
+      const sq = squashScale(b, t);
+      drawBlock(b, b.x, b.y, sq);
+    }
+    drawGhost(ghostRect(), g.idle ? g.pulse : 1, g.ghostGlow);
+    ctx.restore();
+
+    for (const b of state.blocks) if (b.state === 'toTower') drawBlock(b, b.x, b.y, { lifted: true });
+    if (state.drag) {
+      const b = state.drag.obj;
+      drawBlock(b, b.x, b.y, { lifted: true, k: 1.04 });
+    }
+
+    if (state.bird) {
+      const p = birdPose(t);
+      drawBird(p.x, p.y, p.s, p.flap, p.sing, p.flying);
+      if (!p.flying && !reduceMotion) {
+        const st = t - p.landT;
+        for (let i = 0; i < 3; i++) {
+          const nk = (st - i * 420) / 1100;
+          if (nk > 0 && nk < 1) drawNote(p.x - p.s * (0.5 + 0.35 * i), p.y - p.s * (0.5 + nk * 1.4), p.s * 0.45, 1 - nk);
+        }
+      }
+    }
+    drawParticles(t);
+  }
+
+  // ---------------------------------------------------------------------
+  // Main loop
+  // ---------------------------------------------------------------------
+  function update(t) {
+    for (const b of state.blocks) {
+      const a = b.anim;
+      if (!a) continue;
+      const p = clamp((t - a.t0) / a.dur, 0, 1);
+      const pos = animPos(a, p);
+      b.x = pos.x;
+      b.y = pos.y;
+      if (p >= 1) {
+        b.anim = null;
+        if (b.state === 'return') b.state = 'idle';
+        else if (b.state === 'toTower') landOnTower(b, t);
+      }
+    }
+
+    if (state.phase === 'play' && state.completeAt && t >= state.completeAt) {
+      state.completeAt = 0;
+      completeRound();
+    }
+
+    if (state.phase === 'celebrate') {
+      // The song starts on the frame the bird touches down.
+      if (state.bird && !state.bird.sang) {
+        const p = birdPose(t);
+        if (!p.flying) {
+          state.bird.sang = true;
+          playBirdSong();
+          spawnParticles(p.x, p.y + p.s * 0.5, t);
+          log('Bird landed on the finished tower and sang');
+        }
+      }
+      if (t - state.celebrateStart >= CONFIG.CELEBRATE_MS) {
+        if (state.round >= CONFIG.ROUNDS) enterEnd();
+        else state.phase = 'between';
+      }
+    }
+  }
+
+  function render(t) {
+    ctx.fillStyle = COLORS.bg;
+    ctx.fillRect(0, 0, W, H);
+    if (state.phase === 'start' || state.phase === 'between') drawStarScreen(t);
+    else if (state.phase === 'play' || state.phase === 'celebrate') drawPlay(t);
+    else if (state.phase === 'end') drawEnd();
+  }
+
+  let rafId = 0;
+  function frame(t) {
+    update(t);
+    render(t);
+    // The end screen is static: stop the loop entirely.
+    if (state.phase !== 'end') rafId = requestAnimationFrame(frame);
+  }
+
+  function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    DPR = Math.min(window.devicePixelRatio || 1, 2.5);
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    computeLayout();
+    if (state.phase === 'end') render(now());
+  }
+
+  window.addEventListener('resize', resize);
+  window.addEventListener('orientationchange', resize);
+
+  resize();
+  log('Game loaded', { roundsPerSession: CONFIG.ROUNDS, gamesCompletedBefore: progress.gamesCompleted });
+  rafId = requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,1727 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Feelings Faces</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
+  body {
+    background: #F6F1E7;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  canvas { display: block; width: 100%; height: 100%; }
+
+  #home {
+    position: fixed; top: max(10px, env(safe-area-inset-top)); right: max(10px, env(safe-area-inset-right));
+    width: 52px; height: 52px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+    background: rgba(255, 253, 248, 0.85); box-shadow: 0 2px 8px rgba(74, 64, 54, 0.15);
+    -webkit-tap-highlight-color: transparent; z-index: 5;
+  }
+  #home:active { transform: scale(0.94); }
+
+  /* Hidden parent view: press and hold the top-left corner for 3 seconds. */
+  #parent {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: rgba(74, 64, 54, 0.55); padding: 16px; box-sizing: border-box; z-index: 10;
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #4A4036;
+  }
+  #parent[hidden] { display: none; }
+  #parent .card { background: #FFFDF8; border-radius: 16px; padding: 20px 22px; max-width: 400px; width: 100%; max-height: 100%; overflow-y: auto; box-sizing: border-box; box-shadow: 0 10px 30px rgba(0,0,0,0.18); }
+  #parent h2 { margin: 0 0 10px; font-size: 18px; }
+  #parent h3 { margin: 14px 0 0; font-size: 15px; }
+  #parent table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 13px; }
+  #parent th, #parent td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #EDE5D6; }
+  #parent .hint { margin: 12px 0 0; font-size: 12px; opacity: 0.7; }
+</style>
+</head>
+<body>
+<canvas id="game" aria-label="Feelings faces game"></canvas>
+<a id="home" href="../../index.html" aria-label="Home">
+  <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><path d="M4 11.5 12 5l8 6.5V19a1 1 0 0 1-1 1h-4.5v-5h-5v5H5a1 1 0 0 1-1-1z" fill="none" stroke="#4A4036" stroke-width="2" stroke-linejoin="round"/></svg>
+</a>
+
+<div id="parent" hidden>
+  <div class="card">
+    <h2>Progress on this device</h2>
+    <div id="parentBody"></div>
+    <p class="hint">Stored only on this device. Tap anywhere to close.</p>
+  </div>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  /* =====================================================================
+   * EMOTION RECOGNITION: "FEELINGS FACES"
+   * ELOF domain: Social and Emotional Development (emotional functioning:
+   *              recognising feelings in others, linking a situation to a
+   *              feeling, and hearing a healthy way to respond).
+   *
+   * Design rules this file follows (from the brief):
+   *  - Coherence: one small scene with a friend whose face is blank, and a
+   *    few face tokens. No score, no menus, no text.
+   *  - Control of error: a wrong face dropped on the friend glides back home;
+   *    a wrong tap gives that face a soft wobble. No buzzer, no red X.
+   *  - Forgiving hitboxes: the whole friend (and far around it) is the drop
+   *    zone; face tokens are picked from 1.5x their radius.
+   *  - Visual prompts: the blank face breathes and the tokens bob gently when
+   *    the child is idle; after two slips the right face glows.
+   *  - Self-paced: no timers anywhere the child can see or feel.
+   *  - Natural stopping point: 5 rounds of 2 scenes, then a static "play
+   *    outside" screen with no "play again" button.
+   * ===================================================================== */
+
+  // ---------------------------------------------------------------------
+  // Configuration
+  // ---------------------------------------------------------------------
+  const CONFIG = {
+    ROUNDS: 5,                     // hard session limit (natural stopping point)
+    SCENES_PER_ROUND: 2,
+    STORAGE_KEY: 'emotion-recognition.v1',
+    IDLE_PULSE_MS: 1500,           // idle time before the blank face and tokens pulse
+    TUTORIAL_HINT_MS: 5000,        // first scene: idle time before the right face glows
+    HINT_AFTER_SLIPS: 2,           // slips on one scene before the right face glows
+    RETURN_MS: 380,                // wrong drop: glide-home duration
+    FLY_MS: 300,                   // right answer: face flies onto the friend
+    WOBBLE_MS: 420,                // wrong tap: soft wobble
+    FEEL_MS: 4200,                 // friend shows the feeling while the voice names it
+    SWAP_MS: 700,                  // slide from the first scene to the second
+    CHEER_MS: 700,                 // friend hop during the round celebration
+    CELEBRATE_MS: 1600,            // round-complete celebration length
+    FAST_MS_PER_SCENE: 7000,       // "quick" threshold for difficulty step-up
+    PARENT_HOLD_MS: 3000,          // hold time for the hidden parent view
+    PARENT_CORNER_PX: 80,
+    HOME_RESERVE_PX: 72,           // top-right corner kept clear for the home button
+    TAP_SLOP_PX: 12,               // movement below this is a tap, not a drop
+  };
+
+  const COLORS = {
+    bg: '#F6F1E7',
+    ink: '#4A4036',
+    skin: '#FFF4E4',               // face oval on friends and on tokens
+    mouth: '#9A6450',
+    tongue: '#F2A0A8',
+    tear: '#8FB8DE',
+    star: '#F6C85F',
+    grass: '#B9D7A8',
+    cheek: '#F2A88A',
+    panelEdge: '#E6DCCB',
+  };
+
+  // Ladder order: each tier adds one feeling.
+  const EMOTIONS = ['happy', 'sad', 'surprised', 'scared', 'angry'];
+
+  // Difficulty ladder for dynamic difficulty adjustment (scaffolding).
+  const TIERS = [
+    { faces: ['happy', 'sad'] },                                   // the two clearest opposites
+    { faces: ['happy', 'sad', 'surprised'] },
+    { faces: ['happy', 'sad', 'surprised', 'scared'] },
+    { faces: ['happy', 'sad', 'surprised', 'scared', 'angry'] },   // all five
+  ];
+
+  // Each scene: the feeling it shows, where the friend stands (scene units,
+  // 400 x 300) and the healthy response the voice models afterwards.
+  const SCENES = [
+    { id: 'birthday',  emotion: 'happy',     cx: 150, cy: 172, response: "Let's sing together!" },
+    { id: 'balloons',  emotion: 'happy',     cx: 160, cy: 174, response: "Let's share a big smile!" },
+    { id: 'brokenToy', emotion: 'sad',       cx: 150, cy: 172, response: 'A hug can help.' },
+    { id: 'iceCream',  emotion: 'sad',       cx: 155, cy: 172, response: "It's okay to feel sad. A hug can help." },
+    { id: 'storm',     emotion: 'scared',    cx: 140, cy: 174, response: 'Holding hands can help.' },
+    { id: 'tower',     emotion: 'angry',     cx: 150, cy: 172, response: "Let's take a big breath." },
+    { id: 'gift',      emotion: 'surprised', cx: 150, cy: 172, response: 'Wow, what a surprise!' },
+  ];
+
+  const FRIENDS = [
+    { name: 'Mia',  body: '#E8B4C8', hair: 'bow' },
+    { name: 'Leo',  body: '#8FB8DE', hair: 'tuft' },
+    { name: 'Ava',  body: '#9CCB9A', hair: 'puffs' },
+    { name: 'Sam',  body: '#B8A9D9', hair: 'curl' },
+    { name: 'Noah', body: '#F2A88A', hair: 'tuft' },
+  ];
+
+  const CHAR_R = 62;               // friend body radius in scene units
+  const SCENE_W = 400, SCENE_H = 300;
+  const FONT = 'ui-rounded, "Arial Rounded MT Bold", "Nunito", system-ui, -apple-system, sans-serif';
+  const TAU = Math.PI * 2;
+  const reduceMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+
+  // ---------------------------------------------------------------------
+  // Small helpers
+  // ---------------------------------------------------------------------
+  const now = () => performance.now();
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const easeOutCubic = t => 1 - Math.pow(1 - t, 3);
+  const easeInOutQuad = t => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
+  const easeOutBack = t => 1 + 2.2 * Math.pow(t - 1, 3) + 1.2 * Math.pow(t - 1, 2);
+  const log = (...args) => console.log('[Emotions]', ...args);
+
+  function shuffle(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }
+
+  // Mix a hex colour toward black (amt < 0) or white (amt > 0).
+  const shadeCache = new Map();
+  function shade(hex, amt) {
+    const key = hex + amt;
+    if (shadeCache.has(key)) return shadeCache.get(key);
+    const n = parseInt(hex.slice(1), 16);
+    const target = amt < 0 ? 0 : 255;
+    const p = Math.abs(amt);
+    const c = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map(v => Math.round(lerp(v, target, p)));
+    const out = `rgb(${c[0]},${c[1]},${c[2]})`;
+    shadeCache.set(key, out);
+    return out;
+  }
+
+  // ---------------------------------------------------------------------
+  // Canvas setup
+  // ---------------------------------------------------------------------
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  let W = 0, H = 0, DPR = 1;
+
+  // Layout values recomputed on every resize.
+  const L = {
+    m: 16,
+    panel: { x: 0, y: 0, w: 400, h: 300 },   // the scene card on screen
+    sc: 1, ox: 0, oy: 0,                     // scene units -> screen pixels
+    tokR: 40,                                // face token radius
+  };
+
+  // ---------------------------------------------------------------------
+  // Game state
+  // ---------------------------------------------------------------------
+  const state = {
+    phase: 'start',          // 'start' | 'play' | 'celebrate' | 'between' | 'end'
+    round: 0,                // rounds completed this session
+    tier: 0,                 // index into TIERS
+    scenes: [],              // this round's scenes: { def, friend, faceOn, feelT0, cheerT0 }
+    sceneIdx: 0,
+    scenePhase: 'ask',       // 'ask' | 'feel' | 'swap'
+    swapT0: 0,
+    tokens: [],
+    drag: null,              // { tok, dx, dy, sx, sy, moved }
+    lastInteraction: 0,
+    lastSceneId: null,
+    roundStart: 0,
+    roundSlips: 0,           // wrong drops + wrong taps this round
+    roundAttempts: 0,        // every answer the friend received
+    roundFirstTry: 0,        // scenes solved with no slip
+    roundAnswerMs: 0,        // time spent answering (excludes feeling + slide animations)
+    askStart: 0,             // when the current scene started asking
+    sceneSlips: 0,
+    solvedAny: false,        // has the child found the mechanic yet (tutorial hint)
+    celebrateStart: 0,
+    particles: [],
+  };
+
+  const currentScene = () => state.scenes[state.sceneIdx] || null;
+
+  // ---------------------------------------------------------------------
+  // Local progress tracking (localStorage, never leaves the device)
+  // ---------------------------------------------------------------------
+  function freshProgress() {
+    const feelings = {};
+    EMOTIONS.forEach(e => { feelings[e] = { seen: 0, firstTry: 0 }; });
+    return { version: 1, gamesCompleted: 0, roundsCompleted: 0, scenesSolved: 0, slips: 0, feelings, lastPlayed: null, sessions: [] };
+  }
+
+  function loadProgress() {
+    try {
+      const raw = window.localStorage.getItem(CONFIG.STORAGE_KEY);
+      if (raw) {
+        const data = JSON.parse(raw);
+        if (data && data.version === 1 && Array.isArray(data.sessions)) {
+          const fresh = freshProgress();
+          data.feelings = Object.assign(fresh.feelings, data.feelings || {});
+          return data;
+        }
+      }
+    } catch (e) {
+      console.warn('[Emotions] Progress could not be loaded (storage unavailable):', e && e.message);
+    }
+    return freshProgress();
+  }
+
+  function saveProgress() {
+    try {
+      window.localStorage.setItem(CONFIG.STORAGE_KEY, JSON.stringify(progress));
+      log('Progress saved', { gamesCompleted: progress.gamesCompleted, roundsCompleted: progress.roundsCompleted });
+    } catch (e) {
+      console.warn('[Emotions] Progress could not be saved (storage unavailable):', e && e.message);
+    }
+  }
+
+  const progress = loadProgress();
+  let session = null; // created on the first round of this app launch
+
+  function ensureSession() {
+    if (session) return;
+    session = { startedAt: new Date().toISOString(), finished: false, rounds: [] };
+    progress.sessions.push(session);
+    if (progress.sessions.length > 30) progress.sessions.splice(0, progress.sessions.length - 30);
+  }
+
+  // ---------------------------------------------------------------------
+  // Audio: Web Audio tones + optional spoken words
+  // ---------------------------------------------------------------------
+  let actx = null;
+
+  // Browsers only allow audio after a user gesture, so this runs on every pointer down.
+  function unlockAudio() {
+    if (!actx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) { try { actx = new AC(); } catch (e) { actx = null; } }
+    }
+    if (actx && actx.state === 'suspended') actx.resume();
+  }
+
+  function tone(freq, delay, dur, vol = 0.16, type = 'sine') {
+    if (!actx) return;
+    const t = actx.currentTime + delay;
+    const osc = actx.createOscillator();
+    const gain = actx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(vol, t + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    osc.connect(gain).connect(actx.destination);
+    osc.start(t);
+    osc.stop(t + dur + 0.05);
+  }
+
+  // Each feeling always plays the same soft note when it lands: predictable feedback.
+  const FEEL_NOTE = { happy: 659.25, sad: 440, surprised: 783.99, scared: 493.88, angry: 392 };
+  const playPickup = () => tone(440, 0, 0.08, 0.05, 'triangle');
+  const playWobble = () => tone(220, 0, 0.12, 0.05, 'triangle');
+  const playChime = e => { const f = FEEL_NOTE[e]; tone(f, 0, 0.35); tone(f * 1.5, 0.07, 0.4, 0.1); };
+  const playSwap = () => tone(587.33, 0, 0.18, 0.05, 'triangle');
+  const playRoundDone = () => [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => tone(f, i * 0.12, 0.5, 0.12));
+
+  // Spoken words via the Web Speech API. Android WebView usually lacks it,
+  // so this quietly does nothing there and the tones carry the feedback.
+  function say(text) {
+    try {
+      if (!('speechSynthesis' in window)) return;
+      window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'en-US';
+      u.rate = 0.85;
+      u.pitch = 1.15;
+      window.speechSynthesis.speak(u);
+    } catch (e) { /* speech is optional */ }
+  }
+
+  // ---------------------------------------------------------------------
+  // Rounds, scenes and difficulty
+  // ---------------------------------------------------------------------
+  // Two different scenes (and, when possible, two different feelings) per round.
+  function pickScenes(faces) {
+    const eligible = shuffle(SCENES.filter(s => faces.includes(s.emotion)));
+    const first = eligible.find(s => s.id !== state.lastSceneId) || eligible[0];
+    const second = eligible.find(s => s !== first && s.emotion !== first.emotion) ||
+      eligible.find(s => s !== first) || first;
+    return [first, second];
+  }
+
+  function startRound() {
+    ensureSession();
+    const faces = TIERS[state.tier].faces;
+    const friends = shuffle(FRIENDS.slice());
+    state.scenes = pickScenes(faces).map((def, i) => ({ def, friend: friends[i], faceOn: null, feelT0: 0, cheerT0: -1e9 }));
+    state.sceneIdx = 0;
+    state.roundSlips = 0;
+    state.roundAttempts = 0;
+    state.roundFirstTry = 0;
+    state.roundAnswerMs = 0;
+    state.particles = [];
+    state.drag = null;
+    setupScene();
+
+    state.phase = 'play';
+    state.roundStart = now();
+    state.lastInteraction = now();
+    askPrompt();
+    log(`Round ${state.round + 1}/${CONFIG.ROUNDS} started at level ${state.tier + 1}: faces ${faces.join(', ')}; scenes ${state.scenes.map(s => s.def.id).join(', ')}`);
+  }
+
+  // Fresh, reshuffled face tokens for the current scene.
+  function setupScene() {
+    const faces = TIERS[state.tier].faces;
+    state.tokens = shuffle(faces.slice()).map((emotion, i) => ({
+      emotion, slot: i,
+      x: 0, y: 0, homeX: 0, homeY: 0, scale: 1,
+      state: 'idle',             // 'idle' | 'drag' | 'return' | 'fly' | 'placed'
+      anim: null, wobbleT0: -1e9,
+    }));
+    state.sceneSlips = 0;
+    state.scenePhase = 'ask';
+    state.drag = null;
+    computeLayout();
+  }
+
+  function askPrompt() {
+    const sc = currentScene();
+    state.askStart = now();
+    const name = sc.friend.name;
+    if (state.round === 0 && state.sceneIdx === 0) say(`How does ${name} feel? Find ${name}'s face.`);
+    else say(`How does ${name} feel?`);
+    log(`Scene ${state.sceneIdx + 1}/${CONFIG.SCENES_PER_ROUND}: ${sc.def.id} (${name}), answer: ${sc.def.emotion}`);
+  }
+
+  // The face has landed on the friend: sound, face and feeling start on the same frame.
+  function placeFace(tok, t) {
+    const sc = currentScene();
+    tok.state = 'placed';
+    sc.faceOn = tok.emotion;
+    sc.feelT0 = t;
+    state.scenePhase = 'feel';
+    state.solvedAny = true;
+    state.roundAnswerMs += t - state.askStart;
+    if (state.sceneSlips === 0) state.roundFirstTry++;
+    const stats = progress.feelings[tok.emotion];
+    if (stats) { stats.seen++; if (state.sceneSlips === 0) stats.firstTry++; }
+    playChime(tok.emotion);
+    say(`${sc.friend.name} feels ${tok.emotion}. ${sc.def.response}`);
+    log(`Answer accepted: ${tok.emotion} on ${sc.friend.name} (${sc.def.id}), slips on this scene: ${state.sceneSlips}`);
+  }
+
+  // After the feeling has been shown: slide to the next scene, or finish the round.
+  function finishScene(t) {
+    if (state.sceneIdx + 1 < CONFIG.SCENES_PER_ROUND) {
+      state.sceneIdx++;
+      state.lastSceneId = currentScene().def.id;
+      setupScene();
+      state.scenePhase = 'swap';
+      state.swapT0 = t;
+      playSwap();
+    } else {
+      state.lastSceneId = currentScene().def.id;
+      completeRound();
+    }
+  }
+
+  function completeRound() {
+    const t = now();
+    const ms = t - state.roundStart;
+    const record = {
+      level: state.tier + 1,
+      faces: TIERS[state.tier].faces.length,
+      scenes: state.scenes.map(s => s.def.emotion),
+      firstTry: state.roundFirstTry,
+      attempts: state.roundAttempts,
+      slips: state.roundSlips,
+      seconds: Math.round(ms / 100) / 10,
+      answerSeconds: Math.round(state.roundAnswerMs / 100) / 10,
+    };
+
+    session.rounds.push(record);
+    progress.roundsCompleted++;
+    progress.scenesSolved += state.scenes.length;
+    progress.slips += state.roundSlips;
+    progress.lastPlayed = new Date().toISOString();
+    state.round++;
+    log('Level completed', record);
+
+    const finalRound = state.round >= CONFIG.ROUNDS;
+    if (finalRound) {
+      session.finished = true;
+      progress.gamesCompleted++;
+    } else {
+      // Praise the effort, not the child's "smartness" (growth mindset).
+      say(state.roundSlips > 0 ? 'You kept trying, and you found the feelings!' : 'You looked closely at every face!');
+    }
+    saveProgress();
+    adjustDifficulty(record);
+
+    playRoundDone();
+    const sc = currentScene();
+    sc.cheerT0 = t;
+    spawnParticles(t);
+    state.phase = 'celebrate';
+    state.celebrateStart = t;
+  }
+
+  // Simple DDA: quick and clean -> one step harder; a real struggle -> one step easier.
+  // Speed is measured on answering time only, not on the feeling animations.
+  function adjustDifficulty(record) {
+    const fast = state.roundAnswerMs / CONFIG.SCENES_PER_ROUND <= CONFIG.FAST_MS_PER_SCENE;
+    const before = state.tier;
+    if (record.firstTry === CONFIG.SCENES_PER_ROUND && fast) {
+      state.tier = Math.min(TIERS.length - 1, state.tier + 1);
+    } else if (record.slips >= 3) {
+      state.tier = Math.max(0, state.tier - 1);
+    }
+    if (state.tier !== before) log(`Difficulty ${state.tier > before ? 'up' : 'down'}: level ${before + 1} -> ${state.tier + 1}`);
+  }
+
+  function enterEnd() {
+    state.phase = 'end';
+    say('Great job! Time to play outside!');
+    log('Session finished: end screen shown, no replay offered');
+  }
+
+  // ---------------------------------------------------------------------
+  // Layout
+  // ---------------------------------------------------------------------
+  function computeLayout() {
+    const minDim = Math.min(W, H);
+    const m = clamp(minDim * 0.045, 12, 36);
+    L.m = m;
+    const landscape = W > H * 1.1;
+    let area;   // where the face tokens go
+
+    if (landscape) {
+      // Scene card on the left, tokens in a column on the right.
+      const pw = (W - 3 * m) * 0.64;
+      L.panel = { x: m, y: m, w: pw, h: H - 2 * m };
+      const ax = m * 2 + pw;
+      const ay = Math.max(m, CONFIG.HOME_RESERVE_PX) + m * 0.5;
+      area = { x: ax, y: ay, w: W - ax - m, h: H - ay - m };
+    } else {
+      // Scene card on top (below the home-button strip), tokens underneath.
+      const ay = Math.max(m, CONFIG.HOME_RESERVE_PX);
+      const aw = W - 2 * m;
+      const ah = (H - ay - m) * 0.62;
+      const ph = Math.min(ah, aw);
+      L.panel = { x: m, y: ay, w: aw, h: ph };
+      const ty = ay + ph + m;
+      area = { x: m, y: ty, w: aw, h: H - ty - m };
+    }
+
+    // The 400 x 300 scene is scaled to fit and centred; the backdrop fills the rest of the card.
+    const P = L.panel;
+    L.sc = Math.min(P.w / SCENE_W, P.h / SCENE_H);
+    L.ox = P.x + (P.w - SCENE_W * L.sc) / 2;
+    L.oy = P.y + (P.h - SCENE_H * L.sc) / 2;
+
+    // Token grid: pick the column count that gives the biggest tokens; on a tie
+    // (sizes are capped) pick the grid whose shape best matches the area.
+    const n = Math.max(1, state.tokens.length || 5);
+    const cap = Math.min(minDim * 0.12, 70);
+    const areaAspect = Math.log(area.w / Math.max(1, area.h));
+    let best = { cols: 1, r: 0, fit: Infinity };
+    for (let cols = 1; cols <= n; cols++) {
+      const rows = Math.ceil(n / cols);
+      const r = Math.min(Math.min(area.w / cols, area.h / rows) * 0.36, cap);
+      const fit = Math.abs(Math.log(cols / rows) - areaAspect);
+      if (r > best.r + 0.5 || (r > best.r - 0.5 && fit < best.fit)) best = { cols, r, fit };
+    }
+    L.tokR = clamp(best.r, 24, 70);
+    const cols = best.cols, rows = Math.ceil(n / cols);
+    const cw = area.w / cols, ch = area.h / rows;
+
+    state.tokens.forEach(tok => {
+      const row = Math.floor(tok.slot / cols);
+      const inRow = row === rows - 1 ? n - row * cols : cols;
+      const col = tok.slot - row * cols;
+      tok.homeX = area.x + (cols - inRow) * cw / 2 + cw * (col + 0.5);
+      tok.homeY = area.y + ch * (row + 0.5);
+    });
+    relayoutTokens();
+  }
+
+  // Keep every token where it belongs after a resize or rotation.
+  function relayoutTokens() {
+    for (const tok of state.tokens) {
+      if (tok.state === 'idle') {
+        tok.x = tok.homeX; tok.y = tok.homeY;
+      } else if (tok.state === 'return' && tok.anim) {
+        tok.anim.tx = tok.homeX; tok.anim.ty = tok.homeY;
+      } else if (tok.state === 'fly' && tok.anim) {
+        const f = faceTarget();
+        tok.anim.tx = f.x; tok.anim.ty = f.y; tok.anim.ts = f.r / (L.tokR * 0.85);
+      } else if (tok.state === 'drag') {
+        tok.x = clamp(tok.x, 0, W); tok.y = clamp(tok.y, 0, H);
+      }
+    }
+  }
+
+  // Scene units -> screen pixels.
+  const toScreen = (x, y) => ({ x: L.ox + x * L.sc, y: L.oy + y * L.sc });
+
+  // Where a face sits on the current friend, in screen pixels.
+  function faceTarget() {
+    const sc = currentScene();
+    const def = sc ? sc.def : SCENES[0];
+    const p = toScreen(def.cx, def.cy - CHAR_R * 0.06);
+    return { x: p.x, y: p.y, r: CHAR_R * 0.62 * L.sc };
+  }
+
+  // Generous drop zone: a circle far bigger than the friend's body.
+  function dropZone() {
+    const sc = currentScene();
+    const def = sc ? sc.def : SCENES[0];
+    const p = toScreen(def.cx, def.cy);
+    return { x: p.x, y: p.y, r: Math.max(CHAR_R * 1.7 * L.sc, L.tokR * 2) };
+  }
+
+  const inDropZone = tok => { const z = dropZone(); return Math.hypot(tok.x - z.x, tok.y - z.y) <= z.r; };
+  const correctToken = () => { const sc = currentScene(); return sc ? state.tokens.find(k => k.emotion === sc.def.emotion) : null; };
+
+  // ---------------------------------------------------------------------
+  // Drag, drop and tap
+  // ---------------------------------------------------------------------
+  // Forgiving pick: the nearest token within 1.5x its radius.
+  function pickToken(p) {
+    let best = null, bestD = Infinity;
+    for (const tok of state.tokens) {
+      if (tok.state !== 'idle' && tok.state !== 'return') continue;
+      const d = Math.hypot(p.x - tok.x, p.y - tok.y);
+      if (d <= L.tokR * 1.5 && d < bestD) { best = tok; bestD = d; }
+    }
+    return best;
+  }
+
+  function beginDrag(tok, p) {
+    tok.state = 'drag';
+    tok.anim = null;
+    tok.scale = 1;
+    state.drag = { tok, dx: tok.x - p.x, dy: tok.y - p.y, sx: p.x, sy: p.y, moved: 0 };
+    // Draw the held token on top of the others.
+    state.tokens.splice(state.tokens.indexOf(tok), 1);
+    state.tokens.push(tok);
+    playPickup();
+    say(tok.emotion);
+    log('Picked up', tok.emotion);
+  }
+
+  function dropToken() {
+    const tok = state.drag.tok;
+    const wasTap = state.drag.moved < CONFIG.TAP_SLOP_PX;
+    state.drag = null;
+    const sc = currentScene();
+    const correct = tok.emotion === sc.def.emotion;
+
+    // The scene was already answered (e.g. a resize or a very quick second grab): just go home.
+    if (state.scenePhase !== 'ask' || sc.faceOn) { sendHome(tok); return; }
+
+    if (wasTap) {
+      // Tapping a face is an answer too.
+      tok.x = tok.homeX; tok.y = tok.homeY;
+      state.roundAttempts++;
+      if (correct) { flyToFace(tok); return; }
+      tok.state = 'idle';
+      tok.wobbleT0 = now();
+      slip(tok, 'tapped');
+      playWobble();
+      return;
+    }
+
+    if (inDropZone(tok)) {
+      state.roundAttempts++;
+      if (correct) { flyToFace(tok); return; }
+      slip(tok, 'dropped');
+    }
+    sendHome(tok);
+  }
+
+  function slip(tok, how) {
+    state.sceneSlips++;
+    state.roundSlips++;
+    log(`Item rejected: ${tok.emotion} ${how} on ${currentScene().friend.name} (needs ${currentScene().def.emotion})`);
+  }
+
+  function flyToFace(tok) {
+    const f = faceTarget();
+    tok.state = 'fly';
+    tok.anim = { fx: tok.x, fy: tok.y, tx: f.x, ty: f.y, fs: tok.scale, ts: f.r / (L.tokR * 0.85), t0: now(), dur: CONFIG.FLY_MS, ease: easeInOutQuad };
+  }
+
+  // Montessori control of error: the face simply glides back to where it started.
+  function sendHome(tok) {
+    tok.state = 'return';
+    tok.anim = { fx: tok.x, fy: tok.y, tx: tok.homeX, ty: tok.homeY, fs: tok.scale, ts: 1, t0: now(), dur: CONFIG.RETURN_MS, ease: easeOutCubic };
+  }
+
+  // ---------------------------------------------------------------------
+  // Input: touch + mouse
+  // ---------------------------------------------------------------------
+  let activeTouch = null;
+  let mouseDown = false;
+  let parentTimer = null;
+
+  function toCanvas(clientX, clientY) {
+    const r = canvas.getBoundingClientRect();
+    return { x: clientX - r.left, y: clientY - r.top };
+  }
+
+  function findTouch(list, id) {
+    for (let i = 0; i < list.length; i++) if (list[i].identifier === id) return list[i];
+    return null;
+  }
+
+  function cancelParentHold() {
+    if (parentTimer) { clearTimeout(parentTimer); parentTimer = null; }
+  }
+
+  function onDown(p) {
+    unlockAudio();
+    state.lastInteraction = now();
+
+    if (state.phase === 'start' || state.phase === 'between') {
+      const g = starGeom();
+      if (Math.hypot(p.x - g.cx, p.y - g.cy) <= g.R * 1.8) { startRound(); return; }
+    } else if (state.phase === 'play' && state.scenePhase === 'ask' && !state.tokens.some(k => k.state === 'fly')) {
+      const tok = pickToken(p);
+      if (tok) { beginDrag(tok, p); return; }
+    }
+
+    // Hidden parent view: hold the top-left corner still for 3 seconds.
+    if (p.x < CONFIG.PARENT_CORNER_PX && p.y < CONFIG.PARENT_CORNER_PX) {
+      cancelParentHold();
+      parentTimer = setTimeout(openParent, CONFIG.PARENT_HOLD_MS);
+    }
+  }
+
+  function onMove(p) {
+    if (parentTimer && (p.x >= CONFIG.PARENT_CORNER_PX || p.y >= CONFIG.PARENT_CORNER_PX)) cancelParentHold();
+    if (!state.drag) return;
+    state.lastInteraction = now();
+    const d = state.drag;
+    d.moved = Math.max(d.moved, Math.hypot(p.x - d.sx, p.y - d.sy));
+    d.tok.x = clamp(p.x + d.dx, 0, W);
+    d.tok.y = clamp(p.y + d.dy, 0, H);
+  }
+
+  function onUp() {
+    cancelParentHold();
+    if (state.drag) dropToken();
+  }
+
+  canvas.addEventListener('touchstart', e => {
+    e.preventDefault();
+    if (activeTouch !== null) return;          // one finger at a time
+    const t = e.changedTouches[0];
+    activeTouch = t.identifier;
+    onDown(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  canvas.addEventListener('touchmove', e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (t) onMove(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  const endTouch = e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (!t) return;
+    activeTouch = null;
+    onUp(toCanvas(t.clientX, t.clientY));
+  };
+  canvas.addEventListener('touchend', endTouch, { passive: false });
+  canvas.addEventListener('touchcancel', endTouch, { passive: false });
+
+  canvas.addEventListener('mousedown', e => { mouseDown = true; onDown(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mousemove', e => { if (mouseDown) onMove(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mouseup', e => {
+    if (!mouseDown) return;
+    mouseDown = false;
+    onUp(toCanvas(e.clientX, e.clientY));
+  });
+
+  // ---------------------------------------------------------------------
+  // Parent view (hidden, local data only)
+  // ---------------------------------------------------------------------
+  const parentEl = document.getElementById('parent');
+  const parentBody = document.getElementById('parentBody');
+
+  function el(tag, text) {
+    const node = document.createElement(tag);
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function openParent() {
+    parentTimer = null;
+    parentBody.textContent = '';
+    parentBody.appendChild(el('div', `Full games finished: ${progress.gamesCompleted}`));
+    parentBody.appendChild(el('div', `Rounds finished: ${progress.roundsCompleted}`));
+    parentBody.appendChild(el('div', `Feelings named: ${progress.scenesSolved}`));
+
+    // Which feelings come easily, and which need more talk at home.
+    parentBody.appendChild(el('h3', 'Found on the first try'));
+    const ft = el('table');
+    const fh = el('tr');
+    ['Feeling', 'Seen', 'First try'].forEach(h => fh.appendChild(el('th', h)));
+    ft.appendChild(fh);
+    EMOTIONS.forEach(e => {
+      const f = progress.feelings[e] || { seen: 0, firstTry: 0 };
+      const tr = el('tr');
+      tr.appendChild(el('td', e));
+      tr.appendChild(el('td', String(f.seen)));
+      tr.appendChild(el('td', f.seen ? `${Math.round(100 * f.firstTry / f.seen)}%` : '-'));
+      ft.appendChild(tr);
+    });
+    parentBody.appendChild(ft);
+
+    const recent = progress.sessions.slice(-6).reverse();
+    if (recent.length) {
+      parentBody.appendChild(el('h3', 'Recent sessions'));
+      const table = el('table');
+      const head = el('tr');
+      ['When', 'Rounds', 'Top level', 'Slips'].forEach(h => head.appendChild(el('th', h)));
+      table.appendChild(head);
+      recent.forEach(s => {
+        const tr = el('tr');
+        const when = new Date(s.startedAt);
+        tr.appendChild(el('td', when.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' ' +
+          when.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })));
+        tr.appendChild(el('td', `${s.rounds.length}/${CONFIG.ROUNDS}`));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => Math.max(a, r.level), 0) || '-')));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => a + r.slips, 0))));
+        table.appendChild(tr);
+      });
+      parentBody.appendChild(table);
+    }
+    parentEl.hidden = false;
+    log('Parent view opened', progress);
+  }
+
+  parentEl.addEventListener('click', () => { parentEl.hidden = true; });
+
+  // Read-only debug hooks for the Android/desktop console.
+  window.EmotionFaces = {
+    progress: () => JSON.parse(JSON.stringify(progress)),
+    state: () => {
+      const sc = currentScene();
+      const f = faceTarget(), z = dropZone(), g = starGeom();
+      return {
+        phase: state.phase,
+        round: state.round,
+        level: state.tier + 1,
+        scene: state.sceneIdx,
+        scenePhase: state.scenePhase,
+        sceneId: sc ? sc.def.id : null,
+        friend: sc ? sc.friend.name : null,
+        answer: sc ? sc.def.emotion : null,
+        star: { x: g.cx, y: g.cy, r: g.R },
+        target: { x: f.x, y: f.y, r: f.r, dropRadius: z.r },
+        faces: state.tokens.map(k => ({ emotion: k.emotion, correct: !!sc && k.emotion === sc.def.emotion, state: k.state, x: k.x, y: k.y, r: L.tokR })),
+      };
+    },
+  };
+
+  // ---------------------------------------------------------------------
+  // Drawing primitives
+  // ---------------------------------------------------------------------
+  function roundRectPath(x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  function circle(x, y, r) { ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); }
+  function addCircle(x, y, r) { ctx.moveTo(x + r, y); ctx.arc(x, y, r, 0, TAU); }
+
+  // Fill the current path with a soft darker outline of the same hue (fill must be hex).
+  function paint(fill, lw = 3) {
+    ctx.fillStyle = fill;
+    ctx.fill();
+    ctx.lineWidth = lw;
+    ctx.strokeStyle = shade(fill, -0.28);
+    ctx.stroke();
+  }
+
+  // Union of overlapping parts with one outer outline: stroke wide, then fill over it.
+  function blob(fill, addParts, lw = 3) {
+    ctx.beginPath();
+    addParts();
+    ctx.lineWidth = lw * 2;
+    ctx.strokeStyle = shade(fill, -0.28);
+    ctx.stroke();
+    ctx.fillStyle = fill;
+    ctx.fill();
+  }
+
+  function stroke(color, lw) {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = lw;
+    ctx.stroke();
+  }
+
+  function line(x0, y0, x1, y1, color, lw) {
+    ctx.beginPath();
+    ctx.moveTo(x0, y0);
+    ctx.lineTo(x1, y1);
+    stroke(color, lw);
+  }
+
+  function drop(x, y, s, fill) {
+    ctx.beginPath();
+    ctx.moveTo(x, y - s * 1.4);
+    ctx.bezierCurveTo(x + s, y - s * 0.2, x + s, y + s, x, y + s);
+    ctx.bezierCurveTo(x - s, y + s, x - s, y - s * 0.2, x, y - s * 1.4);
+    ctx.fillStyle = fill;
+    ctx.fill();
+  }
+
+  function heart(x, y, s, fill) {
+    ctx.beginPath();
+    ctx.moveTo(x, y + s * 0.9);
+    ctx.bezierCurveTo(x - s * 1.4, y - s * 0.1, x - s * 0.6, y - s * 1.1, x, y - s * 0.35);
+    ctx.bezierCurveTo(x + s * 0.6, y - s * 1.1, x + s * 1.4, y - s * 0.1, x, y + s * 0.9);
+    ctx.fillStyle = fill;
+    ctx.fill();
+  }
+
+  // Four-point twinkle.
+  function sparkle(x, y, s, fill) {
+    ctx.beginPath();
+    ctx.moveTo(x, y - s);
+    ctx.quadraticCurveTo(x, y, x + s, y);
+    ctx.quadraticCurveTo(x, y, x, y + s);
+    ctx.quadraticCurveTo(x, y, x - s, y);
+    ctx.quadraticCurveTo(x, y, x, y - s);
+    ctx.fillStyle = fill;
+    ctx.fill();
+  }
+
+  function cheeks(cx, cy, gap, rx, ry, alpha, color = COLORS.cheek) {
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = color;
+    ctx.beginPath(); ctx.ellipse(cx - gap, cy, rx, ry, 0, 0, TAU); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(cx + gap, cy, rx, ry, 0, 0, TAU); ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------------------------------------------------------------------
+  // Faces: one function draws every expression, on tokens and on friends.
+  // r is the half-width of the face; everything scales with it.
+  // ---------------------------------------------------------------------
+  function drawFeatures(emotion, cx, cy, r) {
+    const lw = Math.max(1.5, r * 0.075);
+    const ex = r * 0.36, ey = cy - r * 0.1;
+    const ink = COLORS.ink;
+    ctx.save();
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    const dotEyes = (dy = 0.04, s = 0.085) => {
+      for (const sx of [-1, 1]) { circle(cx + sx * ex, ey + r * dy, r * s); ctx.fillStyle = ink; ctx.fill(); }
+    };
+    const roundEyes = (er, pr, py) => {
+      for (const sx of [-1, 1]) {
+        circle(cx + sx * ex, ey, r * er); ctx.fillStyle = '#FFFFFF'; ctx.fill(); stroke(ink, lw * 0.7);
+        circle(cx + sx * ex, ey + r * py, r * pr); ctx.fillStyle = ink; ctx.fill();
+      }
+    };
+    // Brows: (outer dy, inner dy) relative to the eyes; negative is up.
+    const brows = (outer, inner, w = lw) => {
+      for (const sx of [-1, 1]) {
+        ctx.beginPath();
+        ctx.moveTo(cx + sx * (ex + r * 0.16), ey + r * outer);
+        ctx.lineTo(cx + sx * (ex - r * 0.13), ey + r * inner);
+        stroke(ink, w);
+      }
+    };
+
+    if (emotion === 'happy') {
+      // Smiling closed eyes and a big open smile.
+      for (const sx of [-1, 1]) {
+        ctx.beginPath(); ctx.arc(cx + sx * ex, ey + r * 0.08, r * 0.13, Math.PI * 1.15, Math.PI * 1.85);
+        stroke(ink, lw * 1.1);
+      }
+      ctx.beginPath();
+      ctx.moveTo(cx - r * 0.34, cy + r * 0.14);
+      ctx.quadraticCurveTo(cx, cy + r * 0.78, cx + r * 0.34, cy + r * 0.14);
+      ctx.closePath();
+      ctx.fillStyle = COLORS.mouth; ctx.fill();
+      ctx.save(); ctx.clip();
+      ctx.beginPath(); ctx.ellipse(cx, cy + r * 0.46, r * 0.17, r * 0.1, 0, 0, TAU);
+      ctx.fillStyle = COLORS.tongue; ctx.fill();
+      ctx.restore();
+      ctx.beginPath();
+      ctx.moveTo(cx - r * 0.34, cy + r * 0.14);
+      ctx.quadraticCurveTo(cx, cy + r * 0.78, cx + r * 0.34, cy + r * 0.14);
+      ctx.closePath();
+      stroke(ink, lw);
+      cheeks(cx, cy + r * 0.12, r * 0.56, r * 0.14, r * 0.09, 0.5);
+    } else if (emotion === 'sad') {
+      // Inner brow ends lifted, a downturned mouth and one tear.
+      dotEyes();
+      brows(-0.12, -0.26);
+      ctx.beginPath(); ctx.arc(cx, cy + r * 0.56, r * 0.24, Math.PI * 1.2, Math.PI * 1.8);
+      stroke(ink, lw * 1.1);
+      drop(cx + ex + r * 0.05, ey + r * 0.3, r * 0.085, COLORS.tear);
+      cheeks(cx, cy + r * 0.12, r * 0.56, r * 0.12, r * 0.07, 0.3);
+    } else if (emotion === 'scared') {
+      // Wide eyes with small pupils, worried high brows, a wobbly mouth.
+      roundEyes(0.15, 0.06, -0.02);
+      brows(-0.22, -0.36);
+      ctx.beginPath();
+      ctx.moveTo(cx - r * 0.26, cy + r * 0.36);
+      for (let i = 1; i <= 4; i++) {
+        const x0 = cx - r * 0.26 + (i - 0.5) * r * 0.13;
+        ctx.quadraticCurveTo(x0, cy + r * (i % 2 ? 0.28 : 0.44), cx - r * 0.26 + i * r * 0.13, cy + r * 0.36);
+      }
+      stroke(ink, lw);
+      drop(cx + r * 0.66, cy - r * 0.42, r * 0.07, COLORS.tear);
+    } else if (emotion === 'angry') {
+      // Brows pulled down to the middle, a tight mouth with teeth, warm cheeks.
+      dotEyes(0.05);
+      brows(-0.3, -0.12, lw * 1.25);
+      ctx.beginPath(); roundRectPath(cx - r * 0.24, cy + r * 0.26, r * 0.48, r * 0.17, r * 0.07);
+      ctx.fillStyle = '#FFFFFF'; ctx.fill(); stroke(ink, lw);
+      line(cx - r * 0.2, cy + r * 0.345, cx + r * 0.2, cy + r * 0.345, ink, lw * 0.6);
+      cheeks(cx, cy + r * 0.12, r * 0.56, r * 0.15, r * 0.09, 0.6, '#EE8E7C');
+    } else if (emotion === 'surprised') {
+      // High round brows, big round eyes, an "O" mouth.
+      for (const sx of [-1, 1]) {
+        ctx.beginPath(); ctx.arc(cx + sx * ex, ey - r * 0.08, r * 0.17, Math.PI * 1.2, Math.PI * 1.8);
+        stroke(ink, lw);
+      }
+      roundEyes(0.14, 0.07, 0);
+      ctx.beginPath(); ctx.ellipse(cx, cy + r * 0.38, r * 0.12, r * 0.16, 0, 0, TAU);
+      ctx.fillStyle = COLORS.mouth; ctx.fill(); stroke(ink, lw);
+      cheeks(cx, cy + r * 0.14, r * 0.56, r * 0.12, r * 0.07, 0.35);
+    }
+    ctx.restore();
+  }
+
+  // A face token: a round skin-coloured card with one expression.
+  function drawToken(tok, k, lifted, glow, alpha) {
+    const r = L.tokR * tok.scale * k * (lifted ? 1.1 : 1);
+    let x = tok.x;
+    const wp = (now() - tok.wobbleT0) / CONFIG.WOBBLE_MS;
+    if (wp >= 0 && wp < 1) x += Math.sin(wp * Math.PI * 4) * L.tokR * (reduceMotion ? 0.05 : 0.12) * (1 - wp);
+    const y = tok.y;
+
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    if (glow > 0) {
+      ctx.globalAlpha = alpha * (0.3 + 0.4 * glow);
+      circle(x, y, r * (1.18 + 0.12 * glow));
+      ctx.fillStyle = COLORS.star; ctx.fill();
+      ctx.globalAlpha = alpha;
+    }
+    if (lifted) {
+      ctx.shadowColor = 'rgba(60, 45, 30, 0.22)';
+      ctx.shadowBlur = r * 0.5;
+      ctx.shadowOffsetY = r * 0.25;
+    } else {
+      ctx.globalAlpha = alpha * 0.12;
+      ctx.beginPath(); ctx.ellipse(x, y + r * 0.92, r * 0.8, r * 0.16, 0, 0, TAU);
+      ctx.fillStyle = COLORS.ink; ctx.fill();
+      ctx.globalAlpha = alpha;
+    }
+    circle(x, y, r);
+    ctx.fillStyle = COLORS.skin; ctx.fill();
+    ctx.shadowColor = 'transparent';
+    ctx.lineWidth = Math.max(2, r * 0.07);
+    ctx.strokeStyle = shade('#E9D8BC', -0.12);
+    ctx.stroke();
+    drawFeatures(tok.emotion, x, y, r * 0.85);
+    ctx.restore();
+  }
+
+  function drawStar(cx, cy, R, fill, face) {
+    ctx.save();
+    ctx.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const rad = i % 2 === 0 ? R : R * 0.5;
+      const a = -Math.PI / 2 + i * Math.PI / 5;
+      const x = cx + rad * Math.cos(a), y = cy + rad * Math.sin(a);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    ctx.lineJoin = 'round';
+    if (fill) {
+      ctx.fillStyle = fill;
+      ctx.fill();
+      ctx.strokeStyle = fill;            // same-colour stroke rounds the tips
+      ctx.lineWidth = Math.max(2, R * 0.16);
+      ctx.stroke();
+    } else {
+      ctx.strokeStyle = 'rgba(74, 64, 54, 0.25)';
+      ctx.lineWidth = Math.max(2, R * 0.14);
+      ctx.stroke();
+    }
+
+    if (face) {
+      ctx.fillStyle = COLORS.ink;
+      ctx.beginPath(); ctx.arc(cx - R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.arc(cx + R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.strokeStyle = COLORS.ink;
+      ctx.lineWidth = Math.max(2, R * 0.05);
+      ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.arc(cx, cy + R * 0.06, R * 0.17, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+      ctx.globalAlpha = 0.35;
+      ctx.fillStyle = COLORS.cheek;
+      ctx.beginPath(); ctx.ellipse(cx - R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(cx + R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // ---------------------------------------------------------------------
+  // The friend (scene units). Feelings change how the body moves, gently.
+  // ---------------------------------------------------------------------
+  function drawFriend(sc, t, blank) {
+    const def = sc.def, fr = sc.friend, R = CHAR_R;
+    let x = def.cx, y = def.cy, sx = 1, sy = 1, rot = 0;
+    const amp = reduceMotion ? 0.3 : 1;
+    const feel = sc.faceOn ? t - sc.feelT0 : -1;
+
+    if (feel >= 0) {
+      if (sc.faceOn === 'happy') {
+        const k = Math.max(0, 1 - feel / 2800);
+        y -= Math.abs(Math.sin(feel / 650 * Math.PI)) * R * 0.15 * k * amp;
+      } else if (sc.faceOn === 'sad') {
+        const k = Math.min(1, feel / 600);
+        sy -= 0.04 * k; sx += 0.02 * k;
+        rot = Math.sin(feel / 900) * 0.035 * amp * k;
+      } else if (sc.faceOn === 'scared') {
+        const k = Math.max(0, 1 - feel / 1800);
+        x += Math.sin(feel * 0.09) * R * 0.035 * k * amp;
+      } else if (sc.faceOn === 'angry') {
+        if (feel < 900) {
+          x += Math.sin(feel * 0.06) * R * 0.03 * amp * (1 - feel / 900);
+        } else {
+          // The big breath: puff up slowly, then let it go.
+          const b = Math.sin(clamp((feel - 900) / 2000, 0, 1) * Math.PI);
+          sx += 0.05 * b * amp; sy += 0.05 * b * amp;
+        }
+      } else if (sc.faceOn === 'surprised' && feel < 520) {
+        const k = Math.sin(feel / 520 * Math.PI);
+        y -= k * R * 0.26 * amp; sy += 0.04 * k;
+      }
+    }
+    const cp = (t - sc.cheerT0) / CONFIG.CHEER_MS;
+    if (cp >= 0 && cp < 1) y -= Math.sin(Math.PI * cp) * R * 0.25 * amp;
+
+    // Ground shadow stays on the floor.
+    ctx.globalAlpha = 0.14;
+    ctx.beginPath(); ctx.ellipse(def.cx, def.cy + R * 1.1, R * 0.8, R * 0.12, 0, 0, TAU);
+    ctx.fillStyle = COLORS.ink; ctx.fill();
+    ctx.globalAlpha = 1;
+
+    ctx.save();
+    ctx.translate(x, y + R);
+    ctx.rotate(rot);
+    ctx.scale(sx, sy);
+    ctx.translate(-x, -(y + R));
+
+    const body = fr.body;
+    // Feet, body, arms.
+    for (const s of [-1, 1]) {
+      ctx.beginPath(); ctx.ellipse(x + s * R * 0.38, y + R * 0.98, R * 0.27, R * 0.13, 0, 0, TAU);
+      ctx.fillStyle = shade(body, -0.15); ctx.fill();
+    }
+    ctx.beginPath(); ctx.ellipse(x, y, R, R * 1.04, 0, 0, TAU);
+    paint(body, 3);
+    for (const s of [-1, 1]) {
+      ctx.beginPath(); ctx.ellipse(x + s * R * 0.97, y + R * 0.22, R * 0.17, R * 0.27, s * 0.45, 0, TAU);
+      paint(body, 3);
+    }
+    ctx.globalAlpha = 0.3; ctx.fillStyle = '#fff';
+    ctx.beginPath(); ctx.ellipse(x - R * 0.5, y - R * 0.7, R * 0.2, R * 0.08, -0.6, 0, TAU); ctx.fill();
+    ctx.globalAlpha = 1;
+
+    drawHair(fr, x, y, R);
+    if (def.id === 'birthday') drawPartyHat(x, y, R);
+    if (def.id === 'balloons') drawHeldBalloons(x, y, R);
+    if (def.id === 'iceCream') drawEmptyCone(x + R * 0.98, y + R * 0.14);
+
+    // Face oval: blank (soft dashed outline) until the right face lands.
+    const fx = x, fy = y - R * 0.06;
+    ctx.beginPath(); ctx.ellipse(fx, fy, R * 0.66, R * 0.6, 0, 0, TAU);
+    ctx.fillStyle = COLORS.skin; ctx.fill();
+    if (sc.faceOn) {
+      drawFeatures(sc.faceOn, fx, fy, R * 0.62);
+    } else {
+      const k = blank.pulse;
+      ctx.save();
+      ctx.setLineDash([7, 6]);
+      ctx.lineCap = 'round';
+      ctx.globalAlpha = 0.35 + 0.35 * blank.emph;
+      ctx.beginPath(); ctx.ellipse(fx, fy, R * 0.5 * k, R * 0.44 * k, 0, 0, TAU);
+      stroke(COLORS.ink, 2.5);
+      ctx.restore();
+    }
+    ctx.restore();
+
+    // Modelled responses, drawn outside the body transform.
+    if (feel >= 0) drawFeelingExtras(sc.faceOn, def.cx, def.cy, R, feel);
+  }
+
+  function drawHair(fr, x, y, R) {
+    const top = y - R * 1.0;
+    const dark = shade(fr.body, -0.18), edge = shade(fr.body, -0.34);
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = edge;
+    if (fr.hair === 'tuft') {
+      for (const [dx, a] of [[-0.18, -0.5], [0, 0], [0.18, 0.5]]) {
+        ctx.beginPath(); ctx.ellipse(x + dx * R, top + R * 0.02, R * 0.08, R * 0.17, a, 0, TAU);
+        ctx.fillStyle = dark; ctx.fill(); ctx.stroke();
+      }
+    } else if (fr.hair === 'curl') {
+      ctx.beginPath();
+      ctx.moveTo(x, top + R * 0.06);
+      ctx.bezierCurveTo(x - R * 0.05, top - R * 0.3, x + R * 0.3, top - R * 0.3, x + R * 0.2, top - R * 0.08);
+      ctx.bezierCurveTo(x + R * 0.12, top + R * 0.04, x + R * 0.04, top - R * 0.08, x + R * 0.1, top - R * 0.14);
+      ctx.lineCap = 'round'; ctx.lineWidth = 5; ctx.strokeStyle = dark; ctx.stroke();
+    } else if (fr.hair === 'puffs') {
+      for (const s of [-1, 1]) {
+        circle(x + s * R * 0.72, y - R * 0.74, R * 0.2);
+        ctx.fillStyle = dark; ctx.fill(); ctx.stroke();
+      }
+    } else if (fr.hair === 'bow') {
+      const bx = x + R * 0.42, by = y - R * 0.86;
+      for (const s of [-1, 1]) {
+        ctx.beginPath(); ctx.moveTo(bx, by); ctx.lineTo(bx + s * R * 0.3, by - R * 0.16); ctx.lineTo(bx + s * R * 0.3, by + R * 0.16); ctx.closePath();
+        ctx.lineJoin = 'round'; paint('#F6C85F', 3);
+      }
+      circle(bx, by, R * 0.08); paint('#F6C85F', 3);
+    }
+  }
+
+  function drawPartyHat(x, y, R) {
+    const bx = x - R * 0.12, by = y - R * 0.9;
+    ctx.save();
+    ctx.translate(bx, by);
+    ctx.rotate(-0.2);
+    const cone = () => { ctx.beginPath(); ctx.moveTo(-R * 0.3, 0); ctx.lineTo(0, -R * 0.78); ctx.lineTo(R * 0.3, 0); ctx.closePath(); };
+    cone(); ctx.fillStyle = '#8FB8DE'; ctx.fill();
+    ctx.save(); cone(); ctx.clip();
+    ctx.fillStyle = '#F4D35E';
+    for (let i = 0; i < 3; i++) ctx.fillRect(-R, -R * (0.16 + i * 0.24), R * 2, R * 0.1);
+    ctx.restore();
+    cone(); ctx.lineJoin = 'round'; stroke(shade('#8FB8DE', -0.28), 3);
+    circle(0, -R * 0.8, R * 0.11); paint('#F2A88A', 3);
+    ctx.restore();
+  }
+
+  function drawHeldBalloons(x, y, R) {
+    const hx = x + R * 1.02, hy = y + R * 0.08;
+    const balloons = [[x + R * 1.5, y - R * 1.75, '#F2A88A'], [x + R * 2.1, y - R * 1.4, '#F4D35E'], [x + R * 1.2, y - R * 1.15, '#8FB8DE']];
+    for (const [bx, by] of balloons) {
+      ctx.beginPath(); ctx.moveTo(hx, hy); ctx.quadraticCurveTo(bx - R * 0.1, (hy + by) / 2, bx, by + R * 0.4);
+      stroke('#B7A58C', 1.6);
+    }
+    for (const [bx, by, c] of balloons) {
+      ctx.beginPath(); ctx.ellipse(bx, by, R * 0.32, R * 0.4, 0, 0, TAU); paint(c, 3);
+      ctx.beginPath(); ctx.moveTo(bx, by + R * 0.38); ctx.lineTo(bx - R * 0.06, by + R * 0.48); ctx.lineTo(bx + R * 0.06, by + R * 0.48); ctx.closePath();
+      paint(c, 2);
+      ctx.globalAlpha = 0.4; ctx.fillStyle = '#fff';
+      ctx.beginPath(); ctx.ellipse(bx - R * 0.12, by - R * 0.16, R * 0.07, R * 0.12, 0.4, 0, TAU); ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function drawEmptyCone(hx, hy) {
+    ctx.save();
+    ctx.translate(hx, hy);
+    ctx.rotate(0.25);
+    const cone = () => { ctx.beginPath(); ctx.moveTo(-13, -14); ctx.lineTo(13, -14); ctx.lineTo(0, 26); ctx.closePath(); };
+    cone(); ctx.fillStyle = '#E9C98B'; ctx.fill();
+    ctx.save(); cone(); ctx.clip();
+    for (let i = -3; i <= 3; i++) { line(i * 8 - 14, -16, i * 8 + 14, 28, '#D3AE6A', 1.6); line(i * 8 + 14, -16, i * 8 - 14, 28, '#D3AE6A', 1.6); }
+    ctx.restore();
+    cone(); ctx.lineJoin = 'round'; stroke(shade('#E9C98B', -0.3), 3);
+    ctx.restore();
+  }
+
+  // Small, calm pictures of the healthy response the voice is describing.
+  function drawFeelingExtras(emotion, cx, cy, R, feel) {
+    if (emotion === 'sad' || emotion === 'scared') {
+      // A floating heart: a hug / a hand to hold.
+      const k = clamp((feel - 900) / 1600, 0, 1);
+      if (k <= 0) return;
+      ctx.globalAlpha = Math.min(1, k * 3) * (1 - Math.max(0, k - 0.8) * 5);
+      heart(cx + R * 1.25, cy - R * 0.5 - k * R * 0.6, R * 0.2, '#F2A0A8');
+      ctx.globalAlpha = 1;
+    } else if (emotion === 'angry') {
+      // The big breath out: a soft puff that drifts away.
+      const k = clamp((feel - 1900) / 1400, 0, 1);
+      if (k <= 0 || k >= 1) return;
+      ctx.globalAlpha = 0.55 * (1 - k);
+      blob('#FFFFFF', () => {
+        const px = cx + R * (0.85 + k * 0.8), py = cy + R * 0.1;
+        addCircle(px, py, R * (0.14 + k * 0.1));
+        addCircle(px + R * 0.18, py - R * 0.06, R * (0.11 + k * 0.08));
+        addCircle(px + R * 0.12, py + R * 0.1, R * (0.1 + k * 0.08));
+      }, 1);
+      ctx.globalAlpha = 1;
+    } else if (emotion === 'surprised') {
+      const k = clamp(feel / 900, 0, 1);
+      if (k >= 1) return;
+      ctx.globalAlpha = 1 - k;
+      ctx.lineCap = 'round';
+      for (let i = 0; i < 5; i++) {
+        const a = -Math.PI / 2 + (i - 2) * 0.42;
+        const r0 = R * (1.2 + k * 0.2), r1 = R * (1.42 + k * 0.25);
+        line(cx + Math.cos(a) * r0, cy - R * 0.1 + Math.sin(a) * r0, cx + Math.cos(a) * r1, cy - R * 0.1 + Math.sin(a) * r1, '#E9B949', 3.5);
+      }
+      ctx.globalAlpha = 1;
+    } else if (emotion === 'happy') {
+      const k = clamp(feel / 1400, 0, 1);
+      if (k >= 1) return;
+      ctx.globalAlpha = 1 - k;
+      sparkle(cx - R * 1.25, cy - R * 0.7 - k * R * 0.3, R * 0.14, COLORS.star);
+      sparkle(cx + R * 1.3, cy - R * 0.9 - k * R * 0.3, R * 0.12, COLORS.star);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Scene backdrops and props (scene units; vb = visible bounds of the card)
+  // ---------------------------------------------------------------------
+  function room(vb, wall, floor) {
+    ctx.fillStyle = wall; ctx.fillRect(vb.x0, vb.y0, vb.x1 - vb.x0, vb.y1 - vb.y0);
+    ctx.fillStyle = floor; ctx.fillRect(vb.x0, 228, vb.x1 - vb.x0, vb.y1 - 228);
+    line(vb.x0, 228, vb.x1, 228, shade(floor, -0.12), 3);
+  }
+
+  function park(vb) {
+    ctx.fillStyle = '#DDEBF4'; ctx.fillRect(vb.x0, vb.y0, vb.x1 - vb.x0, vb.y1 - vb.y0);
+    ctx.lineCap = 'round';
+    for (let i = 0; i < 8; i++) {
+      const a = i * TAU / 8;
+      line(46 + Math.cos(a) * 26, 44 + Math.sin(a) * 26, 46 + Math.cos(a) * 34, 44 + Math.sin(a) * 34, '#F2C14E', 4);
+    }
+    circle(46, 44, 19); paint('#F6C85F', 3);
+    blob('#FFFFFF', () => { addCircle(330, 52, 16); addCircle(350, 44, 20); addCircle(372, 54, 14); }, 1);
+    ctx.beginPath();
+    ctx.moveTo(vb.x0, 226);
+    ctx.quadraticCurveTo(200, 206, vb.x1, 222);
+    ctx.lineTo(vb.x1, vb.y1); ctx.lineTo(vb.x0, vb.y1); ctx.closePath();
+    ctx.fillStyle = COLORS.grass; ctx.fill();
+    for (const [gx, gy] of [[40, 250], [110, 270], [250, 280], [340, 252], [380, 286]]) {
+      line(gx - 4, gy, gx - 7, gy - 8, '#97BE85', 2.5); line(gx, gy, gx, gy - 10, '#97BE85', 2.5); line(gx + 4, gy, gx + 7, gy - 8, '#97BE85', 2.5);
+    }
+  }
+
+  function rug() {
+    ctx.globalAlpha = 0.55;
+    ctx.beginPath(); ctx.ellipse(205, 262, 165, 22, 0, 0, TAU);
+    ctx.fillStyle = '#E8C9B0'; ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  function block(x, y, rot, color, s = 28) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(rot);
+    ctx.beginPath(); roundRectPath(-s / 2, -s / 2, s, s, 4); paint(color, 2.5);
+    ctx.globalAlpha = 0.35;
+    ctx.beginPath(); roundRectPath(-s * 0.3, -s * 0.3, s * 0.6, s * 0.6, 3); ctx.fillStyle = '#fff'; ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.restore();
+  }
+
+  const SCENE_DRAW = {
+    birthday(vb) {
+      room(vb, '#FBEFD9', '#EBD9BC');
+      // Bunting across the top.
+      const x0 = Math.max(vb.x0, -30), x1 = Math.min(vb.x1, 430), y = 26;
+      ctx.beginPath(); ctx.moveTo(x0, y); ctx.quadraticCurveTo((x0 + x1) / 2, y + 26, x1, y);
+      stroke('#C9B79C', 2);
+      const flags = ['#F2A88A', '#F4D35E', '#8FB8DE', '#9CCB9A', '#E8B4C8'];
+      let fi = 0;
+      for (let fx = x0 + 18; fx < x1 - 10; fx += 32) {
+        const u = (fx - x0) / (x1 - x0), fy = y + 52 * u * (1 - u);
+        ctx.beginPath(); ctx.moveTo(fx - 11, fy); ctx.lineTo(fx + 11, fy); ctx.lineTo(fx, fy + 20); ctx.closePath();
+        ctx.fillStyle = flags[fi++ % flags.length]; ctx.fill();
+      }
+      // Balloons tied to the floor on the left.
+      for (const [bx, by, c] of [[42, 92, '#E8B4C8'], [70, 72, '#8FB8DE']]) {
+        ctx.beginPath(); ctx.moveTo(bx, by + 24); ctx.quadraticCurveTo(bx + 8, 170, 58, 232); stroke('#B7A58C', 1.5);
+        ctx.beginPath(); ctx.ellipse(bx, by, 19, 24, 0, 0, TAU); paint(c, 2.5);
+      }
+      // Table with the cake.
+      ctx.beginPath(); roundRectPath(294, 232, 14, 34, 3); paint('#C9A27C', 2.5);
+      ctx.beginPath(); ctx.ellipse(300, 266, 30, 6, 0, 0, TAU); ctx.fillStyle = shade('#C9A27C', -0.15); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(300, 230, 74, 14, 0, 0, TAU); paint('#F7F3EA', 2.5);
+      ctx.beginPath(); roundRectPath(258, 186, 84, 42, 8); paint('#E8B4C8', 2.5);
+      blob('#FFF3D6', () => { roundRectPath(254, 180, 92, 16, 8); addCircle(272, 198, 6); addCircle(298, 200, 7); addCircle(324, 197, 5.5); }, 1.5);
+      [[276, '#8FB8DE'], [300, '#9CCB9A'], [324, '#F4D35E']].forEach(([cx, c]) => {
+        ctx.beginPath(); roundRectPath(cx - 4, 156, 8, 26, 2); paint(c, 2);
+        ctx.beginPath(); ctx.moveTo(cx, 138); ctx.quadraticCurveTo(cx + 7, 149, cx, 154); ctx.quadraticCurveTo(cx - 7, 149, cx, 138);
+        paint('#F6C85F', 1.5);
+      });
+    },
+
+    balloons(vb) {
+      park(vb);
+      for (const [fx, fy, c] of [[300, 250, '#E8B4C8'], [336, 264, '#F4D35E'], [56, 268, '#B8A9D9']]) {
+        line(fx, fy, fx, fy + 16, '#7FB77E', 2.5);
+        for (let i = 0; i < 5; i++) { const a = i * TAU / 5; circle(fx + Math.cos(a) * 6, fy + Math.sin(a) * 6, 5); ctx.fillStyle = c; ctx.fill(); }
+        circle(fx, fy, 4); ctx.fillStyle = '#F6C85F'; ctx.fill();
+      }
+    },
+
+    brokenToy(vb) {
+      room(vb, '#E9EEF5', '#E2D3BC');
+      rug();
+      // A toy car with a wheel off and a crack.
+      ctx.save();
+      ctx.translate(300, 238);
+      ctx.rotate(-0.2);
+      ctx.beginPath(); ctx.moveTo(-22, -16); ctx.lineTo(-12, -34); ctx.lineTo(14, -34); ctx.lineTo(24, -16); ctx.closePath(); ctx.lineJoin = 'round'; paint('#F2A88A', 2.5);
+      ctx.beginPath(); ctx.moveTo(-14, -18); ctx.lineTo(-8, -30); ctx.lineTo(8, -30); ctx.lineTo(14, -18); ctx.closePath(); paint('#DDEFFA', 2);
+      ctx.beginPath(); roundRectPath(-42, -18, 84, 26, 9); paint('#F2A88A', 2.5);
+      ctx.beginPath(); ctx.moveTo(6, -18); ctx.lineTo(1, -9); ctx.lineTo(8, -3); ctx.lineTo(3, 7);
+      stroke(COLORS.ink, 2);
+      circle(-24, 10, 10); paint('#6B5E52', 2.5); circle(-24, 10, 4); ctx.fillStyle = '#EDE5D6'; ctx.fill();
+      ctx.restore();
+      // The lost wheel lying on its side.
+      ctx.beginPath(); ctx.ellipse(358, 262, 11, 6, 0.2, 0, TAU); paint('#6B5E52', 2.5);
+      circle(364, 248, 2.5); ctx.fillStyle = '#B7A58C'; ctx.fill();
+    },
+
+    iceCream(vb) {
+      park(vb);
+      // The scoop that fell: a pink splat with drips and a cherry.
+      blob('#F7B6C8', () => {
+        ctx.moveTo(316, 256); ctx.ellipse(282, 256, 34, 10, 0, 0, TAU);
+        addCircle(272, 249, 12); addCircle(290, 247, 13); addCircle(258, 258, 7); addCircle(310, 260, 6);
+      }, 1.5);
+      circle(286, 236, 6); paint('#EE8E7C', 2);
+      ctx.beginPath(); ctx.moveTo(286, 230); ctx.quadraticCurveTo(290, 220, 296, 218); stroke('#7FB77E', 2);
+    },
+
+    storm(vb) {
+      room(vb, '#4B5677', '#3E4763');
+      // Window with the storm outside.
+      ctx.beginPath(); roundRectPath(236, 34, 142, 124, 8); paint('#EDE5D6', 2.5);
+      ctx.fillStyle = '#2F3854'; ctx.fillRect(246, 44, 122, 104);
+      ctx.save();
+      ctx.beginPath(); ctx.rect(246, 44, 122, 104); ctx.clip();
+      ctx.lineCap = 'round';
+      for (let i = 0; i < 9; i++) line(252 + i * 14, 92 + (i % 3) * 12, 246 + i * 14, 106 + (i % 3) * 12, '#8FA3C7', 2);
+      blob('#9AA5BD', () => { addCircle(286, 74, 16); addCircle(306, 64, 20); addCircle(328, 74, 15); roundRectPath(272, 70, 70, 18, 9); }, 1.5);
+      ctx.beginPath();
+      ctx.moveTo(310, 86); ctx.lineTo(298, 110); ctx.lineTo(308, 110); ctx.lineTo(300, 134); ctx.lineTo(320, 104); ctx.lineTo(310, 104); ctx.lineTo(318, 86);
+      ctx.closePath(); ctx.lineJoin = 'round'; paint('#F6D365', 2);
+      ctx.restore();
+      line(307, 44, 307, 148, '#EDE5D6', 4);
+      line(246, 96, 368, 96, '#EDE5D6', 4);
+      // Curtains.
+      for (const [x0, s] of [[230, 1], [384, -1]]) {
+        ctx.beginPath();
+        ctx.moveTo(x0, 28); ctx.lineTo(x0 + s * 22, 28);
+        ctx.quadraticCurveTo(x0 + s * 10, 100, x0 + s * 24, 170);
+        ctx.lineTo(x0, 170); ctx.closePath();
+        paint('#B8A9D9', 2.5);
+      }
+      // A little night light glowing on the floor: comfort is close by.
+      const g = ctx.createRadialGradient(56, 236, 2, 56, 236, 46);
+      g.addColorStop(0, 'rgba(246, 211, 101, 0.45)');
+      g.addColorStop(1, 'rgba(246, 211, 101, 0)');
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(56, 236, 46, 0, TAU); ctx.fill();
+      ctx.beginPath(); roundRectPath(50, 236, 12, 16, 3); paint('#EDE5D6', 2);
+      ctx.beginPath(); ctx.arc(56, 238, 16, Math.PI, 0); ctx.closePath(); paint('#F6D365', 2);
+    },
+
+    tower(vb) {
+      room(vb, '#F4ECE0', '#E5D2B4');
+      rug();
+      // The tower tumbling down.
+      block(248, 254, 0.25, '#8FB8DE');
+      block(282, 258, -0.15, '#F4D35E');
+      block(266, 228, 0.6, '#9CCB9A');
+      block(292, 196, -0.45, '#E8B4C8');
+      block(258, 168, 0.9, '#F2A88A');
+      ctx.globalAlpha = 0.5; ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.arc(276, 176, 26, Math.PI * 1.1, Math.PI * 1.45); stroke(COLORS.ink, 2);
+      ctx.beginPath(); ctx.arc(310, 204, 24, Math.PI * 1.6, Math.PI * 1.9); stroke(COLORS.ink, 2);
+      ctx.globalAlpha = 1;
+      // A puppy who bumped it, looking "oops".
+      const px = 346, py = 238;
+      ctx.beginPath(); ctx.moveTo(px + 24, py - 4); ctx.quadraticCurveTo(px + 34, py - 10, px + 38, py - 22); stroke('#A9805C', 5);
+      for (const lx of [-12, -2, 12, 22]) { ctx.beginPath(); roundRectPath(px + lx - 3.5, py + 6, 7, 14, 3); paint('#E3C29B', 2); }
+      ctx.beginPath(); ctx.ellipse(px + 6, py, 26, 15, 0, 0, TAU); paint('#E3C29B', 2.5);
+      circle(px - 20, py - 14, 16); paint('#E3C29B', 2.5);
+      ctx.beginPath(); ctx.ellipse(px - 10, py - 12, 6, 11, 0.4, 0, TAU); paint('#A9805C', 2);
+      circle(px - 24, py - 18, 2.4); ctx.fillStyle = COLORS.ink; ctx.fill();
+      circle(px - 35, py - 12, 2.8); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(px - 27, py - 6, 2.4, 3, 0, 0, TAU); ctx.fill();
+    },
+
+    gift(vb) {
+      room(vb, '#F3EAF6', '#E6D6C0');
+      rug();
+      // Burst of sparkles and confetti from the open box.
+      const conf = [[256, 170, '#F4D35E'], [284, 150, '#8FB8DE'], [318, 160, '#E8B4C8'], [340, 182, '#9CCB9A'], [240, 196, '#F2A88A'], [300, 128, '#F4D35E']];
+      conf.forEach(([cx, cy, c], i) => {
+        if (i % 2) sparkle(cx, cy, 9, c);
+        else { ctx.save(); ctx.translate(cx, cy); ctx.rotate(i); ctx.fillStyle = c; ctx.fillRect(-5, -2.5, 10, 5); ctx.restore(); }
+      });
+      // Open box.
+      ctx.beginPath(); roundRectPath(250, 204, 84, 58, 6); paint('#8FB8DE', 2.5);
+      ctx.fillStyle = '#F2A88A'; ctx.fillRect(286, 204, 12, 58);
+      ctx.beginPath(); roundRectPath(250, 204, 84, 58, 6); stroke(shade('#8FB8DE', -0.28), 2.5);
+      ctx.fillStyle = shade('#8FB8DE', -0.35); ctx.fillRect(254, 204, 76, 5);
+      // The lid, popped up into the air with its bow.
+      ctx.save();
+      ctx.translate(330, 118);
+      ctx.rotate(0.4);
+      ctx.beginPath(); roundRectPath(-48, -9, 96, 18, 5); paint('#8FB8DE', 2.5);
+      ctx.fillStyle = '#F2A88A'; ctx.fillRect(-6, -9, 12, 18);
+      for (const s of [-1, 1]) { ctx.beginPath(); ctx.ellipse(s * 12, -16, 12, 7, s * 0.5, 0, TAU); paint('#F2A88A', 2); }
+      circle(0, -14, 5); paint('#F2A88A', 2);
+      ctx.restore();
+      ctx.globalAlpha = 0.5; ctx.lineCap = 'round';
+      line(300, 196, 312, 146, COLORS.ink, 2); line(316, 198, 334, 150, COLORS.ink, 2);
+      ctx.globalAlpha = 1;
+    },
+  };
+
+  // Draw one scene card, optionally slid sideways (scene change).
+  function drawScene(sc, t, offsetX, blank) {
+    const P = L.panel;
+    const rad = Math.min(P.w, P.h) * 0.06;
+    ctx.save();
+    ctx.beginPath(); roundRectPath(P.x, P.y, P.w, P.h, rad); ctx.clip();
+    ctx.translate(L.ox + offsetX, L.oy);
+    ctx.scale(L.sc, L.sc);
+    const vb = {
+      x0: (P.x - L.ox - offsetX) / L.sc - 2, y0: (P.y - L.oy) / L.sc - 2,
+      x1: (P.x + P.w - L.ox - offsetX) / L.sc + 2, y1: (P.y + P.h - L.oy) / L.sc + 2,
+    };
+    ctx.lineJoin = 'round';
+    SCENE_DRAW[sc.def.id](vb);
+    drawFriend(sc, t, blank);
+    ctx.restore();
+  }
+
+  function drawPanelEdge() {
+    const P = L.panel;
+    ctx.beginPath(); roundRectPath(P.x, P.y, P.w, P.h, Math.min(P.w, P.h) * 0.06);
+    ctx.lineWidth = Math.max(3, L.m * 0.25);
+    ctx.strokeStyle = COLORS.panelEdge;
+    ctx.stroke();
+  }
+
+  // Same ring of sparkles around the friend, every time (no random rewards).
+  function spawnParticles(t) {
+    const f = faceTarget();
+    for (let i = 0; i < 12; i++) {
+      const a = i * TAU / 12;
+      state.particles.push({ x0: f.x, y0: f.y, dx: Math.cos(a), dy: Math.sin(a), dist: f.r * 2.6, t0: t, life: 900, color: i % 2 ? COLORS.star : '#E8B4C8', r: Math.max(3, f.r * 0.12) });
+    }
+  }
+
+  function drawParticles(t) {
+    state.particles = state.particles.filter(p => t - p.t0 < p.life);
+    for (const p of state.particles) {
+      const k = (t - p.t0) / p.life;
+      const e = easeOutCubic(k);
+      ctx.globalAlpha = 1 - k;
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x0 + p.dx * p.dist * e, p.y0 + p.dy * p.dist * e, p.r * (1 - k * 0.5), 0, TAU);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------------------------------------------------------------------
+  // Screens
+  // ---------------------------------------------------------------------
+  function starGeom() {
+    return { cx: W / 2, cy: H * 0.42, R: Math.min(W, H) * 0.2 };
+  }
+
+  // Start and between-round screen: one big pulsing star to tap, plus 5 slots
+  // that fill up so the child can see the end coming.
+  function drawStarScreen(t) {
+    const { cx, cy, R } = starGeom();
+    const amp = reduceMotion ? 0.03 : 0.07;
+    const k = 1 + amp * (0.5 - 0.5 * Math.cos(TAU * t / 1400));
+    drawStar(cx, cy, R * k, COLORS.star, true);
+
+    const sr = R * 0.16, gap = sr * 2.8, y = cy + R * 1.35;
+    for (let i = 0; i < CONFIG.ROUNDS; i++) {
+      drawStar(cx + (i - (CONFIG.ROUNDS - 1) / 2) * gap, y, sr, i < state.round ? COLORS.star : null, false);
+    }
+  }
+
+  function fitFont(text, weight, size, maxW) {
+    ctx.font = `${weight} ${size}px ${FONT}`;
+    while (size > 12 && ctx.measureText(text).width > maxW) {
+      size -= 1;
+      ctx.font = `${weight} ${size}px ${FONT}`;
+    }
+    return size;
+  }
+
+  // Static end screen. No buttons: the session is over.
+  function drawEnd() {
+    const gh = H * 0.14;
+    ctx.fillStyle = COLORS.grass;
+    ctx.beginPath();
+    ctx.moveTo(0, H - gh);
+    ctx.quadraticCurveTo(W / 2, H - gh * 1.5, W, H - gh);
+    ctx.lineTo(W, H);
+    ctx.lineTo(0, H);
+    ctx.closePath();
+    ctx.fill();
+
+    const R = Math.min(W, H) * 0.2;
+    const cy = H * 0.36;
+    drawStar(W / 2, cy, R, COLORS.star, true);
+
+    const big = clamp(Math.min(W, H) * 0.1, 26, 68);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = COLORS.ink;
+    const top = cy + R * 1.25;
+    fitFont('Great Job!', 800, big, W * 0.9);
+    ctx.fillText('Great Job!', W / 2, top + big * 0.5);
+    fitFont('Time to play outside!', 700, Math.round(big * 0.62), W * 0.9);
+    ctx.fillText('Time to play outside!', W / 2, top + big * 1.55);
+  }
+
+  // What to pulse and glow right now.
+  function guidance(t) {
+    const out = { blank: { pulse: 1, emph: 0 }, wave: 0, hint: null, glow: 0 };
+    if (state.phase !== 'play' || state.scenePhase !== 'ask') return out;
+    const right = correctToken();
+
+    if (state.drag) {
+      // Hovering over the friend: the blank face brightens to say "here".
+      if (inDropZone(state.drag.tok)) out.blank = { pulse: 1.06, emph: 1 };
+      if (state.sceneSlips >= CONFIG.HINT_AFTER_SLIPS) { out.hint = right; out.glow = 0.5 + 0.5 * Math.sin(TAU * t / 1300); }
+      return out;
+    }
+
+    const idle = t - state.lastInteraction;
+    if (state.sceneSlips >= CONFIG.HINT_AFTER_SLIPS) { out.hint = right; out.glow = 0.5 + 0.5 * Math.sin(TAU * t / 1300); }
+    if (idle <= CONFIG.IDLE_PULSE_MS) return out;
+    const wave = 0.5 - 0.5 * Math.cos(TAU * (idle - CONFIG.IDLE_PULSE_MS) / 1300);
+    out.blank = { pulse: 1 + (reduceMotion ? 0.04 : 0.1) * wave, emph: wave };
+    out.wave = idle - CONFIG.IDLE_PULSE_MS;
+
+    // Scaffolding: in the very first scene, show the right face if the child is stuck.
+    const tutorial = state.round === 0 && state.sceneIdx === 0 && !state.solvedAny && idle > CONFIG.TUTORIAL_HINT_MS;
+    if (tutorial) { out.hint = right; out.glow = wave; }
+    return out;
+  }
+
+  function drawPlay(t) {
+    const g = guidance(t);
+    const sc = currentScene();
+
+    if (state.scenePhase === 'swap') {
+      const p = clamp((t - state.swapT0) / CONFIG.SWAP_MS, 0, 1);
+      const e = easeInOutQuad(p);
+      const prev = state.scenes[state.sceneIdx - 1];
+      if (reduceMotion) {
+        // No sliding for reduced motion: a calm cut halfway through.
+        drawScene(p < 0.5 ? prev : sc, t, 0, g.blank);
+      } else {
+        drawScene(prev, t, -e * L.panel.w, g.blank);
+        drawScene(sc, t, (1 - e) * L.panel.w, g.blank);
+      }
+    } else {
+      drawScene(sc, t, 0, g.blank);
+    }
+    drawPanelEdge();
+
+    // Face tokens. They grow in after a scene change and dim while a feeling is shown.
+    const swapK = state.scenePhase === 'swap'
+      ? (reduceMotion ? 1 : easeOutBack(clamp((t - state.swapT0) / CONFIG.SWAP_MS, 0, 1)))
+      : 1;
+    const alpha = state.scenePhase === 'feel' || state.phase === 'celebrate' ? 0.4 : 1;
+    const bobAmp = reduceMotion ? 0.03 : 0.07;
+    state.tokens.forEach((tok, i) => {
+      if (tok.state === 'placed' || tok === (state.drag && state.drag.tok)) return;
+      let k = swapK;
+      if (g.wave > 0 && tok.state === 'idle') k *= 1 + bobAmp * Math.max(0, Math.sin(TAU * (g.wave / 1300) - i * 0.6));
+      const isFly = tok.state === 'fly';
+      drawToken(tok, Math.max(0.01, k), false, tok === g.hint ? g.glow : 0, isFly ? 1 : alpha);
+    });
+    if (state.drag) drawToken(state.drag.tok, 1, true, state.drag.tok === g.hint ? g.glow : 0, 1);
+    drawParticles(t);
+  }
+
+  // ---------------------------------------------------------------------
+  // Main loop
+  // ---------------------------------------------------------------------
+  function update(t) {
+    for (const tok of state.tokens) {
+      const a = tok.anim;
+      if (!a) continue;
+      const p = clamp((t - a.t0) / a.dur, 0, 1);
+      const e = a.ease(p);
+      tok.x = lerp(a.fx, a.tx, e);
+      tok.y = lerp(a.fy, a.ty, e);
+      tok.scale = lerp(a.fs, a.ts, e);
+      if (p >= 1) {
+        tok.anim = null;
+        if (tok.state === 'return') tok.state = 'idle';
+        else if (tok.state === 'fly') placeFace(tok, t);
+      }
+    }
+
+    if (state.phase === 'play') {
+      if (state.scenePhase === 'feel' && t - currentScene().feelT0 >= CONFIG.FEEL_MS) finishScene(t);
+      else if (state.scenePhase === 'swap' && t - state.swapT0 >= CONFIG.SWAP_MS) {
+        state.scenePhase = 'ask';
+        state.lastInteraction = t;
+        askPrompt();
+      }
+    }
+
+    if (state.phase === 'celebrate' && t - state.celebrateStart >= CONFIG.CELEBRATE_MS) {
+      if (state.round >= CONFIG.ROUNDS) enterEnd();
+      else state.phase = 'between';
+    }
+  }
+
+  function render(t) {
+    ctx.fillStyle = COLORS.bg;
+    ctx.fillRect(0, 0, W, H);
+    if (state.phase === 'start' || state.phase === 'between') drawStarScreen(t);
+    else if (state.phase === 'play' || state.phase === 'celebrate') drawPlay(t);
+    else if (state.phase === 'end') drawEnd();
+  }
+
+  let rafId = 0;
+  function frame(t) {
+    update(t);
+    render(t);
+    // The end screen is static: stop the loop entirely.
+    if (state.phase !== 'end') rafId = requestAnimationFrame(frame);
+  }
+
+  function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    DPR = Math.min(window.devicePixelRatio || 1, 2.5);
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    computeLayout();
+    if (state.phase === 'end') render(now());
+  }
+
+  window.addEventListener('resize', resize);
+  window.addEventListener('orientationchange', resize);
+
+  resize();
+  log('Game loaded', { roundsPerSession: CONFIG.ROUNDS, gamesCompletedBefore: progress.gamesCompleted });
+  rafId = requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

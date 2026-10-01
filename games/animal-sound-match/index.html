@@ -1,0 +1,1641 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Animal Sound Match</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
+  body {
+    background: #F6F1E7;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  canvas { display: block; width: 100%; height: 100%; }
+
+  #home {
+    position: fixed; top: max(10px, env(safe-area-inset-top)); right: max(10px, env(safe-area-inset-right));
+    width: 52px; height: 52px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+    background: rgba(255, 253, 248, 0.85); box-shadow: 0 2px 8px rgba(74, 64, 54, 0.15);
+    -webkit-tap-highlight-color: transparent; z-index: 5;
+  }
+  #home:active { transform: scale(0.94); }
+
+  /* Hidden parent view: press and hold the top-left corner for 3 seconds. */
+  #parent {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: rgba(74, 64, 54, 0.55); padding: 16px; box-sizing: border-box; z-index: 10;
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #4A4036;
+  }
+  #parent[hidden] { display: none; }
+  #parent .card { background: #FFFDF8; border-radius: 16px; padding: 20px 22px; max-width: 380px; width: 100%; box-shadow: 0 10px 30px rgba(0,0,0,0.18); }
+  #parent h2 { margin: 0 0 10px; font-size: 18px; }
+  #parent table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+  #parent th, #parent td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #EDE5D6; }
+  #parent .hint { margin: 12px 0 0; font-size: 12px; opacity: 0.7; }
+</style>
+</head>
+<body>
+<canvas id="game" aria-label="Animal sound matching game"></canvas>
+<a id="home" href="../../index.html" aria-label="Home">
+  <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><path d="M4 11.5 12 5l8 6.5V19a1 1 0 0 1-1 1h-4.5v-5h-5v5H5a1 1 0 0 1-1-1z" fill="none" stroke="#4A4036" stroke-width="2" stroke-linejoin="round"/></svg>
+</a>
+
+<div id="parent" hidden>
+  <div class="card">
+    <h2>Progress on this device</h2>
+    <div id="parentBody"></div>
+    <p class="hint">Stored only on this device. Tap anywhere to close.</p>
+  </div>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  /* =====================================================================
+   * ANIMAL SOUND MATCH
+   * ELOF domain: Cognition (auditory association, memory) + Language
+   *              (onomatopoeia as early vocabulary).
+   *
+   * How it plays:
+   *  - A big speaker button at the top plays an animal sound, synthesized
+   *    live with Web Audio (no recordings). It plays by itself when a
+   *    question starts and again whenever the speaker is tapped.
+   *  - The child taps the animal that makes that sound. It opens its mouth
+   *    and "says" the sound, mouth moving in time with each syllable.
+   *
+   * Design rules this file follows (from the brief):
+   *  - Coherence: only the speaker and the animals on screen. No score.
+   *  - Control of error: a wrong animal wobbles softly and the sound simply
+   *    plays again. No buzzer, no red X.
+   *  - Self-paced: replay as often as wanted; no timers the child can feel.
+   *  - If Web Audio is missing entirely, the speaker shows a small picture
+   *    of the animal instead, so the game still works as picture matching.
+   *  - Natural stopping point: 5 rounds, then a static "play outside" screen
+   *    with no "play again" button.
+   * ===================================================================== */
+
+  // ---------------------------------------------------------------------
+  // Configuration
+  // ---------------------------------------------------------------------
+  const CONFIG = {
+    ROUNDS: 5,                     // hard session limit (natural stopping point)
+    STORAGE_KEY: 'animal-sound-match.v1',
+    SOUNDS_PER_ROUND: 3,           // questions per round
+    IDLE_PULSE_MS: 1500,           // idle time before the speaker pulses
+    TUTORIAL_HINT_MS: 5000,        // first round: idle time before the right animal glows too
+    INTRO_MS: 550,                 // animals pop in, then the sound plays by itself
+    POP_MS: 380,                   // animal pop-in animation
+    ANSWER_PAD_MS: 650,            // after the animal finishes its sound, before the next question
+    WOBBLE_MS: 480,                // wrong animal wobble
+    CELEBRATE_MS: 1600,            // round-complete celebration length
+    FAST_MS_PER_SOUND: 5000,       // "quick" threshold for difficulty step-up (includes listening)
+    PARENT_HOLD_MS: 3000,          // hold time for the hidden parent view
+    PARENT_CORNER_PX: 80,
+    HOME_RESERVE_PX: 72,           // top-right corner kept free for the home button
+  };
+
+  const COLORS = {
+    bg: '#F6F1E7',
+    ink: '#4A4036',
+    star: '#F6C85F',
+    grass: '#B9D7A8',
+    cheek: '#F2A88A',
+    speaker: '#F2A88A',            // soft coral button
+    speakerDark: '#D9876A',
+    glow: '#F6C85F',
+  };
+
+  // Each animal: display name, the word spoken (if speech exists), its group
+  // (for the difficulty ladder) and its body colour.
+  const ANIMALS = {
+    cow:   { name: 'Cow',   word: 'Moo!',         group: 'farm',  color: '#FBF7EF' },
+    sheep: { name: 'Sheep', word: 'Baa!',         group: 'farm',  color: '#FFFDF8' },
+    pig:   { name: 'Pig',   word: 'Oink oink!',   group: 'farm',  color: '#F6B9BE' },
+    dog:   { name: 'Dog',   word: 'Woof woof!',   group: 'pet',   color: '#D4A475' },
+    cat:   { name: 'Cat',   word: 'Meow!',        group: 'pet',   color: '#F2B57E' },
+    duck:  { name: 'Duck',  word: 'Quack quack!', group: 'small', color: '#F8D867' },
+    bird:  { name: 'Bird',  word: 'Tweet tweet!', group: 'small', color: '#7DB6E6' },
+    frog:  { name: 'Frog',  word: 'Ribbit!',      group: 'small', color: '#8DCB72' },
+  };
+  const GROUPS = {
+    farm: ['cow', 'sheep', 'pig'],
+    pet: ['dog', 'cat'],
+    small: ['duck', 'bird', 'frog'],
+  };
+
+  const FONT = 'ui-rounded, "Arial Rounded MT Bold", "Nunito", system-ui, -apple-system, sans-serif';
+
+  // Difficulty ladder for dynamic difficulty adjustment (scaffolding).
+  // The top tier puts the three big farm animals (cow, sheep, pig) side by side
+  // and asks only for them, so the child must really listen to the sound.
+  const TIERS = [
+    { count: 2, pick: () => shuffle(pick([['cow', 'bird'], ['dog', 'duck'], ['cat', 'frog'], ['pig', 'bird'], ['sheep', 'dog'], ['cow', 'duck'], ['frog', 'cow']]).slice()) },
+    { count: 3, pick: () => [pick(GROUPS.farm), pick(GROUPS.pet), pick(GROUPS.small)] },
+    { count: 4, pick: () => Math.random() < 0.5
+        ? [pick(GROUPS.farm), ...GROUPS.pet, pick(GROUPS.small)]
+        : [pick(GROUPS.farm), pick(GROUPS.pet), ...shuffle(GROUPS.small.slice()).slice(0, 2)] },
+    { count: 4, similar: true, pick: () => [...GROUPS.farm, pick([...GROUPS.pet, ...GROUPS.small])] },
+  ];
+
+  const TAU = Math.PI * 2;
+  const reduceMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  const MOTION = reduceMotion ? 0.4 : 1;
+
+  // ---------------------------------------------------------------------
+  // Small helpers
+  // ---------------------------------------------------------------------
+  const now = () => performance.now();
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const easeOutCubic = t => 1 - Math.pow(1 - t, 3);
+  const easeOutBack = t => { const c = 1.70158; return 1 + (c + 1) * Math.pow(t - 1, 3) + c * Math.pow(t - 1, 2); };
+  const pick = arr => arr[Math.floor(Math.random() * arr.length)];
+  const log = (...args) => console.log('[AnimalSounds]', ...args);
+
+  function shuffle(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }
+
+  // Mix a hex colour toward black (amt < 0) or white (amt > 0).
+  const shadeCache = new Map();
+  function shade(hex, amt) {
+    const key = hex + amt;
+    if (shadeCache.has(key)) return shadeCache.get(key);
+    const n = parseInt(hex.slice(1), 16);
+    const target = amt < 0 ? 0 : 255;
+    const p = Math.abs(amt);
+    const c = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map(v => Math.round(lerp(v, target, p)));
+    const out = `rgb(${c[0]},${c[1]},${c[2]})`;
+    shadeCache.set(key, out);
+    return out;
+  }
+
+  // ---------------------------------------------------------------------
+  // Canvas setup
+  // ---------------------------------------------------------------------
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  let W = 0, H = 0, DPR = 1;
+
+  // Layout values recomputed on every resize.
+  const L = { m: 16, s: 40, sp: { x: 0, y: 0, r: 50 } };
+
+  // ---------------------------------------------------------------------
+  // Game state
+  // ---------------------------------------------------------------------
+  const state = {
+    phase: 'start',          // 'start' | 'play' | 'celebrate' | 'between' | 'end'
+    step: 'intro',           // inside 'play': 'intro' | 'ask' | 'answer'
+    stepT0: 0,
+    round: 0,                // rounds completed this session
+    tier: 0,                 // index into TIERS
+    animals: [],             // { id, x, y, wobbleT0, appearT0 } in screen order
+    plan: [],                // animal id asked at each question
+    q: 0,                    // questions answered this round
+    target: null,            // animal id being asked right now
+    voice: null,             // the sound playing now: { id, source: 'speaker' | 'animal', index, t0, dur, bus }
+    answerIndex: -1,
+    answerEndAt: 0,
+    slips: 0,                // wrong taps on the current question
+    roundSlips: 0,
+    firstTry: 0,
+    replays: 0,
+    askStart: 0,
+    responseMs: 0,
+    lastInteraction: 0,
+    roundStart: 0,
+    celebrateStart: 0,
+    particles: [],
+    speakerPressT0: -1e9,
+    qKey: 0,                 // increments per question; stale speech timers check it
+  };
+
+  // ---------------------------------------------------------------------
+  // Local progress tracking (localStorage, never leaves the device)
+  // ---------------------------------------------------------------------
+  function freshProgress() {
+    return { version: 1, gamesCompleted: 0, roundsCompleted: 0, matched: 0, wrongTaps: 0, replays: 0, lastPlayed: null, sessions: [] };
+  }
+
+  function loadProgress() {
+    try {
+      const raw = window.localStorage.getItem(CONFIG.STORAGE_KEY);
+      if (raw) {
+        const data = JSON.parse(raw);
+        if (data && data.version === 1 && Array.isArray(data.sessions)) return data;
+      }
+    } catch (e) {
+      console.warn('[AnimalSounds] Progress could not be loaded (storage unavailable):', e && e.message);
+    }
+    return freshProgress();
+  }
+
+  function saveProgress() {
+    try {
+      window.localStorage.setItem(CONFIG.STORAGE_KEY, JSON.stringify(progress));
+      log('Progress saved', { gamesCompleted: progress.gamesCompleted, roundsCompleted: progress.roundsCompleted });
+    } catch (e) {
+      console.warn('[AnimalSounds] Progress could not be saved (storage unavailable):', e && e.message);
+    }
+  }
+
+  const progress = loadProgress();
+  let session = null; // created on the first round of this app launch
+
+  function ensureSession() {
+    if (session) return;
+    session = { startedAt: new Date().toISOString(), finished: false, rounds: [] };
+    progress.sessions.push(session);
+    if (progress.sessions.length > 30) progress.sessions.splice(0, progress.sessions.length - 30);
+  }
+
+  // ---------------------------------------------------------------------
+  // Audio: Web Audio tones, synthesized animal voices, optional speech
+  // ---------------------------------------------------------------------
+  let actx = null;
+  let master = null;       // everything goes through a gentle compressor
+  let noiseBuf = null;
+
+  // Browsers only allow audio after a user gesture, so this runs on every pointer down.
+  function unlockAudio() {
+    if (!actx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) {
+        try {
+          actx = new AC();
+          master = actx.createGain();
+          master.gain.value = 0.9;
+          try {
+            const comp = actx.createDynamicsCompressor();
+            comp.threshold.value = -14;
+            comp.ratio.value = 4;
+            master.connect(comp).connect(actx.destination);
+          } catch (e) {
+            master.connect(actx.destination);
+          }
+        } catch (e) { actx = null; master = null; }
+      }
+    }
+    if (actx && actx.state === 'suspended') actx.resume();
+  }
+
+  function tone(freq, delay, dur, vol = 0.16, type = 'sine') {
+    if (!actx) return;
+    const t = actx.currentTime + delay;
+    const osc = actx.createOscillator();
+    const gain = actx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(vol, t + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    osc.connect(gain).connect(master);
+    osc.start(t);
+    osc.stop(t + dur + 0.05);
+  }
+
+  const playChime = () => { tone(783.99, 0, 0.35, 0.1); tone(1174.66, 0.08, 0.45, 0.08); };
+  const playRoundDone = () => [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => tone(f, i * 0.12, 0.5, 0.12));
+  const playTap = () => tone(660, 0, 0.08, 0.05, 'triangle');
+
+  // --- Building blocks for the animal voices ---------------------------
+  function osc(type, freq, at, end, dest) {
+    const o = actx.createOscillator();
+    o.type = type;
+    o.frequency.setValueAtTime(freq, at);
+    o.connect(dest);
+    o.start(at);
+    o.stop(end + 0.05);
+    return o;
+  }
+
+  function filter(type, freq, q, dest) {
+    const f = actx.createBiquadFilter();
+    f.type = type;
+    f.frequency.value = freq;
+    f.Q.value = q;
+    f.connect(dest);
+    return f;
+  }
+
+  function gainTo(dest, value = 1) {
+    const g = actx.createGain();
+    g.gain.value = value;
+    g.connect(dest);
+    return g;
+  }
+
+  // Attack to `peak`, hold until `holdEnd`, then release. Times are relative to `at`.
+  function envelope(param, at, attack, holdEnd, release, peak) {
+    param.setValueAtTime(0.0001, at);
+    param.exponentialRampToValueAtTime(peak, at + attack);
+    param.setValueAtTime(peak, at + holdEnd);
+    param.exponentialRampToValueAtTime(0.0001, at + holdEnd + release);
+  }
+
+  // A low-frequency oscillator wobbling an AudioParam (vibrato / tremolo / croak).
+  function lfo(type, rate, depth, param, at, end) {
+    const o = osc(type, rate, at, end, gainTo(param, depth));
+    return o;
+  }
+
+  function noise(at, end, dest) {
+    if (!noiseBuf) {
+      const len = Math.floor(actx.sampleRate * 1.5);
+      noiseBuf = actx.createBuffer(1, len, actx.sampleRate);
+      const d = noiseBuf.getChannelData(0);
+      for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    }
+    const src = actx.createBufferSource();
+    src.buffer = noiseBuf;
+    src.connect(dest);
+    src.start(at);
+    src.stop(end + 0.05);
+    return src;
+  }
+
+  // --- The voices ------------------------------------------------------
+  // Each has a length (s), the stretches where the mouth is open (s), and a
+  // play(at, out) that schedules the synthesis into the bus `out`.
+  const SOUNDS = {
+    // Low sawtooth pair with a slow pitch glide, through a lowpass that opens
+    // ("mmm") then closes ("ooo").
+    cow: {
+      dur: 1.4, mouth: [[0.1, 1.3]],
+      play(at, out) {
+        const lp = filter('lowpass', 300, 2, out);
+        lp.frequency.setValueAtTime(300, at);
+        lp.frequency.linearRampToValueAtTime(1000, at + 0.35);
+        lp.frequency.linearRampToValueAtTime(720, at + 0.9);
+        lp.frequency.linearRampToValueAtTime(360, at + 1.35);
+        const g = gainTo(lp, 0);
+        envelope(g.gain, at, 0.18, 0.95, 0.4, 0.42);
+        for (const det of [1, 1.007]) {
+          const o = osc('sawtooth', 128 * det, at, at + 1.4, g);
+          o.frequency.linearRampToValueAtTime(152 * det, at + 0.3);
+          o.frequency.linearRampToValueAtTime(120 * det, at + 1.0);
+          o.frequency.linearRampToValueAtTime(98 * det, at + 1.38);
+          lfo('sine', 5, 2.5 * det, o.frequency, at + 0.5, at + 1.4);
+        }
+      },
+    },
+
+    // Two short, noisy, low bursts with a falling pitch: "woof, woof".
+    dog: {
+      dur: 0.68, mouth: [[0, 0.2], [0.36, 0.56]],
+      play(at, out) {
+        for (const off of [0, 0.36]) {
+          const t = at + off;
+          const lp = filter('lowpass', 1400, 5, out);
+          lp.frequency.setValueAtTime(1500, t);
+          lp.frequency.exponentialRampToValueAtTime(420, t + 0.17);
+          const g = gainTo(lp, 0);
+          envelope(g.gain, t, 0.012, 0.05, 0.14, 0.5);
+          const o = osc('sawtooth', 300, t, t + 0.22, g);
+          o.frequency.exponentialRampToValueAtTime(145, t + 0.17);
+          const o2 = osc('square', 150, t, t + 0.22, gainTo(g, 0.35));
+          o2.frequency.exponentialRampToValueAtTime(80, t + 0.17);
+          // Breathy rough attack.
+          const nb = filter('bandpass', 900, 0.9, out);
+          const ng = gainTo(nb, 0);
+          envelope(ng.gain, t, 0.005, 0.02, 0.1, 0.6);
+          noise(t, t + 0.15, ng);
+        }
+      },
+    },
+
+    // A rising-falling glide through a moving "formant" bandpass: "mi-a-ow".
+    cat: {
+      dur: 0.95, mouth: [[0.06, 0.88]],
+      play(at, out) {
+        const post = gainTo(out, 0);
+        envelope(post.gain, at, 0.1, 0.68, 0.24, 1.3);
+        const f1 = filter('bandpass', 750, 5, post);
+        f1.frequency.setValueAtTime(750, at);
+        f1.frequency.linearRampToValueAtTime(1750, at + 0.26);
+        f1.frequency.linearRampToValueAtTime(1350, at + 0.5);
+        f1.frequency.linearRampToValueAtTime(650, at + 0.88);
+        const f2 = filter('bandpass', 2700, 7, gainTo(post, 0.5));
+        const src = gainTo(f1, 1);
+        src.connect(f2);
+        const o = osc('sawtooth', 520, at, at + 0.95, src);
+        o.frequency.linearRampToValueAtTime(720, at + 0.28);
+        o.frequency.linearRampToValueAtTime(650, at + 0.5);
+        o.frequency.linearRampToValueAtTime(430, at + 0.92);
+        lfo('sine', 6, 10, o.frequency, at, at + 0.95);
+      },
+    },
+
+    // Nasal square-wave bursts through two narrow bandpasses: "quack quack".
+    duck: {
+      dur: 0.56, mouth: [[0, 0.19], [0.3, 0.5]],
+      play(at, out) {
+        [[0, 1], [0.3, 0.93]].forEach(([off, k]) => {
+          const t = at + off;
+          const g = gainTo(out, 0);
+          envelope(g.gain, t, 0.01, 0.09, 0.1, 0.9);
+          const b1 = filter('bandpass', 1150, 2.5, g);
+          const b2 = filter('bandpass', 2400, 4, gainTo(g, 0.6));
+          const mix = gainTo(b1, 1);
+          mix.connect(b2);
+          for (const [type, det] of [['square', 1], ['sawtooth', 1.012]]) {
+            const o = osc(type, 300 * k * det, t, t + 0.2, mix);
+            o.frequency.linearRampToValueAtTime(360 * k * det, t + 0.03);
+            o.frequency.exponentialRampToValueAtTime(255 * k * det, t + 0.18);
+          }
+        });
+      },
+    },
+
+    // A bleat with strong vibrato and tremolo: "baa-aa-aa".
+    sheep: {
+      dur: 1.1, mouth: [[0.04, 1.0]],
+      play(at, out) {
+        const trem = gainTo(out, 0.65);
+        lfo('sine', 7.5, 0.35, trem.gain, at, at + 1.1);
+        const g = gainTo(trem, 0);
+        envelope(g.gain, at, 0.06, 0.78, 0.28, 0.75);
+        const bp = filter('bandpass', 500, 1.4, g);
+        bp.frequency.setValueAtTime(500, at);
+        bp.frequency.linearRampToValueAtTime(1050, at + 0.1);
+        bp.frequency.linearRampToValueAtTime(900, at + 1.0);
+        const o = osc('sawtooth', 330, at, at + 1.1, bp);
+        o.frequency.linearRampToValueAtTime(290, at + 0.08);
+        o.frequency.linearRampToValueAtTime(262, at + 1.05);
+        lfo('sine', 7.5, 14, o.frequency, at, at + 1.1);
+      },
+    },
+
+    // Fast high chirps sweeping up and back: "tweet tweet".
+    bird: {
+      dur: 0.9, mouth: [[0, 0.1], [0.15, 0.25], [0.3, 0.4], [0.6, 0.7], [0.75, 0.85]],
+      play(at, out) {
+        for (const off of [0, 0.15, 0.3, 0.6, 0.75]) {
+          const t = at + off;
+          const g = gainTo(out, 0);
+          envelope(g.gain, t, 0.006, 0.04, 0.05, 0.22);
+          const o = osc('sine', 2300, t, t + 0.1, g);
+          o.frequency.exponentialRampToValueAtTime(3900, t + 0.05);
+          o.frequency.exponentialRampToValueAtTime(3000, t + 0.09);
+          const h = osc('sine', 4600, t, t + 0.1, gainTo(g, 0.12));
+          h.frequency.exponentialRampToValueAtTime(7800, t + 0.05);
+        }
+      },
+    },
+
+    // Two quick croaks: a low buzz chopped by a fast pulse ("rrr"), the second higher.
+    frog: {
+      dur: 0.46, mouth: [[0, 0.18], [0.25, 0.42]],
+      play(at, out) {
+        [[0, 125, 0.17], [0.25, 150, 0.15]].forEach(([off, f, len]) => {
+          const t = at + off;
+          const lp = filter('lowpass', 900, 4, out);
+          const g = gainTo(lp, 0);
+          envelope(g.gain, t, 0.01, len - 0.06, 0.06, 0.7);
+          const am = gainTo(g, 0.5);
+          lfo('square', 32, 0.5, am.gain, t, t + len);
+          const o = osc('sawtooth', f, t, t + len, am);
+          o.frequency.linearRampToValueAtTime(f * 0.88, t + len);
+          osc('square', f * 0.5, t, t + len, gainTo(am, 0.4));
+        });
+      },
+    },
+
+    // Short snorty, nasal bursts: "oink oink".
+    pig: {
+      dur: 0.58, mouth: [[0, 0.22], [0.32, 0.54]],
+      play(at, out) {
+        for (const off of [0, 0.32]) {
+          const t = at + off;
+          const g = gainTo(out, 0);
+          envelope(g.gain, t, 0.02, 0.1, 0.1, 0.8);
+          const am = gainTo(g, 0.6);
+          lfo('square', 45, 0.4, am.gain, t, t + 0.22);
+          const bp = filter('bandpass', 800, 3, am);
+          const o = osc('sawtooth', 170, t, t + 0.22, bp);
+          o.frequency.linearRampToValueAtTime(265, t + 0.06);
+          o.frequency.exponentialRampToValueAtTime(150, t + 0.2);
+          // The snort.
+          const nb = filter('bandpass', 420, 1.2, out);
+          const ng = gainTo(nb, 0);
+          envelope(ng.gain, t, 0.01, 0.06, 0.08, 0.5);
+          noise(t, t + 0.18, ng);
+        }
+      },
+    },
+  };
+
+  // Play an animal voice now, from the speaker or from the animal itself.
+  // The visual sync (speaker waves, mouth) runs off the same start time.
+  function playVoice(id, source, index, t) {
+    stopVoice();
+    const snd = SOUNDS[id];
+    const v = { id, source, index, t0: t + 20, dur: snd.dur, bus: null };
+    if (actx && master) {
+      v.bus = gainTo(master, 1);
+      try { snd.play(actx.currentTime + 0.02, v.bus); } catch (e) { console.warn('[AnimalSounds] Voice failed:', e && e.message); }
+    }
+    state.voice = v;
+    return v;
+  }
+
+  // Cut the current voice (a 30 ms fade avoids a click).
+  function stopVoice() {
+    const v = state.voice;
+    state.voice = null;
+    if (!v || !v.bus || !actx) return;
+    const ct = actx.currentTime;
+    v.bus.gain.cancelScheduledValues(ct);
+    v.bus.gain.setValueAtTime(v.bus.gain.value, ct);
+    v.bus.gain.linearRampToValueAtTime(0, ct + 0.03);
+    const bus = v.bus;
+    setTimeout(() => { try { bus.disconnect(); } catch (e) { /* already gone */ } }, 300);
+  }
+
+  const voiceActive = (v, t) => !!v && t >= v.t0 && t - v.t0 < v.dur * 1000;
+
+  // How far the mouth is open (0..1) for a voice at time t, following its syllables.
+  function mouthOpen(v, t) {
+    if (!voiceActive(v, t)) return 0;
+    const s = (t - v.t0) / 1000;
+    for (const [a, b] of SOUNDS[v.id].mouth) {
+      if (s >= a && s <= b) return clamp(Math.min((s - a) / 0.05, (b - s) / 0.05), 0, 1);
+    }
+    return 0;
+  }
+
+  // Spoken words via the Web Speech API. Android WebView usually lacks it,
+  // so this quietly does nothing there and the synthesized voices carry the game.
+  function say(text) {
+    try {
+      if (!('speechSynthesis' in window)) return;
+      window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'en-US';
+      u.rate = 0.85;
+      u.pitch = 1.15;
+      window.speechSynthesis.speak(u);
+    } catch (e) { /* speech is optional */ }
+  }
+
+  // Say the animal's word right after its synthesized sound, if the question is still current.
+  function sayAfter(text, ms, step) {
+    const key = state.qKey;
+    setTimeout(() => {
+      // Skip it if the question moved on or a sound is playing again (e.g. a replay).
+      if (state.qKey === key && state.phase === 'play' && state.step === step && !voiceActive(state.voice, now())) say(text);
+    }, ms);
+  }
+
+  // ---------------------------------------------------------------------
+  // Rounds and difficulty
+  // ---------------------------------------------------------------------
+  function startRound() {
+    ensureSession();
+    const tier = TIERS[state.tier];
+    const ids = tier.pick();
+
+    state.animals = ids.map(id => ({ id, x: 0, y: 0, wobbleT0: -1e9, appearT0: 0 }));
+
+    // Plan the three questions: different animals each time when possible.
+    // At the top tier, only the look-alike farm animals are asked.
+    if (tier.similar) {
+      state.plan = shuffle(GROUPS.farm.slice());
+    } else if (ids.length >= CONFIG.SOUNDS_PER_ROUND) {
+      state.plan = shuffle(ids.slice()).slice(0, CONFIG.SOUNDS_PER_ROUND);
+    } else {
+      const first = Math.floor(Math.random() * ids.length);
+      state.plan = [...Array(CONFIG.SOUNDS_PER_ROUND).keys()].map(k => ids[(first + k) % ids.length]);
+    }
+
+    state.q = 0;
+    state.roundSlips = 0;
+    state.firstTry = 0;
+    state.replays = 0;
+    state.responseMs = 0;
+    state.particles = [];
+    state.phase = 'play';
+    state.roundStart = now();
+    log(`Round ${state.round + 1}/${CONFIG.ROUNDS} started at level ${state.tier + 1}: ${ids.join(', ')}; asking ${state.plan.join(', ')}`);
+    startQuestion(now());
+  }
+
+  // Each question reshuffles where the animals stand, so the child listens
+  // rather than remembering a spot.
+  function startQuestion(t) {
+    stopVoice();
+    shuffle(state.animals);
+    state.animals.forEach((a, i) => { a.appearT0 = t + i * 70; a.wobbleT0 = -1e9; });
+    state.target = state.plan[state.q];
+    state.slips = 0;
+    state.answerIndex = -1;
+    state.qKey++;
+    computeLayout();
+    state.step = 'intro';
+    state.stepT0 = t;
+    state.lastInteraction = t;
+  }
+
+  // The question's sound plays (automatically, or from a speaker tap).
+  function playQuestionSound(t, auto) {
+    const v = playVoice(state.target, 'speaker', -1, t);
+    state.speakerPressT0 = t;
+    if (state.step === 'intro') {
+      state.step = 'ask';
+      state.stepT0 = t;
+      state.askStart = t;
+      sayAfter(ANIMALS[state.target].word, v.dur * 1000 + 120, 'ask');
+      log(`Question ${state.q + 1}/${CONFIG.SOUNDS_PER_ROUND}: playing the ${state.target} sound${auto ? '' : ' (speaker tapped)'}`);
+    }
+  }
+
+  function tapAnimal(i, t) {
+    const a = state.animals[i];
+    if (a.id === state.target) {
+      state.responseMs += t - state.askStart;
+      if (state.slips === 0) state.firstTry++;
+      progress.matched++;
+      // The animal says its sound, mouth in time with it; sparkles on the same frame.
+      const v = playVoice(a.id, 'animal', i, t);
+      spawnParticles(a, t);
+      state.answerIndex = i;
+      state.answerEndAt = t + v.dur * 1000 + CONFIG.ANSWER_PAD_MS;
+      state.step = 'answer';
+      state.stepT0 = t;
+      sayAfter(ANIMALS[a.id].word, v.dur * 1000 + 60, 'answer');
+      log(`Answer accepted: ${a.id} (slips on this sound: ${state.slips})`);
+    } else {
+      // Control of error: that animal wobbles, and the sound simply plays again.
+      a.wobbleT0 = t;
+      state.slips++;
+      state.roundSlips++;
+      progress.wrongTaps++;
+      playVoice(state.target, 'speaker', -1, t);
+      state.speakerPressT0 = t;
+      log(`Item rejected: tapped ${a.id}, the sound was ${state.target}`);
+    }
+  }
+
+  function finishQuestion(t) {
+    state.q++;
+    if (state.q >= CONFIG.SOUNDS_PER_ROUND) {
+      completeRound(t);
+    } else {
+      playChime();   // the next animals pop in on the same frame
+      startQuestion(t);
+    }
+  }
+
+  function completeRound(t) {
+    const ms = state.responseMs;
+    const record = {
+      level: state.tier + 1,
+      animals: state.animals.length,
+      sounds: CONFIG.SOUNDS_PER_ROUND,
+      firstTry: state.firstTry,
+      attempts: CONFIG.SOUNDS_PER_ROUND + state.roundSlips,    // animal taps
+      slips: state.roundSlips,
+      replays: state.replays,
+      seconds: Math.round(ms / 100) / 10,
+    };
+
+    session.rounds.push(record);
+    progress.roundsCompleted++;
+    progress.replays += state.replays;
+    progress.lastPlayed = new Date().toISOString();
+    state.round++;
+    log('Level completed', record);
+
+    const finalRound = state.round >= CONFIG.ROUNDS;
+    if (finalRound) {
+      session.finished = true;
+      progress.gamesCompleted++;
+    } else {
+      // Praise the listening and the effort (growth mindset).
+      say(state.roundSlips > 0 ? 'You kept trying, and you did it!' : 'You listened so carefully!');
+    }
+    saveProgress();
+    adjustDifficulty(record, ms);
+
+    playRoundDone();
+    state.animals.forEach(a => spawnParticles(a, t));
+    state.step = 'done';
+    state.phase = 'celebrate';
+    state.celebrateStart = t;
+  }
+
+  // Simple DDA: quick and clean -> one step harder; a real struggle -> one step easier.
+  function adjustDifficulty(record, ms) {
+    const fast = ms / record.sounds <= CONFIG.FAST_MS_PER_SOUND;
+    const before = state.tier;
+    if (record.firstTry === record.sounds && fast) {
+      state.tier = Math.min(TIERS.length - 1, state.tier + 1);
+    } else if (record.slips >= 3) {
+      state.tier = Math.max(0, state.tier - 1);
+    }
+    if (state.tier !== before) log(`Difficulty ${state.tier > before ? 'up' : 'down'}: level ${before + 1} -> ${state.tier + 1}`);
+  }
+
+  function enterEnd() {
+    stopVoice();
+    state.phase = 'end';
+    say('Great job! Time to play outside!');
+    log('Session finished: end screen shown, no replay offered');
+  }
+
+  // ---------------------------------------------------------------------
+  // Layout
+  // ---------------------------------------------------------------------
+  // The speaker sits top-centre; the animals share the rest of the screen in
+  // whichever grid (columns x rows) gives them the biggest size.
+  function computeLayout() {
+    const minDim = Math.min(W, H);
+    const m = clamp(minDim * 0.045, 12, 36);
+    const r = clamp(minDim * 0.11, 38, 78);
+    // Keep the speaker clear of the home button on very narrow screens.
+    const spX = Math.min(W / 2, W - CONFIG.HOME_RESERVE_PX - r * 1.15);
+    L.sp = { x: spX, y: m + r * 1.1, r };
+    L.m = m;
+
+    const n = state.animals.length || 3;
+    const top = L.sp.y + r * 1.35 + m * 0.5;
+    const availW = W - 2 * m;
+    const availH = Math.max(80, H - m - top);
+
+    let best = { s: 0, cols: n, rows: 1 };
+    for (let cols = 1; cols <= n; cols++) {
+      const rows = Math.ceil(n / cols);
+      const s = Math.min(availW / cols / 2.7, availH / rows / 2.6, minDim * 0.2);
+      if (s > best.s + 0.5) best = { s, cols, rows };
+    }
+    L.s = Math.max(22, best.s);
+
+    const cw = availW / best.cols;
+    const ch = availH / best.rows;
+    state.animals.forEach((a, i) => {
+      const row = Math.floor(i / best.cols);
+      const inRow = row === best.rows - 1 ? n - row * best.cols : best.cols;
+      const col = i - row * best.cols;
+      a.x = W / 2 + (col - (inRow - 1) / 2) * cw;
+      a.y = top + ch * (row + 0.5) + L.s * 0.08;
+    });
+  }
+
+  // Forgiving hit test: a generous oval around each animal, nearest one wins.
+  function findAnimal(p) {
+    let best = -1, bestD = Infinity;
+    state.animals.forEach((a, i) => {
+      const d = Math.hypot(p.x - a.x, (p.y - a.y) * 0.85);
+      if (d <= L.s * 1.45 && d < bestD) { best = i; bestD = d; }
+    });
+    return best;
+  }
+
+  const onSpeaker = p => Math.hypot(p.x - L.sp.x, p.y - L.sp.y) <= L.sp.r * 1.35;
+
+  // ---------------------------------------------------------------------
+  // Input: touch + mouse
+  // ---------------------------------------------------------------------
+  let activeTouch = null;
+  let mouseDown = false;
+  let parentTimer = null;
+
+  function toCanvas(clientX, clientY) {
+    const r = canvas.getBoundingClientRect();
+    return { x: clientX - r.left, y: clientY - r.top };
+  }
+
+  function findTouch(list, id) {
+    for (let i = 0; i < list.length; i++) if (list[i].identifier === id) return list[i];
+    return null;
+  }
+
+  function cancelParentHold() {
+    if (parentTimer) { clearTimeout(parentTimer); parentTimer = null; }
+  }
+
+  function onDown(p) {
+    unlockAudio();
+    const t = now();
+    state.lastInteraction = t;
+
+    if (state.phase === 'start' || state.phase === 'between') {
+      const g = starGeom();
+      if (Math.hypot(p.x - g.cx, p.y - g.cy) <= g.R * 1.8) { startRound(); return; }
+    } else if (state.phase === 'play' && (state.step === 'intro' || state.step === 'ask')) {
+      if (onSpeaker(p)) {
+        if (state.step === 'ask') state.replays++;
+        playTap();
+        playQuestionSound(t, false);
+        return;
+      }
+      // Animals listen only once the sound has been heard.
+      if (state.step === 'ask') {
+        const i = findAnimal(p);
+        if (i >= 0) { tapAnimal(i, t); return; }
+      }
+    }
+
+    // Hidden parent view: hold the top-left corner still for 3 seconds.
+    if (p.x < CONFIG.PARENT_CORNER_PX && p.y < CONFIG.PARENT_CORNER_PX) {
+      cancelParentHold();
+      parentTimer = setTimeout(openParent, CONFIG.PARENT_HOLD_MS);
+    }
+  }
+
+  function onMove(p) {
+    if (parentTimer && (p.x >= CONFIG.PARENT_CORNER_PX || p.y >= CONFIG.PARENT_CORNER_PX)) cancelParentHold();
+  }
+
+  function onUp() {
+    cancelParentHold();
+  }
+
+  canvas.addEventListener('touchstart', e => {
+    e.preventDefault();
+    if (activeTouch !== null) return;          // one finger at a time
+    const t = e.changedTouches[0];
+    activeTouch = t.identifier;
+    onDown(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  canvas.addEventListener('touchmove', e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (t) onMove(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  const endTouch = e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (!t) return;
+    activeTouch = null;
+    onUp();
+  };
+  canvas.addEventListener('touchend', endTouch, { passive: false });
+  canvas.addEventListener('touchcancel', endTouch, { passive: false });
+
+  canvas.addEventListener('mousedown', e => { mouseDown = true; onDown(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mousemove', e => { if (mouseDown) onMove(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mouseup', () => {
+    if (!mouseDown) return;
+    mouseDown = false;
+    onUp();
+  });
+
+  // ---------------------------------------------------------------------
+  // Parent view (hidden, local data only)
+  // ---------------------------------------------------------------------
+  const parentEl = document.getElementById('parent');
+  const parentBody = document.getElementById('parentBody');
+
+  function el(tag, text) {
+    const node = document.createElement(tag);
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function openParent() {
+    parentTimer = null;
+    const sounds = progress.sessions.reduce((a, s) => a + s.rounds.reduce((b, r) => b + r.sounds, 0), 0);
+    const firstTry = progress.sessions.reduce((a, s) => a + s.rounds.reduce((b, r) => b + r.firstTry, 0), 0);
+
+    parentBody.textContent = '';
+    parentBody.appendChild(el('div', `Full games finished: ${progress.gamesCompleted}`));
+    parentBody.appendChild(el('div', `Rounds finished: ${progress.roundsCompleted}`));
+    parentBody.appendChild(el('div', `Sounds matched: ${progress.matched}`));
+    parentBody.appendChild(el('div', `Matched on the first try: ${sounds ? Math.round(100 * firstTry / sounds) : 0}%`));
+    parentBody.appendChild(el('div', `Times the sound was replayed: ${progress.replays}`));
+
+    const recent = progress.sessions.slice(-6).reverse();
+    if (recent.length) {
+      const table = el('table');
+      const head = el('tr');
+      ['When', 'Rounds', 'Top level', 'Slips'].forEach(h => head.appendChild(el('th', h)));
+      table.appendChild(head);
+      recent.forEach(s => {
+        const tr = el('tr');
+        const when = new Date(s.startedAt);
+        tr.appendChild(el('td', when.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' ' +
+          when.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })));
+        tr.appendChild(el('td', `${s.rounds.length}/${CONFIG.ROUNDS}`));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => Math.max(a, r.level), 0) || '-')));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => a + r.slips, 0))));
+        table.appendChild(tr);
+      });
+      parentBody.appendChild(table);
+    }
+    parentEl.hidden = false;
+    log('Parent view opened', progress);
+  }
+
+  parentEl.addEventListener('click', () => { parentEl.hidden = true; });
+
+  // Read-only debug hooks for the Android/desktop console.
+  window.AnimalSoundMatch = {
+    progress: () => JSON.parse(JSON.stringify(progress)),
+    state: () => ({
+      phase: state.phase,
+      step: state.step,
+      listening: state.phase === 'play' && state.step === 'ask',
+      round: state.round,
+      level: state.tier + 1,
+      question: state.q,
+      target: state.target,
+      correctIndex: state.animals.findIndex(a => a.id === state.target),
+      audio: !!actx,
+      speaker: { x: L.sp.x, y: L.sp.y, r: L.sp.r },
+      animals: state.animals.map((a, i) => ({ index: i, id: a.id, x: a.x, y: a.y, r: L.s, correct: a.id === state.target })),
+      star: (state.phase === 'start' || state.phase === 'between') ? { x: starGeom().cx, y: starGeom().cy } : null,
+    }),
+  };
+
+  // ---------------------------------------------------------------------
+  // Drawing primitives
+  // ---------------------------------------------------------------------
+  function circle(x, y, r) { ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); }
+  function oval(x, y, rx, ry, rot = 0) { ctx.beginPath(); ctx.ellipse(x, y, Math.max(0.01, rx), Math.max(0.01, ry), rot, 0, TAU); }
+
+  // Fill + soft darker outline, the house style for every animal part (fill is a hex colour).
+  function paint(fill, line) {
+    ctx.fillStyle = fill;
+    ctx.fill();
+    if (line) {
+      ctx.strokeStyle = shade(fill, -0.3);
+      ctx.stroke();
+    }
+  }
+
+  // Eyes: a dark dot with a glint, a regular slow blink, or happy arcs.
+  function eyes(s, dx, y, r, t, happy, phase) {
+    ctx.fillStyle = COLORS.ink;
+    ctx.strokeStyle = COLORS.ink;
+    ctx.lineWidth = Math.max(1.5, s * 0.055);
+    const blink = !happy && ((t + phase) % 3800) < 130;
+    for (const side of [-1, 1]) {
+      const x = side * dx;
+      if (happy) {
+        ctx.beginPath(); ctx.arc(x, y + r * 0.4, r * 1.05, 1.15 * Math.PI, 1.85 * Math.PI); ctx.stroke();
+      } else if (blink) {
+        ctx.beginPath(); ctx.moveTo(x - r, y); ctx.lineTo(x + r, y); ctx.stroke();
+      } else {
+        circle(x, y, r); ctx.fill();
+        ctx.fillStyle = '#fff';
+        circle(x + r * 0.35, y - r * 0.38, r * 0.34); ctx.fill();
+        ctx.fillStyle = COLORS.ink;
+      }
+    }
+  }
+
+  function cheeks(s, dx, y) {
+    ctx.save();
+    ctx.globalAlpha = 0.4;
+    ctx.fillStyle = COLORS.cheek;
+    for (const side of [-1, 1]) { oval(side * dx, y, s * 0.09, s * 0.055); ctx.fill(); }
+    ctx.restore();
+  }
+
+  // An open mouth: dark oval with a little tongue, sized by mo (0..1).
+  function openMouth(x, y, rx, ry, mo) {
+    if (mo <= 0.02) return false;
+    ctx.fillStyle = '#6B3F3A';
+    oval(x, y, rx * (0.7 + 0.3 * mo), ry * mo);
+    ctx.fill();
+    ctx.fillStyle = '#E98A8A';
+    oval(x, y + ry * mo * 0.45, rx * 0.5, ry * mo * 0.42);
+    ctx.fill();
+    return true;
+  }
+
+  function smile(x, y, r, lw) {
+    ctx.strokeStyle = COLORS.ink;
+    ctx.lineWidth = lw;
+    ctx.beginPath(); ctx.arc(x, y - r * 0.5, r, 0.2 * Math.PI, 0.8 * Math.PI); ctx.stroke();
+  }
+
+  // ---------------------------------------------------------------------
+  // The animals. Each draws centred on (0, 0) with size unit s; the figure
+  // spans about -1.25s (ears) to +1.05s (feet). mo = mouth open (0..1).
+  // ---------------------------------------------------------------------
+  const DRAW = {
+    cow(s, mo, t, happy) {
+      const c = ANIMALS.cow.color, patch = '#7B675B', pink = '#F3B9AF';
+      // Body with patches.
+      oval(0, s * 0.55, s * 0.58, s * 0.46); paint(c, true);
+      ctx.save(); oval(0, s * 0.55, s * 0.58, s * 0.46); ctx.clip();
+      ctx.fillStyle = patch;
+      oval(-s * 0.38, s * 0.42, s * 0.24, s * 0.18, 0.4); ctx.fill();
+      oval(s * 0.42, s * 0.75, s * 0.22, s * 0.16, -0.3); ctx.fill();
+      ctx.restore();
+      for (const side of [-1, 1]) { oval(side * s * 0.28, s * 0.98, s * 0.17, s * 0.09); paint('#8C7A6E', false); }
+      // Horns and ears behind the head.
+      for (const side of [-1, 1]) {
+        ctx.beginPath();
+        ctx.moveTo(side * s * 0.26, -s * 0.78);
+        ctx.quadraticCurveTo(side * s * 0.42, -s * 1.12, side * s * 0.52, -s * 1.08);
+        ctx.quadraticCurveTo(side * s * 0.44, -s * 0.9, side * s * 0.42, -s * 0.72);
+        ctx.closePath(); paint('#EBDDBC', true);
+        oval(side * s * 0.66, -s * 0.5, s * 0.25, s * 0.12, side * 0.35); paint(c, true);
+        oval(side * s * 0.68, -s * 0.5, s * 0.14, s * 0.06, side * 0.35); ctx.fillStyle = pink; ctx.fill();
+      }
+      // Head with a patch over one eye.
+      circle(0, -s * 0.32, s * 0.6); paint(c, true);
+      ctx.save(); circle(0, -s * 0.32, s * 0.6); ctx.clip();
+      ctx.fillStyle = patch; oval(s * 0.32, -s * 0.62, s * 0.3, s * 0.24, 0.5); ctx.fill();
+      ctx.restore();
+      // Muzzle, nostrils, mouth.
+      oval(0, -s * 0.06, s * 0.42, s * 0.27); paint(pink, true);
+      ctx.fillStyle = shade(pink, -0.3);
+      oval(-s * 0.15, -s * 0.12, s * 0.06, s * 0.045); ctx.fill();
+      oval(s * 0.15, -s * 0.12, s * 0.06, s * 0.045); ctx.fill();
+      if (!openMouth(0, s * 0.06, s * 0.16, s * 0.13, mo)) smile(0, s * 0.06, s * 0.1, Math.max(1.2, s * 0.04));
+      eyes(s, s * 0.23, -s * 0.5, s * 0.075, t, happy, 0);
+    },
+
+    dog(s, mo, t, happy) {
+      const c = ANIMALS.dog.color, ear = '#946B4A', light = '#F3E0C6';
+      oval(0, s * 0.55, s * 0.55, s * 0.46); paint(c, true);
+      oval(0, s * 0.62, s * 0.32, s * 0.3); ctx.fillStyle = light; ctx.fill();
+      for (const side of [-1, 1]) { oval(side * s * 0.28, s * 0.98, s * 0.18, s * 0.1); paint(c, true); }
+      circle(0, -s * 0.32, s * 0.6); paint(c, true);
+      // Patch over one eye.
+      ctx.save(); circle(0, -s * 0.32, s * 0.6); ctx.clip();
+      ctx.fillStyle = shade(c, -0.12); oval(-s * 0.24, -s * 0.5, s * 0.18, s * 0.16); ctx.fill();
+      ctx.restore();
+      // Floppy ears hang over the sides of the head.
+      for (const side of [-1, 1]) {
+        oval(side * s * 0.56, -s * 0.36, s * 0.19, s * 0.38, side * 0.28 + side * mo * 0.15); paint(ear, true);
+      }
+      oval(0, -s * 0.12, s * 0.32, s * 0.24); paint(light, false);
+      if (!openMouth(0, s * 0.02, s * 0.15, s * 0.14, mo)) {
+        ctx.strokeStyle = COLORS.ink; ctx.lineWidth = Math.max(1.2, s * 0.04);
+        ctx.beginPath(); ctx.moveTo(0, -s * 0.16); ctx.lineTo(0, -s * 0.06);
+        ctx.arc(-s * 0.08, -s * 0.06, s * 0.08, 0, 0.8 * Math.PI);
+        ctx.moveTo(0, -s * 0.06); ctx.arc(s * 0.08, -s * 0.06, s * 0.08, Math.PI, 0.2 * Math.PI, true);
+        ctx.stroke();
+      }
+      ctx.fillStyle = COLORS.ink; oval(0, -s * 0.2, s * 0.11, s * 0.08); ctx.fill();
+      ctx.fillStyle = 'rgba(255,255,255,0.6)'; oval(-s * 0.03, -s * 0.23, s * 0.035, s * 0.02); ctx.fill();
+      eyes(s, s * 0.23, -s * 0.48, s * 0.075, t, happy, 900);
+      cheeks(s, s * 0.38, -s * 0.2);
+    },
+
+    cat(s, mo, t, happy) {
+      const c = ANIMALS.cat.color, stripe = '#DB9659', light = '#FBE8D1', pink = '#EFA4A0';
+      // Tail curling up beside the body.
+      ctx.strokeStyle = shade(c, -0.3);
+      ctx.lineCap = 'round';
+      ctx.lineWidth = s * 0.2;
+      ctx.beginPath(); ctx.moveTo(s * 0.4, s * 0.85); ctx.quadraticCurveTo(s * 0.95, s * 0.8, s * 0.85, s * 0.25); ctx.stroke();
+      ctx.strokeStyle = c; ctx.lineWidth = s * 0.13; ctx.stroke();
+      ctx.lineWidth = Math.max(1.5, s * 0.055);
+      oval(0, s * 0.55, s * 0.52, s * 0.46); paint(c, true);
+      oval(0, s * 0.62, s * 0.3, s * 0.3); ctx.fillStyle = light; ctx.fill();
+      for (const side of [-1, 1]) { oval(side * s * 0.26, s * 0.98, s * 0.16, s * 0.09); paint(c, true); }
+      // Pointy ears.
+      for (const side of [-1, 1]) {
+        ctx.beginPath();
+        ctx.moveTo(side * s * 0.18, -s * 0.8);
+        ctx.lineTo(side * s * 0.5, -s * 1.15);
+        ctx.lineTo(side * s * 0.58, -s * 0.58);
+        ctx.closePath(); paint(c, true);
+        ctx.beginPath();
+        ctx.moveTo(side * s * 0.28, -s * 0.8);
+        ctx.lineTo(side * s * 0.48, -s * 1.02);
+        ctx.lineTo(side * s * 0.52, -s * 0.7);
+        ctx.closePath(); ctx.fillStyle = pink; ctx.fill();
+      }
+      circle(0, -s * 0.32, s * 0.6); paint(c, true);
+      // Forehead stripes.
+      ctx.strokeStyle = stripe; ctx.lineWidth = s * 0.06;
+      for (const dx of [-0.13, 0, 0.13]) {
+        ctx.beginPath(); ctx.moveTo(dx * s, -s * 0.9); ctx.lineTo(dx * s * 0.8, -s * 0.74); ctx.stroke();
+      }
+      oval(0, -s * 0.1, s * 0.3, s * 0.2); ctx.fillStyle = light; ctx.fill();
+      // Whiskers.
+      ctx.strokeStyle = 'rgba(74, 64, 54, 0.55)'; ctx.lineWidth = Math.max(1, s * 0.025);
+      for (const side of [-1, 1]) {
+        for (const k of [-1, 0, 1]) {
+          ctx.beginPath();
+          ctx.moveTo(side * s * 0.28, -s * 0.1 + k * s * 0.05);
+          ctx.lineTo(side * s * 0.72, -s * 0.14 + k * s * 0.11);
+          ctx.stroke();
+        }
+      }
+      if (!openMouth(0, s * 0.0, s * 0.11, s * 0.12, mo)) {
+        ctx.strokeStyle = COLORS.ink; ctx.lineWidth = Math.max(1.2, s * 0.035);
+        ctx.beginPath();
+        ctx.arc(-s * 0.06, -s * 0.08, s * 0.06, 0.1 * Math.PI, 0.9 * Math.PI);
+        ctx.moveTo(s * 0.12, -s * 0.08);
+        ctx.arc(s * 0.06, -s * 0.08, s * 0.06, 0.1 * Math.PI, 0.9 * Math.PI);
+        ctx.stroke();
+      }
+      ctx.fillStyle = pink;
+      ctx.beginPath(); ctx.moveTo(-s * 0.06, -s * 0.16); ctx.lineTo(s * 0.06, -s * 0.16); ctx.lineTo(0, -s * 0.09); ctx.closePath(); ctx.fill();
+      eyes(s, s * 0.24, -s * 0.38, s * 0.085, t, happy, 1700);
+      cheeks(s, s * 0.42, -s * 0.16);
+    },
+
+    duck(s, mo, t, happy) {
+      const c = ANIMALS.duck.color, bill = '#F39F4C';
+      for (const side of [-1, 1]) {
+        ctx.beginPath();
+        ctx.moveTo(side * s * 0.12, s * 0.96);
+        ctx.lineTo(side * s * 0.46, s * 0.96);
+        ctx.lineTo(side * s * 0.3, s * 0.82);
+        ctx.closePath(); paint(bill, true);
+      }
+      oval(0, s * 0.52, s * 0.6, s * 0.46); paint(c, true);
+      for (const side of [-1, 1]) { oval(side * s * 0.5, s * 0.5, s * 0.16, s * 0.3, -side * 0.5); paint('#EEC851', false); }
+      // Head tuft.
+      ctx.strokeStyle = shade(c, -0.3); ctx.lineWidth = Math.max(1.5, s * 0.06); ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(0, -s * 0.9); ctx.quadraticCurveTo(s * 0.05, -s * 1.12, s * 0.18, -s * 1.08); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(-s * 0.04, -s * 0.9); ctx.quadraticCurveTo(-s * 0.12, -s * 1.08, -s * 0.02, -s * 1.16); ctx.stroke();
+      ctx.lineWidth = Math.max(1.5, s * 0.055);
+      circle(0, -s * 0.34, s * 0.58); paint(c, true);
+      // Bill: the lower half drops open with the quack.
+      const drop = mo * s * 0.13;
+      if (mo > 0.02) { ctx.fillStyle = '#6B3F3A'; oval(0, -s * 0.08 + drop * 0.5, s * 0.22, s * 0.06 + drop * 0.5); ctx.fill(); }
+      oval(0, -s * 0.03 + drop, s * 0.27, s * 0.09); paint('#E8913F', true);
+      oval(0, -s * 0.13, s * 0.32, s * 0.12); paint(bill, true);
+      ctx.fillStyle = shade(bill, -0.3);
+      oval(-s * 0.08, -s * 0.16, s * 0.025, s * 0.018); ctx.fill();
+      oval(s * 0.08, -s * 0.16, s * 0.025, s * 0.018); ctx.fill();
+      eyes(s, s * 0.22, -s * 0.46, s * 0.075, t, happy, 2500);
+      cheeks(s, s * 0.4, -s * 0.24);
+    },
+
+    sheep(s, mo, t, happy) {
+      const wool = ANIMALS.sheep.color, face = '#8C786C', line = shade('#E8E0D2', -0.3);
+      // Legs.
+      for (const side of [-1, 1]) {
+        ctx.beginPath(); ctx.rect(side * s * 0.28 - s * 0.07, s * 0.75, s * 0.14, s * 0.24);
+        ctx.fillStyle = face; ctx.fill();
+        oval(side * s * 0.28, s * 0.99, s * 0.09, s * 0.05); ctx.fillStyle = shade(face, -0.25); ctx.fill();
+      }
+      // Woolly cloud: outline all puffs first, then fill them, so only the outer edge shows.
+      const puffs = [];
+      for (let k = 0; k < 9; k++) {
+        const a = (k / 9) * TAU;
+        puffs.push([Math.cos(a) * s * 0.5, s * 0.5 + Math.sin(a) * s * 0.34, s * 0.24]);
+      }
+      for (let k = 0; k < 7; k++) {
+        const a = Math.PI + (k / 6) * Math.PI;
+        puffs.push([Math.cos(a) * s * 0.42, -s * 0.5 + Math.sin(a) * s * 0.36, s * 0.2]);
+      }
+      puffs.push([0, s * 0.5, s * 0.42]);
+      ctx.strokeStyle = line; ctx.lineWidth = Math.max(1.5, s * 0.055) * 2;
+      for (const [x, y, r] of puffs) { circle(x, y, r); ctx.stroke(); }
+      ctx.fillStyle = wool;
+      for (const [x, y, r] of puffs) { circle(x, y, r); ctx.fill(); }
+      ctx.lineWidth = Math.max(1.5, s * 0.055);
+      // Ears and face.
+      for (const side of [-1, 1]) { oval(side * s * 0.44, -s * 0.36, s * 0.22, s * 0.09, side * 0.25); paint(face, true); }
+      oval(0, -s * 0.24, s * 0.34, s * 0.44); paint(face, true);
+      // Wool fringe on the forehead.
+      ctx.fillStyle = wool; ctx.strokeStyle = line;
+      for (const dx of [-0.17, 0, 0.17]) { circle(dx * s, -s * 0.66, s * 0.14); ctx.fill(); }
+      if (!openMouth(0, -s * 0.02, s * 0.12, s * 0.12, mo)) {
+        ctx.strokeStyle = shade(face, 0.45); ctx.lineWidth = Math.max(1.2, s * 0.04);
+        ctx.beginPath(); ctx.moveTo(0, -s * 0.1); ctx.lineTo(0, -s * 0.03);
+        ctx.moveTo(-s * 0.07, 0); ctx.lineTo(0, -s * 0.03); ctx.lineTo(s * 0.07, 0); ctx.stroke();
+      }
+      ctx.fillStyle = shade(face, -0.3); oval(0, -s * 0.13, s * 0.07, s * 0.04); ctx.fill();
+      // Eyes on the darker face get a pale ring so they read clearly.
+      ctx.fillStyle = shade(face, 0.55);
+      for (const side of [-1, 1]) { circle(side * s * 0.15, -s * 0.36, s * 0.085); ctx.fill(); }
+      eyes(s, s * 0.15, -s * 0.36, s * 0.06, t, happy, 600);
+    },
+
+    bird(s, mo, t, happy) {
+      const c = ANIMALS.bird.color, belly = '#DDECF8', beak = '#F4B04C';
+      // Tail feathers behind.
+      ctx.save(); ctx.translate(s * 0.55, s * 0.55); ctx.rotate(-0.6);
+      oval(0, 0, s * 0.14, s * 0.36); paint('#6FA8DA', true);
+      ctx.restore();
+      // Feet.
+      ctx.strokeStyle = shade(beak, -0.2); ctx.lineWidth = Math.max(1.5, s * 0.05); ctx.lineCap = 'round';
+      for (const side of [-1, 1]) {
+        ctx.beginPath();
+        ctx.moveTo(side * s * 0.2, s * 0.7); ctx.lineTo(side * s * 0.2, s * 0.96);
+        ctx.moveTo(side * s * 0.2, s * 0.96); ctx.lineTo(side * s * 0.32, s * 1.0);
+        ctx.moveTo(side * s * 0.2, s * 0.96); ctx.lineTo(side * s * 0.08, s * 1.0);
+        ctx.stroke();
+      }
+      ctx.lineWidth = Math.max(1.5, s * 0.055);
+      // Crest.
+      for (const [dx, a] of [[-0.1, -0.35], [0, 0], [0.1, 0.35]]) {
+        ctx.save(); ctx.translate(dx * s, -s * 0.78); ctx.rotate(a);
+        oval(0, -s * 0.14, s * 0.07, s * 0.17); paint(c, true);
+        ctx.restore();
+      }
+      // One round body.
+      circle(0, -s * 0.02, s * 0.76); paint(c, true);
+      oval(0, s * 0.32, s * 0.48, s * 0.36); ctx.fillStyle = belly; ctx.fill();
+      // Wings flap a little with each chirp.
+      for (const side of [-1, 1]) {
+        oval(side * s * 0.7, s * 0.14, s * 0.17, s * 0.34, -side * (0.35 + mo * 0.45 * MOTION)); paint('#6AA3D4', true);
+      }
+      // Beak: the lower half opens with each chirp.
+      const drop = mo * s * 0.12;
+      ctx.beginPath(); ctx.moveTo(-s * 0.11, -s * 0.12); ctx.lineTo(s * 0.11, -s * 0.12); ctx.lineTo(0, -s * 0.02 + drop); ctx.closePath();
+      if (mo > 0.02) paint('#E09A3C', true);
+      ctx.beginPath(); ctx.moveTo(-s * 0.13, -s * 0.14); ctx.lineTo(s * 0.13, -s * 0.14); ctx.lineTo(0, -s * 0.0 - (mo > 0.02 ? s * 0.06 : 0)); ctx.closePath();
+      paint(beak, true);
+      eyes(s, s * 0.25, -s * 0.3, s * 0.08, t, happy, 3100);
+      cheeks(s, s * 0.43, -s * 0.12);
+    },
+
+    frog(s, mo, t, happy) {
+      const c = ANIMALS.frog.color, belly = '#DCEFC0';
+      // Body and legs.
+      for (const side of [-1, 1]) { oval(side * s * 0.52, s * 0.8, s * 0.3, s * 0.16, side * 0.2); paint(c, true); }
+      oval(0, s * 0.5, s * 0.6, s * 0.45); paint(c, true);
+      oval(0, s * 0.58, s * 0.38, s * 0.3); ctx.fillStyle = belly; ctx.fill();
+      for (const side of [-1, 1]) { oval(side * s * 0.25, s * 0.94, s * 0.16, s * 0.08); paint(c, true); }
+      // Eye bumps on top of a wide head.
+      for (const side of [-1, 1]) { circle(side * s * 0.36, -s * 0.62, s * 0.25); paint(c, true); }
+      oval(0, -s * 0.2, s * 0.74, s * 0.48); paint(c, true);
+      for (const side of [-1, 1]) {
+        circle(side * s * 0.36, -s * 0.64, s * 0.17); ctx.fillStyle = '#FFFDF8'; ctx.fill();
+      }
+      eyes(s, s * 0.36, -s * 0.64, s * 0.09, t, happy, 1300);
+      // Throat pouch puffs out with each croak.
+      if (mo > 0.02) {
+        oval(0, s * 0.12, s * 0.28 * (0.6 + 0.5 * mo), s * 0.18 * (0.5 + 0.6 * mo)); paint(belly, true);
+      }
+      if (!openMouth(0, -s * 0.12, s * 0.36, s * 0.12, mo)) {
+        ctx.strokeStyle = shade(c, -0.4); ctx.lineWidth = Math.max(1.5, s * 0.05);
+        ctx.beginPath(); ctx.moveTo(-s * 0.42, -s * 0.18); ctx.quadraticCurveTo(0, s * 0.02, s * 0.42, -s * 0.18); ctx.stroke();
+      }
+      ctx.fillStyle = shade(c, -0.35);
+      circle(-s * 0.07, -s * 0.32, s * 0.025); ctx.fill();
+      circle(s * 0.07, -s * 0.32, s * 0.025); ctx.fill();
+      cheeks(s, s * 0.5, -s * 0.14);
+    },
+
+    pig(s, mo, t, happy) {
+      const c = ANIMALS.pig.color, snout = '#EE9EA6';
+      // Curly tail.
+      ctx.strokeStyle = shade(c, -0.3); ctx.lineWidth = Math.max(1.5, s * 0.06); ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(s * 0.5, s * 0.55);
+      ctx.bezierCurveTo(s * 0.8, s * 0.5, s * 0.82, s * 0.25, s * 0.68, s * 0.28);
+      ctx.bezierCurveTo(s * 0.56, s * 0.32, s * 0.68, s * 0.46, s * 0.8, s * 0.38);
+      ctx.stroke();
+      ctx.lineWidth = Math.max(1.5, s * 0.055);
+      oval(0, s * 0.55, s * 0.58, s * 0.46); paint(c, true);
+      for (const side of [-1, 1]) { oval(side * s * 0.28, s * 0.98, s * 0.17, s * 0.09); paint('#E7A3A9', true); }
+      // Floppy triangle ears.
+      for (const side of [-1, 1]) {
+        ctx.beginPath();
+        ctx.moveTo(side * s * 0.16, -s * 0.84);
+        ctx.quadraticCurveTo(side * s * 0.62, -s * 1.12, side * s * 0.7, -s * 0.62);
+        ctx.quadraticCurveTo(side * s * 0.5, -s * 0.66, side * s * 0.42, -s * 0.56);
+        ctx.closePath(); paint(c, true);
+      }
+      circle(0, -s * 0.32, s * 0.6); paint(c, true);
+      // Snout with nostrils, mouth below.
+      if (!openMouth(0, s * 0.06, s * 0.14, s * 0.12, mo)) smile(0, s * 0.07, s * 0.1, Math.max(1.2, s * 0.04));
+      oval(0, -s * 0.16, s * 0.26, s * 0.17 * (1 + mo * 0.08)); paint(snout, true);
+      ctx.fillStyle = shade(snout, -0.35);
+      oval(-s * 0.09, -s * 0.16, s * 0.045, s * 0.07); ctx.fill();
+      oval(s * 0.09, -s * 0.16, s * 0.045, s * 0.07); ctx.fill();
+      eyes(s, s * 0.24, -s * 0.5, s * 0.075, t, happy, 2100);
+      cheeks(s, s * 0.42, -s * 0.24);
+    },
+  };
+
+  function drawAnimal(a, i, t, g) {
+    const s = L.s;
+    let x = a.x, y = a.y, rot = 0, sc = 1, sy = 1;
+
+    // Pop in at the start of each question.
+    const pp = clamp((t - a.appearT0) / CONFIG.POP_MS, 0, 1);
+    sc *= Math.max(0, easeOutBack(pp));
+    if (sc <= 0.01) return;
+
+    // Wrong tap: a soft wobble of this animal only.
+    const wp = (t - a.wobbleT0) / CONFIG.WOBBLE_MS;
+    if (wp >= 0 && wp < 1) {
+      const k = Math.sin(wp * Math.PI * 4) * (1 - wp) * MOTION;
+      x += k * s * 0.08;
+      rot = k * 0.08;
+    }
+
+    // Speaking: a little bounce on each syllable. Celebration: everyone hops.
+    const mo = state.voice && state.voice.source === 'animal' && state.voice.index === i ? mouthOpen(state.voice, t) : 0;
+    sy = 1 + mo * 0.04 * MOTION;
+    if (state.phase === 'celebrate') {
+      const k = (t - state.celebrateStart - i * 120) / 520;
+      if (k > 0) y -= Math.abs(Math.sin(Math.PI * k)) * s * 0.3 * MOTION;
+    }
+    const happy = (state.phase === 'celebrate') || (state.step === 'answer' && state.answerIndex === i);
+
+    // Ground shadow.
+    ctx.fillStyle = 'rgba(74, 64, 54, 0.12)';
+    oval(a.x, a.y + s * 1.02, s * 0.75 * sc, s * 0.13 * sc);
+    ctx.fill();
+
+    // Scaffolding hint: a warm halo behind the right animal.
+    if (g.hintIndex === i && g.glow > 0) {
+      ctx.save();
+      ctx.globalAlpha = 0.25 + 0.4 * g.glow;
+      ctx.fillStyle = shade(COLORS.glow, 0.35);
+      oval(a.x, a.y - s * 0.1, s * (1.2 + 0.12 * g.glow), s * (1.3 + 0.12 * g.glow));
+      ctx.fill();
+      ctx.restore();
+    }
+
+    ctx.save();
+    ctx.translate(x, y + s * 1.0);
+    ctx.rotate(rot);
+    ctx.scale(sc, sc * sy);
+    ctx.translate(0, -s * 1.0);
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.lineWidth = Math.max(1.5, s * 0.055);
+    DRAW[a.id](s, mo, t, happy);
+    ctx.restore();
+  }
+
+  // The speaker button: a soft coral disc with a friendly speaker and sound waves.
+  // Without Web Audio it shows a small picture of the animal instead.
+  function drawSpeaker(t, g) {
+    const { x, y, r } = L.sp;
+    const playing = state.voice && state.voice.source === 'speaker' && voiceActive(state.voice, t);
+    let k = g.speakerPulse;
+    const pp = (t - state.speakerPressT0) / 220;
+    if (pp >= 0 && pp < 1) k *= 1 - 0.07 * Math.sin(Math.PI * pp);
+
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(k, k);
+
+    // Sound waves ripple out while it plays.
+    if (playing) {
+      const e = (t - state.voice.t0) / 1000;
+      for (let w = 0; w < 3; w++) {
+        const ph = ((e * 1.6 + w / 3) % 1);
+        ctx.globalAlpha = (1 - ph) * 0.45;
+        ctx.strokeStyle = COLORS.speaker;
+        ctx.lineWidth = r * 0.08;
+        circle(0, 0, r * (1.02 + ph * 0.32));
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    ctx.fillStyle = 'rgba(74, 64, 54, 0.14)';
+    circle(0, r * 0.08, r); ctx.fill();
+    circle(0, 0, r);
+    ctx.fillStyle = COLORS.speaker; ctx.fill();
+    ctx.lineWidth = Math.max(2, r * 0.05);
+    ctx.strokeStyle = COLORS.speakerDark; ctx.stroke();
+
+    if (!actx && state.target) {
+      // No Web Audio at all: show the animal as a picture prompt.
+      ctx.fillStyle = '#FFFDF8';
+      circle(0, 0, r * 0.84); ctx.fill();
+      const s = r * 0.36;
+      ctx.translate(0, s * 0.1);
+      ctx.lineWidth = Math.max(1, s * 0.055);
+      ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+      DRAW[state.target](s, 0, t, false);
+    } else {
+      // Speaker icon.
+      ctx.fillStyle = '#FFFDF8';
+      ctx.beginPath();
+      ctx.moveTo(-r * 0.42, -r * 0.16);
+      ctx.lineTo(-r * 0.22, -r * 0.16);
+      ctx.lineTo(r * 0.04, -r * 0.4);
+      ctx.lineTo(r * 0.04, r * 0.4);
+      ctx.lineTo(-r * 0.22, r * 0.16);
+      ctx.lineTo(-r * 0.42, r * 0.16);
+      ctx.closePath();
+      ctx.lineJoin = 'round';
+      ctx.lineWidth = r * 0.08;
+      ctx.strokeStyle = '#FFFDF8';
+      ctx.fill(); ctx.stroke();
+      ctx.lineCap = 'round';
+      ctx.lineWidth = r * 0.09;
+      const wobble = playing ? 0.5 + 0.5 * Math.sin(t / 90) : 1;
+      for (let w = 0; w < 2; w++) {
+        ctx.globalAlpha = playing ? (w === 0 ? 1 : wobble) : 0.9;
+        ctx.beginPath();
+        ctx.arc(r * 0.08, 0, r * (0.22 + w * 0.18), -0.85, 0.85);
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+    }
+    ctx.restore();
+  }
+
+  function drawStar(cx, cy, R, fill, face) {
+    ctx.save();
+    ctx.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const rad = i % 2 === 0 ? R : R * 0.5;
+      const a = -Math.PI / 2 + i * Math.PI / 5;
+      const x = cx + rad * Math.cos(a), y = cy + rad * Math.sin(a);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    ctx.lineJoin = 'round';
+    if (fill) {
+      ctx.fillStyle = fill;
+      ctx.fill();
+      ctx.strokeStyle = fill;            // same-colour stroke rounds the tips
+      ctx.lineWidth = Math.max(2, R * 0.16);
+      ctx.stroke();
+    } else {
+      ctx.strokeStyle = 'rgba(74, 64, 54, 0.25)';
+      ctx.lineWidth = Math.max(2, R * 0.14);
+      ctx.stroke();
+    }
+
+    if (face) {
+      ctx.fillStyle = COLORS.ink;
+      ctx.beginPath(); ctx.arc(cx - R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.arc(cx + R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.strokeStyle = COLORS.ink;
+      ctx.lineWidth = Math.max(2, R * 0.05);
+      ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.arc(cx, cy + R * 0.06, R * 0.17, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+      ctx.globalAlpha = 0.35;
+      ctx.fillStyle = COLORS.cheek;
+      ctx.beginPath(); ctx.ellipse(cx - R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(cx + R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // Same ring of sparkles from every animal, every time (no random rewards).
+  function spawnParticles(a, t) {
+    const col = ANIMALS[a.id].color;
+    for (let i = 0; i < 10; i++) {
+      const ang = -Math.PI / 2 + (i - 4.5) * 0.3;
+      state.particles.push({ x0: a.x, y0: a.y - L.s * 0.9, dx: Math.cos(ang), dy: Math.sin(ang), dist: L.s * 1.3, t0: t, life: 900, color: i % 2 ? COLORS.star : shade(col, -0.05) });
+    }
+  }
+
+  function drawParticles(t) {
+    state.particles = state.particles.filter(p => t - p.t0 < p.life);
+    for (const p of state.particles) {
+      const k = (t - p.t0) / p.life;
+      const e = easeOutCubic(k);
+      ctx.globalAlpha = 1 - k;
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x0 + p.dx * p.dist * e, p.y0 + p.dy * p.dist * e, L.s * 0.1 * (1 - k * 0.5), 0, TAU);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------------------------------------------------------------------
+  // Screens
+  // ---------------------------------------------------------------------
+  function starGeom() {
+    return { cx: W / 2, cy: H * 0.42, R: Math.min(W, H) * 0.2 };
+  }
+
+  // Start and between-round screen: one big pulsing star to tap, plus 5 slots
+  // that fill up so the child can see the end coming.
+  function drawStarScreen(t) {
+    const { cx, cy, R } = starGeom();
+    const amp = reduceMotion ? 0.03 : 0.07;
+    const k = 1 + amp * (0.5 - 0.5 * Math.cos(TAU * t / 1400));
+    drawStar(cx, cy, R * k, COLORS.star, true);
+
+    const sr = R * 0.16, gap = sr * 2.8, y = cy + R * 1.35;
+    for (let i = 0; i < CONFIG.ROUNDS; i++) {
+      drawStar(cx + (i - (CONFIG.ROUNDS - 1) / 2) * gap, y, sr, i < state.round ? COLORS.star : null, false);
+    }
+  }
+
+  function fitFont(text, weight, size, maxW) {
+    ctx.font = `${weight} ${size}px ${FONT}`;
+    while (size > 12 && ctx.measureText(text).width > maxW) {
+      size -= 1;
+      ctx.font = `${weight} ${size}px ${FONT}`;
+    }
+    return size;
+  }
+
+  // Static end screen. No buttons: the session is over.
+  function drawEnd() {
+    const gh = H * 0.14;
+    ctx.fillStyle = COLORS.grass;
+    ctx.beginPath();
+    ctx.moveTo(0, H - gh);
+    ctx.quadraticCurveTo(W / 2, H - gh * 1.5, W, H - gh);
+    ctx.lineTo(W, H);
+    ctx.lineTo(0, H);
+    ctx.closePath();
+    ctx.fill();
+
+    const R = Math.min(W, H) * 0.2;
+    const cy = H * 0.36;
+    drawStar(W / 2, cy, R, COLORS.star, true);
+
+    const big = clamp(Math.min(W, H) * 0.1, 26, 68);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = COLORS.ink;
+    const top = cy + R * 1.25;
+    fitFont('Great Job!', 800, big, W * 0.9);
+    ctx.fillText('Great Job!', W / 2, top + big * 0.5);
+    fitFont('Time to play outside!', 700, Math.round(big * 0.62), W * 0.9);
+    ctx.fillText('Time to play outside!', W / 2, top + big * 1.55);
+  }
+
+  // How much the speaker pulses, and which animal (if any) glows right now.
+  function guidance(t) {
+    const out = { speakerPulse: 1, hintIndex: -1, glow: 0 };
+    if (state.phase !== 'play' || state.step !== 'ask') return out;
+    const amp = reduceMotion ? 0.04 : 0.09;
+    const right = state.animals.findIndex(a => a.id === state.target);
+
+    // Scaffolding: after 2 slips on this sound the right animal glows.
+    if (state.slips >= 2) { out.hintIndex = right; out.glow = 0.5 + 0.5 * Math.sin(TAU * t / 1300); }
+    const idle = t - state.lastInteraction;
+    if (idle <= CONFIG.IDLE_PULSE_MS || voiceActive(state.voice, t)) return out;
+
+    // Idle: the speaker gently pulses ("listen again").
+    const wave = 0.5 - 0.5 * Math.cos(TAU * (idle - CONFIG.IDLE_PULSE_MS) / 1300);
+    out.speakerPulse = 1 + amp * wave;
+
+    // First round: if the child has not found the mechanic yet, glow the right animal too.
+    const tutorial = state.round === 0 && state.q === 0 && idle > CONFIG.TUTORIAL_HINT_MS;
+    if (tutorial) { out.hintIndex = right; out.glow = wave; }
+    return out;
+  }
+
+  function drawPlay(t) {
+    const g = guidance(t);
+    drawSpeaker(t, g);
+    state.animals.forEach((a, i) => drawAnimal(a, i, t, g));
+    drawParticles(t);
+  }
+
+  // ---------------------------------------------------------------------
+  // Main loop
+  // ---------------------------------------------------------------------
+  function update(t) {
+    if (state.phase === 'play') {
+      if (state.step === 'intro' && t - state.stepT0 >= CONFIG.INTRO_MS) playQuestionSound(t, true);
+      else if (state.step === 'answer' && t >= state.answerEndAt) finishQuestion(t);
+    }
+
+    if (state.phase === 'celebrate' && t - state.celebrateStart >= CONFIG.CELEBRATE_MS) {
+      if (state.round >= CONFIG.ROUNDS) enterEnd();
+      else state.phase = 'between';
+    }
+  }
+
+  function render(t) {
+    ctx.fillStyle = COLORS.bg;
+    ctx.fillRect(0, 0, W, H);
+    if (state.phase === 'start' || state.phase === 'between') drawStarScreen(t);
+    else if (state.phase === 'play' || state.phase === 'celebrate') drawPlay(t);
+    else if (state.phase === 'end') drawEnd();
+  }
+
+  let rafId = 0;
+  function frame(t) {
+    update(t);
+    render(t);
+    // The end screen is static: stop the loop entirely.
+    if (state.phase !== 'end') rafId = requestAnimationFrame(frame);
+  }
+
+  function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    DPR = Math.min(window.devicePixelRatio || 1, 2.5);
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    computeLayout();
+    if (state.phase === 'end') render(now());
+  }
+
+  window.addEventListener('resize', resize);
+  window.addEventListener('orientationchange', resize);
+
+  resize();
+  log('Game loaded', { roundsPerSession: CONFIG.ROUNDS, gamesCompletedBefore: progress.gamesCompleted });
+  rafId = requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

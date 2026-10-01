@@ -1,0 +1,1561 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Sorting and Counting Beads</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
+  body {
+    background: #F6F1E7;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  canvas { display: block; width: 100%; height: 100%; }
+
+  #home {
+    position: fixed; top: max(10px, env(safe-area-inset-top)); right: max(10px, env(safe-area-inset-right));
+    width: 52px; height: 52px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+    background: rgba(255, 253, 248, 0.85); box-shadow: 0 2px 8px rgba(74, 64, 54, 0.15);
+    -webkit-tap-highlight-color: transparent; z-index: 5;
+  }
+  #home:active { transform: scale(0.94); }
+
+  /* Hidden parent view: press and hold the top-left corner for 3 seconds. */
+  #parent {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: rgba(74, 64, 54, 0.55); padding: 16px; box-sizing: border-box; z-index: 10;
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #4A4036;
+  }
+  #parent[hidden] { display: none; }
+  #parent .card { background: #FFFDF8; border-radius: 16px; padding: 20px 22px; max-width: 380px; width: 100%; box-shadow: 0 10px 30px rgba(0,0,0,0.18); }
+  #parent h2 { margin: 0 0 10px; font-size: 18px; }
+  #parent table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+  #parent th, #parent td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #EDE5D6; }
+  #parent .hint { margin: 12px 0 0; font-size: 12px; opacity: 0.7; }
+</style>
+</head>
+<body>
+<canvas id="game" aria-label="Sorting and counting beads game"></canvas>
+<a id="home" href="../../index.html" aria-label="Home">
+  <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><path d="M4 11.5 12 5l8 6.5V19a1 1 0 0 1-1 1h-4.5v-5h-5v5H5a1 1 0 0 1-1-1z" fill="none" stroke="#4A4036" stroke-width="2" stroke-linejoin="round"/></svg>
+</a>
+
+<div id="parent" hidden>
+  <div class="card">
+    <h2>Progress on this device</h2>
+    <div id="parentBody"></div>
+    <p class="hint">Stored only on this device. Tap anywhere to close.</p>
+  </div>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  /* =====================================================================
+   * SORTING AND COUNTING BEADS
+   * ELOF domain: Cognition (emergent mathematical thinking: classification,
+   *              one-to-one counting, cardinality) + Perceptual/Motor
+   *              (fine motor drag-and-drop).
+   *
+   * Part 1, sorting: beads lie on a soft mat; the child drags each one into
+   * the tray marked with its colour (early levels) or its shape (later).
+   * Part 2, counting: the trays glide up and grow. The child taps each bead
+   * in the glowing tray; a numeral appears beside it and the voice counts.
+   * The last number is the total (at the top level the child picks it).
+   *
+   * Design rules this file follows (from the brief):
+   *  - Coherence: only beads, mat and trays on screen. No score, no menus.
+   *    Numerals appear only as the counting content itself.
+   *  - Control of error: a bead dropped on the wrong tray glides back home;
+   *    a counted bead cannot be counted twice; a wrong total wobbles.
+   *  - Forgiving hitboxes: drop zones far larger than beads; bead tap areas
+   *    larger than the beads.
+   *  - Visual prompts: the next bead pulses (to drag, or to count).
+   *  - Self-paced: no timers anywhere the child can see or feel.
+   *  - Natural stopping point: 5 rounds, then a static "play outside" screen
+   *    with no "play again" button.
+   * ===================================================================== */
+
+  // ---------------------------------------------------------------------
+  // Configuration
+  // ---------------------------------------------------------------------
+  const CONFIG = {
+    ROUNDS: 5,                     // hard session limit (natural stopping point)
+    STORAGE_KEY: 'sorting-counting-beads.v1',
+    IDLE_PULSE_MS: 1500,           // idle time before the next bead pulses harder
+    TUTORIAL_HINT_MS: 5000,        // first round: idle time before the way is shown
+    HINT_AFTER_SLIPS: 2,           // slips on one bead / one total before the answer glows
+    RETURN_MS: 380,                // wrong drop: glide-home duration
+    TO_TRAY_MS: 240,               // right drop: slide-into-tray duration
+    BOUNCE_MS: 320,                // tray squash when a bead lands
+    WOBBLE_MS: 460,                // wrong total / already-counted wiggle
+    MOVE_DELAY_MS: 450,            // pause after the last bead is sorted
+    MOVE_MS: 750,                  // trays glide into the counting layout
+    COUNT_POP_MS: 280,             // numeral bubble pop-in
+    ASK_DELAY_MS: 650,             // "How many?" after the last counted number
+    REVEAL_MS: 1150,               // the total shows before the next tray
+    CELEBRATE_MS: 1500,            // round-complete celebration length
+    FAST_MS_PER_BEAD: 4500,        // "quick" threshold (sorting + counting) for a step-up
+    PARENT_HOLD_MS: 3000,          // hold time for the hidden parent view
+    PARENT_CORNER_PX: 80,
+    HOME_RESERVE_PX: 76,           // keep the top-right corner clear for the home button
+    TAP_SLOP_PX: 12,               // movement below this is a tap, not a drop
+  };
+
+  const COLORS = {
+    bg: '#F6F1E7',
+    ink: '#4A4036',
+    coral: '#F2A88A',              // tray / bead colours (same as the shape sorting game)
+    blue: '#8FB8DE',
+    green: '#9CCB9A',
+    neutrals: ['#F4D35E', '#B8A9D9', '#E8B4C8', '#A8D5D1'], // never a tray colour
+    star: '#F6C85F',
+    grass: '#B9D7A8',
+    cheek: '#F2A88A',
+    mat: '#EAE0D0',
+    matStitch: '#D6C7B0',
+    wood: '#E2CDAE',
+    woodWell: '#EFE3CF',
+    bubble: '#FFFDF8',
+  };
+
+  const COLOR_KEYS = ['coral', 'blue', 'green'];
+  const SHAPES = ['round', 'square', 'flower'];
+  const FONT = 'ui-rounded, "Arial Rounded MT Bold", "Nunito", system-ui, -apple-system, sans-serif';
+  const NUMBER_WORDS = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine'];
+
+  // Difficulty ladder for dynamic difficulty adjustment (scaffolding).
+  //  by:     what the trays are marked with (colour = tinted tray, shape = neutral tray with a shape)
+  //  counts: beads per tray [min, max]
+  //  beads:  bead shapes used ('round' only, or 'mixed' as a distractor)
+  //  choose: after counting a tray, the child picks the total from numeral bubbles
+  const TIERS = [
+    { by: 'color', keys: 2, counts: [2, 2], beads: 'round', choose: false }, // 2 colours x 2
+    { by: 'color', keys: 3, counts: [2, 3], beads: 'round', choose: false }, // 3 colours x 2-3
+    { by: 'shape', keys: 3, counts: [2, 3], beads: 'shape', choose: false }, // sort by shape, neutral colours
+    { by: 'color', keys: 3, counts: [3, 5], beads: 'mixed', choose: true  }, // bigger counts + pick the total
+  ];
+
+  const TAU = Math.PI * 2;
+  const reduceMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+
+  // ---------------------------------------------------------------------
+  // Small helpers
+  // ---------------------------------------------------------------------
+  const now = () => performance.now();
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const easeOutCubic = t => 1 - Math.pow(1 - t, 3);
+  const easeInOutQuad = t => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
+  const easeOutBack = t => { const c = 1.6; return 1 + (c + 1) * Math.pow(t - 1, 3) + c * Math.pow(t - 1, 2); };
+  const log = (...args) => console.log('[Beads]', ...args);
+
+  function shuffle(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }
+
+  const randInt = (a, b) => a + Math.floor(Math.random() * (b - a + 1));
+  const lerpRect = (a, b, t) => ({ x: lerp(a.x, b.x, t), y: lerp(a.y, b.y, t), w: lerp(a.w, b.w, t), h: lerp(a.h, b.h, t) });
+
+  // Mix a hex colour toward black (amt < 0) or white (amt > 0).
+  const shadeCache = new Map();
+  function shade(hex, amt) {
+    const key = hex + amt;
+    if (shadeCache.has(key)) return shadeCache.get(key);
+    const n = parseInt(hex.slice(1), 16);
+    const target = amt < 0 ? 0 : 255;
+    const p = Math.abs(amt);
+    const c = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map(v => Math.round(lerp(v, target, p)));
+    const out = `rgb(${c[0]},${c[1]},${c[2]})`;
+    shadeCache.set(key, out);
+    return out;
+  }
+
+  // ---------------------------------------------------------------------
+  // Canvas setup
+  // ---------------------------------------------------------------------
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  let W = 0, H = 0, DPR = 1;
+
+  // Layout values recomputed on every resize.
+  const L = { m: 16, s: 30, mat: { x: 0, y: 0, w: 0, h: 0 } };
+
+  // ---------------------------------------------------------------------
+  // Game state
+  // ---------------------------------------------------------------------
+  const state = {
+    phase: 'start',          // 'start' | 'play' | 'celebrate' | 'between' | 'end'
+    step: 'sort',            // 'sort' | 'sorted' | 'move' | 'count' | 'choose' | 'reveal' | 'done'
+    choose: false,           // this round ends each tray by picking its total
+    round: 0,                // rounds completed this session
+    tier: 0,                 // index into TIERS
+    trays: [],
+    beads: [],
+    drag: null,              // { obj, dx, dy, sx, sy, moved }
+    ct: 0,                   // tray being counted
+    stepAt: 0,               // when a timed step ends
+    moveT0: -1e9,
+    lastInteraction: 0,
+    roundStart: 0,
+    wrongDrops: 0,           // wrong-tray drops this round
+    totalSlips: 0,           // wrong total picks this round
+    recounts: 0,             // taps on an already-counted bead (not a slip)
+    choices: [],             // numeral bubbles for the tray being counted
+    choiceSlips: 0,          // wrong picks for the current tray's total
+    pendingSay: null,        // { at, text }: speech that should follow a moment later
+    completeAt: 0,
+    celebrateStart: 0,
+    particles: [],
+  };
+
+  const tierNow = () => TIERS[state.tier];
+  // While sorting (and in the short pause after it) the trays sit along the bottom.
+  const sorting = () => state.step === 'sort' || state.step === 'sorted';
+
+  // ---------------------------------------------------------------------
+  // Local progress tracking (localStorage, never leaves the device)
+  // ---------------------------------------------------------------------
+  function freshProgress() {
+    return { version: 1, gamesCompleted: 0, roundsCompleted: 0, beadsSorted: 0, beadsCounted: 0, wrongDrops: 0, totalSlips: 0, lastPlayed: null, sessions: [] };
+  }
+
+  function loadProgress() {
+    try {
+      const raw = window.localStorage.getItem(CONFIG.STORAGE_KEY);
+      if (raw) {
+        const data = JSON.parse(raw);
+        if (data && data.version === 1 && Array.isArray(data.sessions)) return data;
+      }
+    } catch (e) {
+      console.warn('[Beads] Progress could not be loaded (storage unavailable):', e && e.message);
+    }
+    return freshProgress();
+  }
+
+  function saveProgress() {
+    try {
+      window.localStorage.setItem(CONFIG.STORAGE_KEY, JSON.stringify(progress));
+      log('Progress saved', { gamesCompleted: progress.gamesCompleted, roundsCompleted: progress.roundsCompleted });
+    } catch (e) {
+      console.warn('[Beads] Progress could not be saved (storage unavailable):', e && e.message);
+    }
+  }
+
+  const progress = loadProgress();
+  let session = null; // created on the first round of this app launch
+
+  function ensureSession() {
+    if (session) return;
+    session = { startedAt: new Date().toISOString(), finished: false, rounds: [] };
+    progress.sessions.push(session);
+    if (progress.sessions.length > 30) progress.sessions.splice(0, progress.sessions.length - 30);
+  }
+
+  // ---------------------------------------------------------------------
+  // Audio: Web Audio tones + optional spoken words
+  // ---------------------------------------------------------------------
+  let actx = null;
+
+  // Browsers only allow audio after a user gesture, so this runs on every pointer down.
+  function unlockAudio() {
+    if (!actx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) { try { actx = new AC(); } catch (e) { actx = null; } }
+    }
+    if (actx && actx.state === 'suspended') actx.resume();
+  }
+
+  function tone(freq, delay, dur, vol = 0.16, type = 'sine') {
+    if (!actx) return;
+    const t = actx.currentTime + delay;
+    const osc = actx.createOscillator();
+    const gain = actx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(vol, t + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    osc.connect(gain).connect(actx.destination);
+    osc.start(t);
+    osc.stop(t + dur + 0.05);
+  }
+
+  // Each tray always plays the same note; each count number always the same
+  // rising note (predictable, proportional feedback).
+  const TRAY_NOTE = [523.25, 659.25, 783.99];
+  const COUNT_NOTE = [0, 523.25, 587.33, 659.25, 783.99, 880, 1046.5, 1174.66, 1318.51, 1567.98];
+  const playPickup = () => tone(440, 0, 0.08, 0.05, 'triangle');
+  const playChime = i => { const f = TRAY_NOTE[i % TRAY_NOTE.length]; tone(f, 0, 0.35); tone(f * 1.5, 0.07, 0.4, 0.1); };
+  const playCount = n => { tone(COUNT_NOTE[clamp(n, 1, 9)], 0, 0.22, 0.12, 'triangle'); };
+  const playTotal = () => { tone(783.99, 0, 0.3, 0.12); tone(1046.5, 0.1, 0.45, 0.12); };
+  const playSoft = () => tone(220, 0, 0.18, 0.05, 'sine');          // never a buzzer
+  const playMove = () => { tone(392, 0, 0.25, 0.05, 'triangle'); tone(523.25, 0.12, 0.3, 0.05, 'triangle'); };
+  const playRoundDone = () => [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => tone(f, i * 0.12, 0.5, 0.12));
+
+  // Spoken words via the Web Speech API. Android WebView usually lacks it,
+  // so this quietly does nothing there and the visuals + tones carry the task.
+  function say(text) {
+    try {
+      if (!('speechSynthesis' in window)) return;
+      window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'en-US';
+      u.rate = 0.85;
+      u.pitch = 1.15;
+      window.speechSynthesis.speak(u);
+    } catch (e) { /* speech is optional */ }
+  }
+
+  const sayLater = (text, delay) => { state.pendingSay = { at: now() + delay, text }; };
+
+  // ---------------------------------------------------------------------
+  // Rounds and difficulty
+  // ---------------------------------------------------------------------
+  function startRound() {
+    ensureSession();
+    const tier = tierNow();
+    const keys = tier.by === 'shape'
+      ? SHAPES.slice(0, tier.keys)
+      : (tier.keys === 3 ? COLOR_KEYS.slice() : shuffle(COLOR_KEYS.slice()).slice(0, tier.keys).sort((a, b) => COLOR_KEYS.indexOf(a) - COLOR_KEYS.indexOf(b)));
+
+    // Bead counts per tray. At the top level they all differ, so each total is its own number.
+    let counts = keys.map(() => randInt(tier.counts[0], tier.counts[1]));
+    if (tier.choose) counts = shuffle([3, 4, 5]).slice(0, keys.length);
+
+    state.trays = keys.map((key, i) => ({
+      key, index: i, by: tier.by,
+      color: tier.by === 'color' ? COLORS[key] : null,
+      shape: tier.by === 'shape' ? key : null,
+      capacity: counts[i], count: 0, counted: 0,
+      bounceT0: -1e9, totalT0: 0, total: 0,
+      sort: { x: 0, y: 0, w: 0, h: 0 }, cnt: { x: 0, y: 0, w: 0, h: 0 }, spot: { x: 0, y: 0, w: 0, h: 0 },
+    }));
+
+    const beads = [];
+    let neutral = Math.floor(Math.random() * COLORS.neutrals.length);
+    let id = 0;
+    state.trays.forEach(tray => {
+      for (let k = 0; k < tray.capacity; k++) {
+        const shape = tier.by === 'shape' ? tray.key : (tier.beads === 'mixed' ? SHAPES[(k + tray.index) % SHAPES.length] : 'round');
+        beads.push({
+          id: id++, tray: tray.index, shape,
+          color: tier.by === 'color' ? tray.color : COLORS.neutrals[neutral++ % COLORS.neutrals.length],
+          jx: Math.random() * 2 - 1,   // fixed jitter so homes stay put across resizes
+          jy: Math.random() * 2 - 1,
+          x: 0, y: 0, homeX: 0, homeY: 0, scale: 1,
+          state: 'idle',             // 'idle' | 'drag' | 'return' | 'toTray' | 'placed'
+          anim: null, animP: 0,
+          errors: 0, slot: -1,
+          countN: 0, countT0: 0, wiggleT0: -1e9,
+        });
+      }
+    });
+    shuffle(beads).forEach((b, i) => { b.homeSlot = i; });
+
+    state.beads = beads;
+    state.step = 'sort';
+    state.choose = tier.choose;
+    state.ct = 0;
+    state.moveT0 = -1e9;
+    state.wrongDrops = 0;
+    state.totalSlips = 0;
+    state.recounts = 0;
+    state.choices = [];
+    state.choiceSlips = 0;
+    state.pendingSay = null;
+    state.completeAt = 0;
+    state.particles = [];
+    state.drag = null;
+    computeLayout();
+
+    state.phase = 'play';
+    state.roundStart = now();
+    state.lastInteraction = now();
+    if (state.round === 0) say('Put each bead in its tray.');
+    log(`Round ${state.round + 1}/${CONFIG.ROUNDS} started at level ${state.tier + 1}: sort by ${tier.by}, trays ${keys.join(', ')}, beads ${counts.join('/')}`);
+  }
+
+  function completeRound() {
+    const t = now();
+    const n = state.beads.length;
+    const withErrors = state.beads.filter(b => b.errors > 0).length;
+    const ms = t - state.roundStart;
+    const record = {
+      level: state.tier + 1,
+      beads: n,
+      firstTry: n - withErrors,
+      wrongDrops: state.wrongDrops,
+      totalSlips: state.totalSlips,
+      recounts: state.recounts,
+      seconds: Math.round(ms / 100) / 10,
+    };
+
+    session.rounds.push(record);
+    progress.roundsCompleted++;
+    progress.beadsSorted += n;
+    progress.beadsCounted += n;
+    progress.wrongDrops += state.wrongDrops;
+    progress.totalSlips += state.totalSlips;
+    progress.lastPlayed = new Date().toISOString();
+    state.round++;
+    log('Level completed', record);
+
+    const finalRound = state.round >= CONFIG.ROUNDS;
+    if (finalRound) {
+      session.finished = true;
+      progress.gamesCompleted++;
+    } else {
+      // Praise the effort, not the child's "smartness" (growth mindset).
+      say(state.wrongDrops + state.totalSlips > 0 ? 'You kept trying, and you did it!' : 'You sorted and counted every bead!');
+    }
+    saveProgress();
+    adjustDifficulty(record, ms);
+
+    playRoundDone();
+    state.trays.forEach(tr => { tr.bounceT0 = t; spawnParticles(trayRect(tr, t), t, beadColorFor(tr)); });
+    state.phase = 'celebrate';
+    state.celebrateStart = t;
+  }
+
+  // Simple DDA: quick and clean -> one step harder; a real struggle -> one step easier.
+  function adjustDifficulty(record, ms) {
+    const fast = ms / record.beads <= CONFIG.FAST_MS_PER_BEAD;
+    const slips = record.wrongDrops + record.totalSlips;
+    const before = state.tier;
+    if (slips === 0 && fast) {
+      state.tier = Math.min(TIERS.length - 1, state.tier + 1);
+    } else if (slips >= Math.max(3, Math.ceil(record.beads / 2))) {
+      state.tier = Math.max(0, state.tier - 1);
+    }
+    if (state.tier !== before) log(`Difficulty ${state.tier > before ? 'up' : 'down'}: level ${before + 1} -> ${state.tier + 1}`);
+  }
+
+  function enterEnd() {
+    state.phase = 'end';
+    say('Great job! Time to play outside!');
+    log('Session finished: end screen shown, no replay offered');
+  }
+
+  // ---------------------------------------------------------------------
+  // Layout
+  // ---------------------------------------------------------------------
+  function computeLayout() {
+    const minDim = Math.min(W, H);
+    const m = clamp(minDim * 0.045, 12, 36);
+    const k = state.trays.length || 3;
+    L.m = m;
+
+    // Sorting layout: trays along the bottom edge (like the shape sorting bins).
+    const trayW = Math.min((W - m * (k + 1)) / k, H * 0.34, 300);
+    const trayH = trayW * 0.66;
+    const rowW = k * trayW + (k - 1) * m;
+    const x0 = (W - rowW) / 2;
+    const trayY = H - m - trayH;
+    state.trays.forEach((tr, i) => { tr.sort = { x: x0 + i * (trayW + m), y: trayY, w: trayW, h: trayH }; });
+
+    // Beads are spread on a grid on the mat above the trays (clear of the home button).
+    const top = CONFIG.HOME_RESERVE_PX;
+    L.mat = { x: m, y: top - m * 0.4, w: W - 2 * m, h: Math.max(60, trayY - m * 0.8 - (top - m * 0.4)) };
+    const ax = m * 1.6, ay = top;
+    const aw = W - 2 * ax;
+    const ah = Math.max(60, trayY - m * 1.6 - ay);
+    const n = Math.max(1, state.beads.length);
+    const rows = Math.ceil(n / clamp(Math.round(Math.sqrt(n * aw / ah)), 1, n));
+    const cols = Math.ceil(n / rows);
+    const cw = aw / cols, ch = ah / rows;
+
+    // Bead radius. trayW >= 2.6 * s keeps every drop zone far wider than a bead.
+    let s = clamp(minDim * 0.075, 20, 60);
+    s = Math.min(s, trayW / 2.6, cw * 0.36, ch * 0.36);
+    L.s = s;
+
+    state.beads.forEach(b => {
+      const i = b.homeSlot;
+      const row = Math.floor(i / cols);
+      const inRow = row === rows - 1 ? n - row * cols : cols;
+      const col = i - row * cols;
+      const rowOffset = (cols - inRow) * cw / 2;   // centre a short last row
+      b.homeX = ax + rowOffset + cw * (col + 0.5) + b.jx * cw * 0.1;
+      b.homeY = ay + ch * (row + 0.5) + b.jy * ch * 0.1;
+    });
+
+    layoutCounting(m, k);
+    relayoutBeads();
+  }
+
+  // Counting layout: the trays grow to fill the screen, each with a "total spot"
+  // beside it (where the total appears, or the numeral bubbles to choose from).
+  // Portrait: trays stacked in rows, spot on the right. Landscape: columns, spot below.
+  function layoutCounting(m, k) {
+    const top = CONFIG.HOME_RESERVE_PX + m * 0.4;
+    const gap = m * 0.8;
+    if (W < H) {
+      const rowH = Math.min((H - top - m - gap * (k - 1)) / k, W * 0.62);
+      const spotW = clamp(Math.min(W * 0.22, rowH * 0.42), 64, 120);
+      const trayW = W - 2 * m - spotW - gap;
+      const y0 = top + (H - top - m - (rowH * k + gap * (k - 1))) / 2;
+      state.trays.forEach((tr, i) => {
+        const y = y0 + i * (rowH + gap);
+        tr.cnt = { x: m, y, w: trayW, h: rowH };
+        tr.spot = { x: m + trayW + gap, y, w: spotW, h: rowH };
+      });
+    } else {
+      const colW = Math.min((W - 2 * m - gap * (k - 1)) / k, (H - top - m) * 1.1);
+      const spotH = clamp((H - top - m) * 0.22, 60, 110);
+      const trayH = H - top - m - spotH - gap;
+      const x0 = (W - (colW * k + gap * (k - 1))) / 2;
+      state.trays.forEach((tr, i) => {
+        const x = x0 + i * (colW + gap);
+        tr.cnt = { x, y: top, w: colW, h: trayH };
+        tr.spot = { x, y: top + trayH + gap, w: colW, h: spotH };
+      });
+    }
+    layoutChoices();
+  }
+
+  // The tray's rectangle right now (it glides from the sorting to the counting layout).
+  function moveProgress(t) {
+    if (sorting()) return 0;
+    return easeInOutQuad(clamp((t - state.moveT0) / CONFIG.MOVE_MS, 0, 1));
+  }
+
+  function trayRect(tr, t) {
+    const p = moveProgress(t);
+    return p <= 0 ? tr.sort : p >= 1 ? tr.cnt : lerpRect(tr.sort, tr.cnt, p);
+  }
+
+  // The well is the hollow beads sit in; below it is the label band.
+  function wellRect(r) {
+    return { x: r.x + r.w * 0.07, y: r.y + r.h * 0.08, w: r.w * 0.86, h: r.h * 0.62 };
+  }
+
+  // Best grid for `cap` beads in a well: as big as possible, with room beside
+  // each bead for its count numeral.
+  function slotGrid(well, cap) {
+    let best = { rows: 1, cols: cap, cell: 0 };
+    for (let rows = 1; rows <= cap; rows++) {
+      const cols = Math.ceil(cap / rows);
+      const cell = Math.min(well.w / cols, well.h / rows);
+      if (cell > best.cell) best = { rows, cols, cell };
+    }
+    best.r = best.cell / 2.7;
+    return best;
+  }
+
+  function slotPos(tr, idx, t) {
+    const well = wellRect(trayRect(tr, t));
+    const g = slotGrid(well, tr.capacity);
+    const row = Math.floor(idx / g.cols);
+    const inRow = row === g.rows - 1 ? tr.capacity - row * g.cols : g.cols;
+    const col = idx - row * g.cols;
+    return {
+      x: well.x + (well.w - inRow * g.cell) / 2 + g.cell * (col + 0.5),
+      y: well.y + (well.h - g.rows * g.cell) / 2 + g.cell * (row + 0.5),
+      // While sorting, beads in trays are never bigger than loose beads.
+      r: sorting() ? Math.min(g.r, L.s * 0.8) : g.r,
+    };
+  }
+
+  // Keep every bead where it belongs after a resize or rotation.
+  function relayoutBeads() {
+    const t = now();
+    for (const b of state.beads) {
+      if (b.state === 'idle') {
+        b.x = b.homeX; b.y = b.homeY;
+      } else if (b.state === 'return' && b.anim) {
+        b.anim.tx = b.homeX; b.anim.ty = b.homeY;
+      } else if (b.state === 'toTray' && b.anim) {
+        const p = slotPos(state.trays[b.tray], b.slot, t);
+        b.anim.tx = p.x; b.anim.ty = p.y; b.anim.ts = p.r / L.s;
+      } else if (b.state === 'drag') {
+        b.x = clamp(b.x, 0, W); b.y = clamp(b.y, 0, H);
+      }
+      // 'placed' beads follow their tray every frame (see update()).
+    }
+  }
+
+  // Numeral bubbles to choose the total from, laid along the spot's long side.
+  function layoutChoices() {
+    const tr = state.trays[state.ct];
+    if (!tr || !state.choices.length) return;
+    const s = tr.spot;
+    const n = state.choices.length;
+    const along = s.w >= s.h;
+    const long = along ? s.w : s.h, short = along ? s.h : s.w;
+    const r = Math.max(28, Math.min(short * 0.42, long / (n * 2.3)));
+    state.choices.forEach((c, i) => {
+      const off = (i - (n - 1) / 2) * (long / n);
+      c.r = r;
+      c.x = along ? s.x + s.w / 2 + off : s.x + s.w / 2;
+      c.y = along ? s.y + s.h / 2 : s.y + s.h / 2 + off;
+    });
+  }
+
+  // Generous drop zone: the tray plus wide margins. Nearest tray wins on overlap.
+  function findDropTray(b) {
+    let best = null, bestD = Infinity;
+    for (const tr of state.trays) {
+      const r = tr.sort;
+      const padX = Math.max(L.s * 0.7, r.w * 0.15);
+      const padTop = L.s * 1.3;
+      if (b.x >= r.x - padX && b.x <= r.x + r.w + padX && b.y >= r.y - padTop && b.y <= r.y + r.h + L.m) {
+        const d = Math.hypot(b.x - (r.x + r.w / 2), b.y - (r.y + r.h / 2));
+        if (d < bestD) { best = tr; bestD = d; }
+      }
+    }
+    return best;
+  }
+
+  // ---------------------------------------------------------------------
+  // Sorting: drag and drop
+  // ---------------------------------------------------------------------
+  // Forgiving pick: the nearest loose bead within 1.5x its radius.
+  function pickBead(p) {
+    let best = null, bestD = Infinity;
+    for (const b of state.beads) {
+      if (b.state !== 'idle' && b.state !== 'return') continue;
+      const d = Math.hypot(p.x - b.x, p.y - b.y);
+      if (d <= L.s * 1.5 && d < bestD) { best = b; bestD = d; }
+    }
+    return best;
+  }
+
+  function beginDrag(b, p) {
+    b.state = 'drag';
+    b.anim = null;
+    b.scale = 1;
+    state.drag = { obj: b, dx: b.x - p.x, dy: b.y - p.y, sx: p.x, sy: p.y, moved: 0 };
+    // Draw the held bead on top of the others.
+    state.beads.splice(state.beads.indexOf(b), 1);
+    state.beads.push(b);
+    playPickup();
+    log('Picked up', b.shape, 'bead for tray', state.trays[b.tray].key);
+  }
+
+  function dropBead() {
+    const b = state.drag.obj;
+    const wasTap = state.drag.moved < CONFIG.TAP_SLOP_PX;
+    state.drag = null;
+    const tr = wasTap ? null : findDropTray(b);
+
+    if (tr && tr.index === b.tray) {
+      acceptBead(b, tr);
+    } else {
+      if (tr) {
+        b.errors++;
+        state.wrongDrops++;
+        log(`Item rejected: bead for ${state.trays[b.tray].key} dropped on ${tr.key} tray, gliding home`);
+      }
+      sendHome(b);
+    }
+  }
+
+  function acceptBead(b, tr) {
+    b.slot = tr.count++;
+    const target = slotPos(tr, b.slot, now());
+    b.state = 'toTray';
+    b.anim = { fx: b.x, fy: b.y, tx: target.x, ty: target.y, fs: b.scale, ts: target.r / L.s, t0: now(), dur: CONFIG.TO_TRAY_MS, ease: easeInOutQuad };
+    b.animP = 0;
+  }
+
+  // Montessori control of error: the bead simply glides back to where it started.
+  function sendHome(b) {
+    b.state = 'return';
+    b.anim = { fx: b.x, fy: b.y, tx: b.homeX, ty: b.homeY, fs: b.scale, ts: 1, t0: now(), dur: CONFIG.RETURN_MS, ease: easeOutCubic };
+    b.animP = 0;
+  }
+
+  // Called when a bead finishes sliding into the right tray.
+  // Sound, tray bounce and the bead settling all happen on the same frame (temporal contiguity).
+  function landInTray(b, t) {
+    const tr = state.trays[b.tray];
+    b.state = 'placed';
+    tr.bounceT0 = t;
+    playChime(tr.index);
+    log(`Item successfully placed: ${b.shape} bead -> ${tr.key} tray (${tr.count}/${tr.capacity})`);
+    if (state.beads.every(x => x.state === 'placed')) {
+      state.stepAt = t + CONFIG.MOVE_DELAY_MS;
+      state.step = 'sorted';
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Counting
+  // ---------------------------------------------------------------------
+  function startCounting(t) {
+    state.step = 'move';
+    state.moveT0 = t;
+    state.stepAt = t + CONFIG.MOVE_MS;
+    playMove();
+    log('All beads sorted: trays move up for counting');
+  }
+
+  function beginTray(t) {
+    const tr = state.trays[state.ct];
+    state.step = 'count';
+    state.choices = [];
+    state.lastInteraction = t;
+    say(state.ct === 0 ? "Let's count!" : 'Now count these!');
+    log(`Counting tray ${state.ct + 1}/${state.trays.length} (${tr.key}, ${tr.capacity} beads)`);
+  }
+
+  const traysBeads = tr => state.beads.filter(b => b.tray === tr.index).sort((a, b) => a.slot - b.slot);
+  const nextUncounted = tr => traysBeads(tr).find(b => !b.countN) || null;
+
+  // Forgiving pick in the counting tray: the nearest bead within 1.6x its radius.
+  function pickCountBead(p, t) {
+    const tr = state.trays[state.ct];
+    let best = null, bestD = Infinity;
+    for (const b of traysBeads(tr)) {
+      const pos = slotPos(tr, b.slot, t);
+      const d = Math.hypot(p.x - pos.x, p.y - pos.y);
+      if (d <= Math.max(pos.r * 1.6, 30) && d < bestD) { best = b; bestD = d; }
+    }
+    return best;
+  }
+
+  function countBead(b, t) {
+    const tr = state.trays[state.ct];
+    if (b.countN) {
+      // One-to-one: a bead already counted just wiggles; the count stays the same.
+      b.wiggleT0 = t;
+      state.recounts++;
+      playSoft();
+      log(`Item rejected: bead already counted as ${b.countN}`);
+      return;
+    }
+    tr.counted++;
+    b.countN = tr.counted;
+    b.countT0 = t;
+    playCount(b.countN);
+    log(`Answer accepted: counted ${b.countN} of ${tr.capacity} in the ${tr.key} tray`);
+
+    if (tr.counted < tr.capacity) { say(NUMBER_WORDS[b.countN]); return; }
+
+    // That was the last bead: the last number said is how many there are.
+    if (state.choose) {
+      say(NUMBER_WORDS[b.countN] + '.');
+      state.choices = makeChoices(tr.capacity).map(n => ({ n, x: 0, y: 0, r: 30, slips: 0, wobbleT0: -1e9, t0: t + 250 }));
+      state.step = 'choose';
+      state.choiceSlips = 0;
+      layoutChoices();
+      sayLater('How many beads?', CONFIG.ASK_DELAY_MS);
+      log(`Choose the total: ${state.choices.map(c => c.n).join(', ')}`);
+    } else {
+      revealTotal(tr, t);
+      say(`${NUMBER_WORDS[b.countN]}! ${NUMBER_WORDS[b.countN]} beads.`);
+    }
+  }
+
+  // The right total plus one or two neighbours, in a random order.
+  function makeChoices(n) {
+    const near = [n - 1, n + 1, n + 2, n - 2].filter(v => v >= 1 && v <= 9 && v !== n);
+    return shuffle([n, ...near.slice(0, 2)]);
+  }
+
+  function chooseTotal(c, t) {
+    const tr = state.trays[state.ct];
+    if (c.n === tr.capacity) {
+      log(`Answer accepted: total ${c.n} for the ${tr.key} tray${state.choiceSlips ? ` (after ${state.choiceSlips} slips)` : ''}`);
+      revealTotal(tr, t);
+      state.pendingSay = null;
+      say(`${NUMBER_WORDS[c.n]} beads!`);
+    } else {
+      c.wobbleT0 = t;
+      state.choiceSlips++;
+      state.totalSlips++;
+      playSoft();
+      log(`Item rejected: total ${c.n}, the tray has ${tr.capacity} (slip ${state.choiceSlips})`);
+      if (state.choiceSlips === CONFIG.HINT_AFTER_SLIPS) log('Hint shown: the right total glows');
+    }
+  }
+
+  function revealTotal(tr, t) {
+    tr.total = tr.capacity;
+    tr.totalT0 = t;
+    tr.bounceT0 = t;
+    state.choices = [];
+    playTotal();
+    state.step = 'reveal';
+    state.stepAt = t + CONFIG.REVEAL_MS;
+  }
+
+  function nextTray(t) {
+    state.ct++;
+    if (state.ct >= state.trays.length) {
+      state.step = 'done';
+      state.completeAt = t + 300;
+    } else {
+      beginTray(t);
+    }
+  }
+
+  function pickChoice(p) {
+    const t = now();
+    let best = null, bestD = Infinity;
+    for (const c of state.choices) {
+      if (t < c.t0) continue;              // not popped in yet
+      const d = Math.hypot(p.x - c.x, p.y - c.y);
+      if (d <= Math.max(c.r * 1.35, 34) && d < bestD) { best = c; bestD = d; }
+    }
+    return best;
+  }
+
+  // ---------------------------------------------------------------------
+  // Input: touch + mouse
+  // ---------------------------------------------------------------------
+  let activeTouch = null;
+  let mouseDown = false;
+  let parentTimer = null;
+
+  function toCanvas(clientX, clientY) {
+    const r = canvas.getBoundingClientRect();
+    return { x: clientX - r.left, y: clientY - r.top };
+  }
+
+  function findTouch(list, id) {
+    for (let i = 0; i < list.length; i++) if (list[i].identifier === id) return list[i];
+    return null;
+  }
+
+  function cancelParentHold() {
+    if (parentTimer) { clearTimeout(parentTimer); parentTimer = null; }
+  }
+
+  function onDown(p) {
+    unlockAudio();
+    const t = now();
+    state.lastInteraction = t;
+
+    if (state.phase === 'start' || state.phase === 'between') {
+      const g = starGeom();
+      if (Math.hypot(p.x - g.cx, p.y - g.cy) <= g.R * 1.8) { startRound(); return; }
+    } else if (state.phase === 'play') {
+      if (state.step === 'sort') {
+        const b = pickBead(p);
+        if (b) { beginDrag(b, p); return; }
+      } else if (state.step === 'count') {
+        const b = pickCountBead(p, t);
+        if (b) { countBead(b, t); return; }
+      } else if (state.step === 'choose') {
+        const c = pickChoice(p);
+        if (c) { chooseTotal(c, t); return; }
+      }
+    }
+
+    // Hidden parent view: hold the top-left corner still for 3 seconds.
+    if (p.x < CONFIG.PARENT_CORNER_PX && p.y < CONFIG.PARENT_CORNER_PX) {
+      cancelParentHold();
+      parentTimer = setTimeout(openParent, CONFIG.PARENT_HOLD_MS);
+    }
+  }
+
+  function onMove(p) {
+    if (parentTimer && (p.x >= CONFIG.PARENT_CORNER_PX || p.y >= CONFIG.PARENT_CORNER_PX)) cancelParentHold();
+    if (!state.drag) return;
+    state.lastInteraction = now();
+    const d = state.drag;
+    d.moved = Math.max(d.moved, Math.hypot(p.x - d.sx, p.y - d.sy));
+    d.obj.x = clamp(p.x + d.dx, 0, W);
+    d.obj.y = clamp(p.y + d.dy, 0, H);
+  }
+
+  function onUp() {
+    cancelParentHold();
+    if (state.drag) dropBead();
+  }
+
+  canvas.addEventListener('touchstart', e => {
+    e.preventDefault();
+    if (activeTouch !== null) return;          // one finger at a time
+    const t = e.changedTouches[0];
+    activeTouch = t.identifier;
+    onDown(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  canvas.addEventListener('touchmove', e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (t) onMove(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  const endTouch = e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (!t) return;
+    activeTouch = null;
+    onUp(toCanvas(t.clientX, t.clientY));
+  };
+  canvas.addEventListener('touchend', endTouch, { passive: false });
+  canvas.addEventListener('touchcancel', endTouch, { passive: false });
+
+  canvas.addEventListener('mousedown', e => { mouseDown = true; onDown(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mousemove', e => { if (mouseDown) onMove(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mouseup', e => {
+    if (!mouseDown) return;
+    mouseDown = false;
+    onUp(toCanvas(e.clientX, e.clientY));
+  });
+
+  // ---------------------------------------------------------------------
+  // Parent view (hidden, local data only)
+  // ---------------------------------------------------------------------
+  const parentEl = document.getElementById('parent');
+  const parentBody = document.getElementById('parentBody');
+
+  function el(tag, text) {
+    const node = document.createElement(tag);
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function openParent() {
+    parentTimer = null;
+    const beads = progress.sessions.reduce((a, s) => a + s.rounds.reduce((b, r) => b + r.beads, 0), 0);
+    const firstTry = progress.sessions.reduce((a, s) => a + s.rounds.reduce((b, r) => b + r.firstTry, 0), 0);
+
+    parentBody.textContent = '';
+    parentBody.appendChild(el('div', `Full games finished: ${progress.gamesCompleted}`));
+    parentBody.appendChild(el('div', `Rounds finished: ${progress.roundsCompleted}`));
+    parentBody.appendChild(el('div', `Beads sorted and counted: ${progress.beadsSorted}`));
+    parentBody.appendChild(el('div', `Sorted on the first try: ${beads ? Math.round(100 * firstTry / beads) : 0}%`));
+    parentBody.appendChild(el('div', `Wrong totals picked (level 4): ${progress.totalSlips}`));
+
+    const recent = progress.sessions.slice(-6).reverse();
+    if (recent.length) {
+      const table = el('table');
+      const head = el('tr');
+      ['When', 'Rounds', 'Top level', 'Wrong trays', 'Wrong totals'].forEach(h => head.appendChild(el('th', h)));
+      table.appendChild(head);
+      recent.forEach(s => {
+        const tr = el('tr');
+        const when = new Date(s.startedAt);
+        tr.appendChild(el('td', when.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' ' +
+          when.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })));
+        tr.appendChild(el('td', `${s.rounds.length}/${CONFIG.ROUNDS}`));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => Math.max(a, r.level), 0) || '-')));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => a + r.wrongDrops, 0))));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => a + r.totalSlips, 0))));
+        table.appendChild(tr);
+      });
+      parentBody.appendChild(table);
+    }
+    parentEl.hidden = false;
+    log('Parent view opened', progress);
+  }
+
+  parentEl.addEventListener('click', () => { parentEl.hidden = true; });
+
+  // Read-only debug hooks for the Android/desktop console.
+  window.SortCountBeads = {
+    progress: () => JSON.parse(JSON.stringify(progress)),
+    state: () => {
+      const t = now();
+      const g = starGeom();
+      const ctr = state.trays[state.ct];
+      const next = (state.step === 'count' && ctr) ? nextUncounted(ctr) : null;
+      return {
+        phase: state.phase,
+        round: state.round,
+        level: state.tier + 1,
+        step: state.step,                  // 'sort': drag beads; 'count': tap beads; 'choose': tap a total
+        countingTray: sorting() ? null : state.ct,
+        trays: state.trays.map(tr => { const r = trayRect(tr, t); return { key: tr.key, x: r.x + r.w / 2, y: r.y + r.h / 2, capacity: tr.capacity, count: tr.count, counted: tr.counted, total: tr.total }; }),
+        beads: state.beads.map(b => {
+          const p = b.state === 'placed' ? slotPos(state.trays[b.tray], b.slot, t) : b;
+          return { id: b.id, shape: b.shape, targetTray: b.tray, state: b.state, x: p.x, y: p.y, countN: b.countN };
+        }),
+        nextBead: next ? next.id : null,
+        choices: state.choices.map(c => ({ n: c.n, x: c.x, y: c.y, correct: !!ctr && c.n === ctr.capacity })),
+        star: (state.phase === 'start' || state.phase === 'between') ? { x: g.cx, y: g.cy } : null,
+      };
+    },
+  };
+
+  // ---------------------------------------------------------------------
+  // Drawing primitives
+  // ---------------------------------------------------------------------
+  function roundRectPath(x, y, w, h, r) {
+    r = Math.max(0, Math.min(r, w / 2, h / 2));
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  // Every bead shape fits inside radius r so they read as the same size.
+  function beadPath(shape, x, y, r) {
+    ctx.beginPath();
+    if (shape === 'round') {
+      ctx.arc(x, y, r, 0, TAU);
+    } else if (shape === 'square') {
+      const h = r * 0.86;
+      roundRectPath(x - h, y - h, h * 2, h * 2, r * 0.28);
+    } else {
+      // Five round petals.
+      for (let k = 0; k < 5; k++) {
+        const a = -Math.PI / 2 + k * TAU / 5;
+        const px = x + r * 0.5 * Math.cos(a), py = y + r * 0.5 * Math.sin(a);
+        ctx.moveTo(px + r * 0.5, py);
+        ctx.arc(px, py, r * 0.5, 0, TAU);
+      }
+      ctx.moveTo(x + r * 0.55, y);
+      ctx.arc(x, y, r * 0.55, 0, TAU);
+    }
+  }
+
+  // A bead: body, soft outline, a threading hole and a little shine.
+  function drawBead(shape, x, y, r, fill, lifted) {
+    ctx.save();
+    if (lifted) {
+      ctx.shadowColor = 'rgba(60, 45, 30, 0.22)';
+      ctx.shadowBlur = r * 0.5;
+      ctx.shadowOffsetY = r * 0.25;
+    }
+    // The flower is a union of circles: outline pass first, then fill pass, so
+    // the inner overlaps never show a line.
+    if (shape === 'flower') {
+      beadPath(shape, x, y, r + Math.max(1.5, r * 0.08));
+      ctx.fillStyle = shade(fill, -0.28);
+      ctx.fill();
+      ctx.shadowColor = 'transparent';
+      beadPath(shape, x, y, r);
+      ctx.fillStyle = fill;
+      ctx.fill();
+    } else {
+      beadPath(shape, x, y, r);
+      ctx.fillStyle = fill;
+      ctx.fill();
+      ctx.shadowColor = 'transparent';
+      ctx.lineJoin = 'round';
+      ctx.lineWidth = Math.max(2, r * 0.12);
+      ctx.strokeStyle = shade(fill, -0.28);
+      ctx.stroke();
+    }
+    // Threading hole.
+    ctx.beginPath();
+    ctx.arc(x, y, r * 0.2, 0, TAU);
+    ctx.fillStyle = shade(fill, -0.38);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(x + r * 0.03, y + r * 0.04, r * 0.12, 0, TAU);
+    ctx.fillStyle = shade(fill, -0.55);
+    ctx.fill();
+    // Shine (relative, so a faded tray fades its beads' shine too).
+    ctx.globalAlpha *= 0.45;
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.ellipse(x - r * 0.38, y - r * 0.4, r * 0.2, r * 0.11, -0.7, 0, TAU);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function beadColorFor(tr) {
+    return tr.color || COLORS.star;
+  }
+
+  // The felt mat the loose beads lie on, with a stitched border.
+  function drawMat(alpha) {
+    if (alpha <= 0) return;
+    const r = L.mat;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.beginPath();
+    roundRectPath(r.x, r.y, r.w, r.h, Math.min(r.w, r.h) * 0.08);
+    ctx.fillStyle = COLORS.mat;
+    ctx.fill();
+    const inset = L.m * 0.45;
+    ctx.beginPath();
+    roundRectPath(r.x + inset, r.y + inset, r.w - inset * 2, r.h - inset * 2, Math.min(r.w, r.h) * 0.07);
+    ctx.setLineDash([L.m * 0.45, L.m * 0.35]);
+    ctx.lineWidth = Math.max(1.5, L.m * 0.12);
+    ctx.strokeStyle = COLORS.matStitch;
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.restore();
+  }
+
+  // A small icon on the tray's label band: a bead of the tray's colour, or the tray's shape.
+  function drawLabel(tr, cx, cy, r) {
+    if (tr.by === 'color') {
+      drawBead('round', cx, cy, r, tr.color, false);
+    } else {
+      beadPath(tr.shape, cx, cy, r);
+      ctx.fillStyle = shade(COLORS.wood, -0.12);
+      ctx.fill();
+      ctx.lineJoin = 'round';
+      ctx.lineWidth = Math.max(2, r * 0.16);
+      ctx.strokeStyle = shade(COLORS.wood, -0.42);
+      ctx.stroke();
+    }
+  }
+
+  // A tray: rim, a hollow well for the beads, and a label band in front.
+  function drawTray(tr, r, t, hovered, glow, dim) {
+    const rim = tr.by === 'color' ? tr.color : COLORS.wood;
+    const well = tr.by === 'color' ? shade(tr.color, 0.45) : COLORS.woodWell;
+    const cx = r.x + r.w / 2, base = r.y + r.h;
+
+    let sx = 1, sy = 1;
+    const bp = (t - tr.bounceT0) / CONFIG.BOUNCE_MS;
+    if (bp >= 0 && bp < 1) {
+      const k = Math.sin(Math.PI * bp);
+      sx += 0.05 * k;
+      sy -= 0.07 * k;
+    }
+    if (hovered) { sx *= 1.05; sy *= 1.05; }
+
+    ctx.save();
+    ctx.globalAlpha = dim;
+    ctx.translate(cx, base);
+    ctx.scale(sx, sy);
+    ctx.translate(-cx, -base);
+
+    // Scaffolding hint (or "count this tray"): a soft glow around the tray.
+    if (glow > 0) {
+      const g = Math.min(r.w, r.h) * (0.05 + 0.06 * glow);
+      ctx.globalAlpha = dim * (0.25 + 0.35 * glow);
+      ctx.fillStyle = shade(tr.by === 'color' ? tr.color : COLORS.star, 0.35);
+      ctx.beginPath();
+      roundRectPath(r.x - g, r.y - g, r.w + g * 2, r.h + g * 2, Math.min(r.w, r.h) * 0.16 + g);
+      ctx.fill();
+      ctx.globalAlpha = dim;
+    }
+
+    ctx.shadowColor = 'rgba(74, 64, 54, 0.14)';
+    ctx.shadowBlur = Math.min(r.w, r.h) * 0.1;
+    ctx.shadowOffsetY = Math.min(r.w, r.h) * 0.04;
+    ctx.beginPath();
+    roundRectPath(r.x, r.y, r.w, r.h, Math.min(r.w, r.h) * 0.16);
+    ctx.fillStyle = rim;
+    ctx.fill();
+    ctx.shadowColor = 'transparent';
+    ctx.lineWidth = Math.max(2, Math.min(r.w, r.h) * 0.025);
+    ctx.strokeStyle = shade(rim, -0.25);
+    ctx.stroke();
+
+    const w = wellRect(r);
+    ctx.beginPath();
+    roundRectPath(w.x, w.y, w.w, w.h, Math.min(w.w, w.h) * 0.18);
+    ctx.fillStyle = well;
+    ctx.fill();
+    ctx.lineWidth = Math.max(2, Math.min(r.w, r.h) * 0.03);
+    ctx.strokeStyle = shade(rim, -0.18);
+    ctx.stroke();
+    // Inner shadow along the top edge of the well.
+    ctx.save();
+    ctx.beginPath();
+    roundRectPath(w.x, w.y, w.w, w.h, Math.min(w.w, w.h) * 0.18);
+    ctx.clip();
+    ctx.globalAlpha = dim * 0.12;
+    ctx.fillStyle = COLORS.ink;
+    ctx.fillRect(w.x, w.y, w.w, Math.min(w.w, w.h) * 0.08);
+    ctx.restore();
+
+    // Label band.
+    const ly = r.y + r.h * 0.83;
+    const lr = Math.min(r.h * 0.1, r.w * 0.12);
+    drawLabel(tr, cx, ly, lr);
+    ctx.restore();
+  }
+
+  // The count numeral beside a bead: a small cream bubble that pops in.
+  function drawCountBubble(n, x, y, r, t0, t) {
+    const p = clamp((t - t0) / CONFIG.COUNT_POP_MS, 0, 1);
+    const k = reduceMotion ? 1 : easeOutBack(p);
+    const br = Math.max(11, r * 0.48) * k;
+    if (br <= 0.5) return;
+    const bx = x + r * 0.92, by = y - r * 0.92;
+    ctx.save();
+    ctx.shadowColor = 'rgba(74, 64, 54, 0.18)';
+    ctx.shadowBlur = br * 0.4;
+    ctx.shadowOffsetY = br * 0.1;
+    ctx.beginPath();
+    ctx.arc(bx, by, br, 0, TAU);
+    ctx.fillStyle = COLORS.bubble;
+    ctx.fill();
+    ctx.restore();
+    ctx.lineWidth = Math.max(1.5, br * 0.1);
+    ctx.strokeStyle = '#E6DCCB';
+    ctx.beginPath(); ctx.arc(bx, by, br, 0, TAU); ctx.stroke();
+    ctx.fillStyle = COLORS.ink;
+    ctx.font = `800 ${Math.round(br * 1.25)}px ${FONT}`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(String(n), bx, by + br * 0.06);
+  }
+
+  // A numeral in a circle (the revealed total, or a bubble to choose).
+  function drawNumberDisc(n, x, y, r, fill, ring, glow) {
+    if (glow > 0) {
+      ctx.globalAlpha = 0.3 + 0.45 * glow;
+      ctx.fillStyle = shade(COLORS.star, 0.3);
+      ctx.beginPath(); ctx.arc(x, y, r * (1.18 + 0.12 * glow), 0, TAU); ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+    ctx.save();
+    ctx.shadowColor = 'rgba(74, 64, 54, 0.16)';
+    ctx.shadowBlur = r * 0.25;
+    ctx.shadowOffsetY = r * 0.06;
+    ctx.beginPath(); ctx.arc(x, y, r, 0, TAU);
+    ctx.fillStyle = fill; ctx.fill();
+    ctx.restore();
+    ctx.lineWidth = Math.max(2, r * 0.08);
+    ctx.strokeStyle = ring;
+    ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.stroke();
+    ctx.fillStyle = COLORS.ink;
+    ctx.font = `800 ${Math.round(r * 1.15)}px ${FONT}`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(String(n), x, y + r * 0.05);
+  }
+
+  function drawStar(cx, cy, R, fill, face) {
+    ctx.save();
+    ctx.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const rad = i % 2 === 0 ? R : R * 0.5;
+      const a = -Math.PI / 2 + i * Math.PI / 5;
+      const x = cx + rad * Math.cos(a), y = cy + rad * Math.sin(a);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    ctx.lineJoin = 'round';
+    if (fill) {
+      ctx.fillStyle = fill;
+      ctx.fill();
+      ctx.strokeStyle = fill;            // same-colour stroke rounds the tips
+      ctx.lineWidth = Math.max(2, R * 0.16);
+      ctx.stroke();
+    } else {
+      ctx.strokeStyle = 'rgba(74, 64, 54, 0.25)';
+      ctx.lineWidth = Math.max(2, R * 0.14);
+      ctx.stroke();
+    }
+
+    if (face) {
+      ctx.fillStyle = COLORS.ink;
+      ctx.beginPath(); ctx.arc(cx - R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.arc(cx + R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.strokeStyle = COLORS.ink;
+      ctx.lineWidth = Math.max(2, R * 0.05);
+      ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.arc(cx, cy + R * 0.06, R * 0.17, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+      ctx.globalAlpha = 0.35;
+      ctx.fillStyle = COLORS.cheek;
+      ctx.beginPath(); ctx.ellipse(cx - R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(cx + R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // Same ring of sparkles from every tray, every time (no random rewards).
+  function spawnParticles(r, t, color) {
+    const cx = r.x + r.w / 2, cy = r.y;
+    for (let i = 0; i < 10; i++) {
+      const a = -Math.PI / 2 + (i - 4.5) * 0.3;
+      state.particles.push({ x0: cx, y0: cy, dx: Math.cos(a), dy: Math.sin(a), dist: Math.min(r.w, r.h) * 0.8, t0: t, life: 900, color: i % 2 ? COLORS.star : shade(color, 0.1) });
+    }
+  }
+
+  function drawParticles(t) {
+    state.particles = state.particles.filter(p => t - p.t0 < p.life);
+    for (const p of state.particles) {
+      const k = (t - p.t0) / p.life;
+      const e = easeOutCubic(k);
+      ctx.globalAlpha = 1 - k;
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x0 + p.dx * p.dist * e, p.y0 + p.dy * p.dist * e, L.s * 0.15 * (1 - k * 0.5), 0, TAU);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------------------------------------------------------------------
+  // Screens
+  // ---------------------------------------------------------------------
+  function starGeom() {
+    return { cx: W / 2, cy: H * 0.42, R: Math.min(W, H) * 0.2 };
+  }
+
+  // Start and between-round screen: one big pulsing star to tap, plus 5 slots
+  // that fill up so the child can see the end coming.
+  function drawStarScreen(t) {
+    const { cx, cy, R } = starGeom();
+    const amp = reduceMotion ? 0.03 : 0.07;
+    const k = 1 + amp * (0.5 - 0.5 * Math.cos(TAU * t / 1400));
+    drawStar(cx, cy, R * k, COLORS.star, true);
+
+    const sr = R * 0.16, gap = sr * 2.8, y = cy + R * 1.35;
+    for (let i = 0; i < CONFIG.ROUNDS; i++) {
+      drawStar(cx + (i - (CONFIG.ROUNDS - 1) / 2) * gap, y, sr, i < state.round ? COLORS.star : null, false);
+    }
+  }
+
+  function fitFont(text, weight, size, maxW) {
+    ctx.font = `${weight} ${size}px ${FONT}`;
+    while (size > 12 && ctx.measureText(text).width > maxW) {
+      size -= 1;
+      ctx.font = `${weight} ${size}px ${FONT}`;
+    }
+    return size;
+  }
+
+  // Static end screen. No buttons: the session is over.
+  function drawEnd() {
+    const gh = H * 0.14;
+    ctx.fillStyle = COLORS.grass;
+    ctx.beginPath();
+    ctx.moveTo(0, H - gh);
+    ctx.quadraticCurveTo(W / 2, H - gh * 1.5, W, H - gh);
+    ctx.lineTo(W, H);
+    ctx.lineTo(0, H);
+    ctx.closePath();
+    ctx.fill();
+
+    const R = Math.min(W, H) * 0.2;
+    const cy = H * 0.36;
+    drawStar(W / 2, cy, R, COLORS.star, true);
+
+    const big = clamp(Math.min(W, H) * 0.1, 26, 68);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = COLORS.ink;
+    const top = cy + R * 1.25;
+    fitFont('Great Job!', 800, big, W * 0.9);
+    ctx.fillText('Great Job!', W / 2, top + big * 0.5);
+    fitFont('Time to play outside!', 700, Math.round(big * 0.62), W * 0.9);
+    ctx.fillText('Time to play outside!', W / 2, top + big * 1.55);
+  }
+
+  // Sorting: which bead to pulse and which tray (if any) to glow right now.
+  function sortGuidance(t) {
+    const out = { target: null, pulse: 1, hintTray: null, glow: 0 };
+    if (state.phase !== 'play' || state.step !== 'sort') return out;
+    const amp = reduceMotion ? 0.05 : 0.12;
+
+    if (state.drag) {
+      const b = state.drag.obj;
+      if (b.errors >= CONFIG.HINT_AFTER_SLIPS) { out.hintTray = state.trays[b.tray]; out.glow = 0.5 + 0.5 * Math.sin(TAU * t / 1300); }
+      return out;
+    }
+
+    const idle = t - state.lastInteraction;
+    if (idle <= CONFIG.IDLE_PULSE_MS) return out;
+    out.target = state.beads.find(b => b.state === 'idle') || null;
+    if (!out.target) return out;
+    const wave = 0.5 - 0.5 * Math.cos(TAU * (idle - CONFIG.IDLE_PULSE_MS) / 1300);
+    out.pulse = 1 + amp * wave;
+
+    // Scaffolding: glow the right tray after repeated slips, or in the very first
+    // round if the child has not found the mechanic yet.
+    const tutorial = state.round === 0 && state.beads.every(b => b.state !== 'placed') && idle > CONFIG.TUTORIAL_HINT_MS;
+    if (out.target.errors >= CONFIG.HINT_AFTER_SLIPS || tutorial) { out.hintTray = state.trays[out.target.tray]; out.glow = wave; }
+    return out;
+  }
+
+  // Counting: the next uncounted bead always pulses gently, and harder when idle.
+  function countPulse(t) {
+    const idle = t - state.lastInteraction;
+    const slow = 0.5 - 0.5 * Math.cos(TAU * t / 1200);
+    let amp = reduceMotion ? 0.04 : 0.08;
+    if (idle > CONFIG.IDLE_PULSE_MS) amp *= 1.8;
+    const tutorial = state.round === 0 && state.ct === 0 && state.trays[0] && state.trays[0].counted === 0 && idle > CONFIG.TUTORIAL_HINT_MS;
+    return { scale: 1 + amp * slow, ring: tutorial ? slow : 0 };
+  }
+
+  function drawSortPlay(t) {
+    const g = sortGuidance(t);
+    const hover = state.drag ? findDropTray(state.drag.obj) : null;
+    drawMat(1);
+    for (const tr of state.trays) {
+      drawTray(tr, tr.sort, t, tr === hover, tr === g.hintTray ? g.glow : 0, 1);
+    }
+    // Beads that are in (or almost in) a tray.
+    for (const b of state.beads) {
+      if (b.state === 'placed' || (b.state === 'toTray' && b.animP >= 0.7)) drawBead(b.shape, b.x, b.y, L.s * b.scale, b.color, false);
+    }
+    for (const b of state.beads) {
+      if (b.state === 'idle' || b.state === 'return' || (b.state === 'toTray' && b.animP < 0.7)) {
+        drawBead(b.shape, b.x, b.y, L.s * b.scale * (b === g.target ? g.pulse : 1), b.color, false);
+      }
+    }
+    if (state.drag) { const b = state.drag.obj; drawBead(b.shape, b.x, b.y, L.s * 1.12, b.color, true); }
+    drawParticles(t);
+  }
+
+  function drawCountPlay(t) {
+    const mp = moveProgress(t);
+    drawMat(1 - mp);
+    const active = state.step === 'count' || state.step === 'choose' || state.step === 'reveal';
+    const cur = state.trays[state.ct];
+    const pulse = countPulse(t);
+    const next = (state.step === 'count' && cur) ? nextUncounted(cur) : null;
+
+    for (const tr of state.trays) {
+      const r = trayRect(tr, t);
+      const isCur = active && tr === cur;
+      // The tray being counted is bright and softly lit; the others rest, slightly faded.
+      const dim = (!active || isCur || state.phase === 'celebrate') ? 1 : (tr.total ? 0.75 : 0.5);
+      const glow = isCur ? 0.4 + 0.25 * Math.sin(TAU * t / 1600) : 0;
+      drawTray(tr, r, t, false, glow, dim);
+
+      ctx.save();
+      ctx.globalAlpha = dim;
+      for (const b of traysBeads(tr)) {
+        const p = slotPos(tr, b.slot, t);
+        let rr = p.r;
+        let wob = 0;
+        const wp = (t - b.wiggleT0) / CONFIG.WOBBLE_MS;
+        if (wp >= 0 && wp < 1) wob = (reduceMotion ? 0.03 : 0.08) * Math.sin(wp * Math.PI * 4) * (1 - wp) * rr;
+        if (b === next) {
+          rr *= pulse.scale;
+          if (pulse.ring > 0) {
+            ctx.globalAlpha = dim * (0.25 + 0.4 * pulse.ring);
+            ctx.fillStyle = shade(COLORS.star, 0.3);
+            ctx.beginPath(); ctx.arc(p.x, p.y, p.r * (1.35 + 0.2 * pulse.ring), 0, TAU); ctx.fill();
+            ctx.globalAlpha = dim;
+          }
+        }
+        drawBead(b.shape, p.x + wob, p.y, rr, b.color, false);
+      }
+      // Count numerals next to their beads, drawn after all beads so none is hidden.
+      for (const b of traysBeads(tr)) {
+        if (!b.countN) continue;
+        const p = slotPos(tr, b.slot, t);
+        drawCountBubble(b.countN, p.x, p.y, p.r, b.countT0, t);
+      }
+      ctx.restore();
+
+      // The total beside the tray.
+      if (tr.total && mp >= 1) {
+        const s = tr.spot;
+        const rr = Math.min(s.w, s.h) * 0.4;
+        const p = clamp((t - tr.totalT0) / 360, 0, 1);
+        const k = reduceMotion ? 1 : easeOutBack(p);
+        ctx.save();
+        ctx.globalAlpha = dim;
+        drawNumberDisc(tr.total, s.x + s.w / 2, s.y + s.h / 2, Math.max(1, rr * k), COLORS.bubble, shade(beadColorFor(tr), -0.1), 0);
+        ctx.restore();
+      }
+    }
+
+    // Numeral bubbles to choose the total from.
+    if (state.step === 'choose') {
+      const idle = t - state.lastInteraction;
+      const hint = state.choiceSlips >= CONFIG.HINT_AFTER_SLIPS;
+      state.choices.forEach((c, i) => {
+        const p = clamp((t - c.t0) / 300, 0, 1);
+        if (p <= 0) return;
+        let k = reduceMotion ? 1 : easeOutBack(p);
+        if (idle > CONFIG.IDLE_PULSE_MS && !reduceMotion) {
+          k *= 1 + 0.06 * Math.max(0, Math.sin(TAU * (idle - CONFIG.IDLE_PULSE_MS) / 1600 - i * 1.4));
+        }
+        let wob = 0;
+        const wp = (t - c.wobbleT0) / CONFIG.WOBBLE_MS;
+        if (wp >= 0 && wp < 1) wob = (reduceMotion ? 0.04 : 0.12) * Math.sin(wp * Math.PI * 4) * (1 - wp) * c.r;
+        const glow = hint && c.n === cur.capacity ? 0.5 + 0.5 * Math.sin(TAU * t / 1300) : 0;
+        drawNumberDisc(c.n, c.x + wob, c.y, c.r * k, COLORS.bubble, '#E6DCCB', glow);
+      });
+    }
+    drawParticles(t);
+  }
+
+  // ---------------------------------------------------------------------
+  // Main loop
+  // ---------------------------------------------------------------------
+  function update(t) {
+    for (const b of state.beads) {
+      const a = b.anim;
+      if (a) {
+        const p = clamp((t - a.t0) / a.dur, 0, 1);
+        const e = a.ease(p);
+        b.x = lerp(a.fx, a.tx, e);
+        b.y = lerp(a.fy, a.ty, e);
+        b.scale = lerp(a.fs, a.ts, e);
+        b.animP = p;
+        if (p >= 1) {
+          b.anim = null;
+          if (b.state === 'return') b.state = 'idle';
+          else if (b.state === 'toTray') landInTray(b, t);
+        }
+      } else if (b.state === 'placed') {
+        // Placed beads ride along with their tray (it grows for counting).
+        const p = slotPos(state.trays[b.tray], b.slot, t);
+        b.x = p.x; b.y = p.y; b.scale = p.r / L.s;
+      }
+    }
+
+    if (state.pendingSay && t >= state.pendingSay.at) {
+      say(state.pendingSay.text);
+      state.pendingSay = null;
+    }
+
+    if (state.phase === 'play') {
+      if (state.step === 'sorted' && t >= state.stepAt) startCounting(t);
+      else if (state.step === 'move' && t >= state.stepAt) beginTray(t);
+      else if (state.step === 'reveal' && t >= state.stepAt) nextTray(t);
+      else if (state.step === 'done' && state.completeAt && t >= state.completeAt) {
+        state.completeAt = 0;
+        completeRound();
+      }
+    }
+
+    if (state.phase === 'celebrate' && t - state.celebrateStart >= CONFIG.CELEBRATE_MS) {
+      if (state.round >= CONFIG.ROUNDS) enterEnd();
+      else state.phase = 'between';
+    }
+  }
+
+  function render(t) {
+    ctx.fillStyle = COLORS.bg;
+    ctx.fillRect(0, 0, W, H);
+    if (state.phase === 'start' || state.phase === 'between') drawStarScreen(t);
+    else if (state.phase === 'play' || state.phase === 'celebrate') {
+      if (sorting()) drawSortPlay(t);
+      else drawCountPlay(t);
+    } else if (state.phase === 'end') drawEnd();
+  }
+
+  let rafId = 0;
+  function frame(t) {
+    update(t);
+    render(t);
+    // The end screen is static: stop the loop entirely.
+    if (state.phase !== 'end') rafId = requestAnimationFrame(frame);
+  }
+
+  function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    DPR = Math.min(window.devicePixelRatio || 1, 2.5);
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    computeLayout();
+    if (state.phase === 'end') render(now());
+  }
+
+  window.addEventListener('resize', resize);
+  window.addEventListener('orientationchange', resize);
+
+  resize();
+  log('Game loaded', { roundsPerSession: CONFIG.ROUNDS, gamesCompletedBefore: progress.gamesCompleted });
+  rafId = requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

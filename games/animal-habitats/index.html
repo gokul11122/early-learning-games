@@ -1,0 +1,1823 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Animal Habitats</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
+  body {
+    background: #F6F1E7;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  canvas { display: block; width: 100%; height: 100%; }
+
+  #home {
+    position: fixed; top: max(10px, env(safe-area-inset-top)); right: max(10px, env(safe-area-inset-right));
+    width: 52px; height: 52px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+    background: rgba(255, 253, 248, 0.85); box-shadow: 0 2px 8px rgba(74, 64, 54, 0.15);
+    -webkit-tap-highlight-color: transparent; z-index: 5;
+  }
+  #home:active { transform: scale(0.94); }
+
+  /* Hidden parent view: press and hold the top-left corner for 3 seconds. */
+  #parent {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: rgba(74, 64, 54, 0.55); padding: 16px; box-sizing: border-box; z-index: 10;
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #4A4036;
+  }
+  #parent[hidden] { display: none; }
+  #parent .card { background: #FFFDF8; border-radius: 16px; padding: 20px 22px; max-width: 380px; width: 100%; box-shadow: 0 10px 30px rgba(0,0,0,0.18); }
+  #parent h2 { margin: 0 0 10px; font-size: 18px; }
+  #parent table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+  #parent th, #parent td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #EDE5D6; }
+  #parent .hint { margin: 12px 0 0; font-size: 12px; opacity: 0.7; }
+</style>
+</head>
+<body>
+<canvas id="game" aria-label="Animal habitats game"></canvas>
+<a id="home" href="../../index.html" aria-label="Home">
+  <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><path d="M4 11.5 12 5l8 6.5V19a1 1 0 0 1-1 1h-4.5v-5h-5v5H5a1 1 0 0 1-1-1z" fill="none" stroke="#4A4036" stroke-width="2" stroke-linejoin="round"/></svg>
+</a>
+
+<div id="parent" hidden>
+  <div class="card">
+    <h2>Progress on this device</h2>
+    <div id="parentBody"></div>
+    <p class="hint">Stored only on this device. Tap anywhere to close.</p>
+  </div>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  /* =====================================================================
+   * ANIMAL HABITATS
+   * ELOF domain: Scientific Reasoning (living things and their environments)
+   *              + Perceptual/Motor (fine motor drag-and-drop).
+   *
+   * The child carries each animal to the place it lives: the pond (water),
+   * the meadow (land) or the open sky. Only unambiguous animals are used
+   * (no ducks, frogs or penguins), so every animal has exactly one home.
+   *
+   * Design rules this file follows (from SPEC.md):
+   *  - Coherence: only animals and habitat scenes on screen. No score, no
+   *    menus, no text during play.
+   *  - Control of error: an animal dropped in the wrong habitat glides back
+   *    home. No buzzer, no red X. The rejection itself is the feedback.
+   *  - Forgiving hitboxes: each habitat scene is far larger than an animal.
+   *  - Visual prompts: the next animal pulses gently when the child is idle.
+   *  - Self-paced: no timers anywhere the child can see or feel.
+   *  - Natural stopping point: 5 rounds, then a static "play outside" screen
+   *    with no "play again" button.
+   * ===================================================================== */
+
+  // ---------------------------------------------------------------------
+  // Configuration
+  // ---------------------------------------------------------------------
+  const CONFIG = {
+    ROUNDS: 5,                     // hard session limit (natural stopping point)
+    STORAGE_KEY: 'animal-habitats.v1',
+    IDLE_PULSE_MS: 1500,           // idle time before the next animal pulses
+    TUTORIAL_HINT_MS: 5000,        // first round: idle time before the right habitat glows too
+    RETURN_MS: 380,                // wrong drop: glide-home duration
+    TO_ZONE_MS: 260,               // right drop: glide-into-habitat duration
+    BOUNCE_MS: 320,                // habitat squash when an animal lands
+    SETTLE_MS: 1800,               // habitat-specific "settling in" motion after landing
+    CELEBRATE_MS: 1700,            // round-complete celebration length
+    FAST_MS_PER_ANIMAL: 4500,      // "quick" threshold for difficulty step-up
+    PARENT_HOLD_MS: 3000,          // hold time for the hidden parent view
+    PARENT_CORNER_PX: 80,
+    TAP_SLOP_PX: 12,               // movement below this is a tap, not a drop
+    HOME_CLEAR_PX: 8,              // extra gap kept around the home button
+  };
+
+  const COLORS = {
+    bg: '#F6F1E7',
+    ink: '#4A4036',
+    star: '#F6C85F',
+    grass: '#B9D7A8',
+    cheek: '#F2A88A',
+    white: '#FFFDF8',
+    pink: '#F2BFB0',
+    orange: '#F2A65A',
+  };
+
+  const FONT = 'ui-rounded, "Arial Rounded MT Bold", "Nunito", system-ui, -apple-system, sans-serif';
+
+  // Each habitat: how its animals move (used in the spoken sentence), the
+  // card's accent colour, and a fixed landing sound.
+  const HABITATS = {
+    water: { verb: 'swim in the water', accent: '#7DB3D8' },
+    land:  { verb: 'walk on the land',  accent: '#8DBF7F' },
+    sky:   { verb: 'fly in the sky',    accent: '#9CC3E3' },
+  };
+  const HABITAT_ORDER = ['water', 'land', 'sky'];
+
+  // Only animals with a single, obvious home.
+  const ANIMALS = {
+    fish:      { habitat: 'water', name: 'fish',      plural: 'Fish' },
+    whale:     { habitat: 'water', name: 'whale',     plural: 'Whales' },
+    octopus:   { habitat: 'water', name: 'octopus',   plural: 'Octopuses' },
+    cow:       { habitat: 'land',  name: 'cow',       plural: 'Cows' },
+    dog:       { habitat: 'land',  name: 'dog',       plural: 'Dogs' },
+    rabbit:    { habitat: 'land',  name: 'rabbit',    plural: 'Rabbits' },
+    lion:      { habitat: 'land',  name: 'lion',      plural: 'Lions' },
+    elephant:  { habitat: 'land',  name: 'elephant',  plural: 'Elephants' },
+    bird:      { habitat: 'sky',   name: 'bird',      plural: 'Birds' },
+    butterfly: { habitat: 'sky',   name: 'butterfly', plural: 'Butterflies' },
+    bee:       { habitat: 'sky',   name: 'bee',       plural: 'Bees' },
+    owl:       { habitat: 'sky',   name: 'owl',       plural: 'Owls' },
+  };
+  const KINDS_BY_HABITAT = {};
+  Object.keys(ANIMALS).forEach(k => {
+    const h = ANIMALS[k].habitat;
+    (KINDS_BY_HABITAT[h] = KINDS_BY_HABITAT[h] || []).push(k);
+  });
+
+  // Difficulty ladder for dynamic difficulty adjustment (scaffolding).
+  // The first two steps use only water and land, the clearest contrast.
+  const TIERS = [
+    { habitats: 2, perType: 2 },   // 4 animals: water / land
+    { habitats: 2, perType: 3 },   // 6 animals: water / land
+    { habitats: 3, perType: 2 },   // 6 animals: water / land / sky
+    { habitats: 3, perType: 3 },   // 9 animals: water / land / sky
+  ];
+
+  // Where placed animals rest inside a habitat card (fractions of its size).
+  // "Tall" cards (narrow portrait screens) use a zig-zag column instead.
+  const SLOTS = {
+    wide: { 2: [[0.3, 0.58], [0.7, 0.62]], 3: [[0.24, 0.45], [0.76, 0.45], [0.5, 0.74]] },
+    tall: { 2: [[0.36, 0.36], [0.64, 0.7]], 3: [[0.3, 0.3], [0.7, 0.53], [0.32, 0.77]] },
+  };
+
+  const TAU = Math.PI * 2;
+  const reduceMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  const MOTION = reduceMotion ? 0.4 : 1;
+
+  // ---------------------------------------------------------------------
+  // Small helpers
+  // ---------------------------------------------------------------------
+  const now = () => performance.now();
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const easeOutCubic = t => 1 - Math.pow(1 - t, 3);
+  const easeInOutQuad = t => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
+  const log = (...args) => console.log('[AnimalHabitats]', ...args);
+
+  function shuffle(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }
+
+  // Mix a hex colour toward black (amt < 0) or white (amt > 0).
+  const shadeCache = new Map();
+  function shade(hex, amt) {
+    const key = hex + amt;
+    if (shadeCache.has(key)) return shadeCache.get(key);
+    const n = parseInt(hex.slice(1), 16);
+    const target = amt < 0 ? 0 : 255;
+    const p = Math.abs(amt);
+    const c = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map(v => Math.round(lerp(v, target, p)));
+    const out = `rgb(${c[0]},${c[1]},${c[2]})`;
+    shadeCache.set(key, out);
+    return out;
+  }
+
+  // ---------------------------------------------------------------------
+  // Canvas setup
+  // ---------------------------------------------------------------------
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const homeEl = document.getElementById('home');
+  let W = 0, H = 0, DPR = 1;
+
+  // Layout values recomputed on every resize. s = free animal radius, pr = placed radius.
+  const L = { m: 16, s: 40, pr: 24 };
+
+  // ---------------------------------------------------------------------
+  // Game state
+  // ---------------------------------------------------------------------
+  const state = {
+    phase: 'start',          // 'start' | 'play' | 'celebrate' | 'between' | 'end'
+    round: 0,                // rounds completed this session
+    tier: 0,                 // index into TIERS
+    zones: [],               // habitat cards along the bottom
+    objects: [],             // animals
+    drag: null,              // { obj, dx, dy, sx, sy, moved }
+    lastInteraction: 0,
+    roundStart: 0,
+    roundErrors: 0,          // wrong-habitat drops this round
+    placedThisRound: 0,
+    completeAt: 0,           // time to fire completeRound()
+    celebrateStart: 0,
+    particles: [],
+  };
+
+  // ---------------------------------------------------------------------
+  // Local progress tracking (localStorage, never leaves the device)
+  // ---------------------------------------------------------------------
+  function freshProgress() {
+    return { version: 1, gamesCompleted: 0, roundsCompleted: 0, placements: 0, wrongDrops: 0, lastPlayed: null, sessions: [] };
+  }
+
+  function loadProgress() {
+    try {
+      const raw = window.localStorage.getItem(CONFIG.STORAGE_KEY);
+      if (raw) {
+        const data = JSON.parse(raw);
+        if (data && data.version === 1 && Array.isArray(data.sessions)) return data;
+      }
+    } catch (e) {
+      console.warn('[AnimalHabitats] Progress could not be loaded (storage unavailable):', e && e.message);
+    }
+    return freshProgress();
+  }
+
+  function saveProgress() {
+    try {
+      window.localStorage.setItem(CONFIG.STORAGE_KEY, JSON.stringify(progress));
+      log('Progress saved', { gamesCompleted: progress.gamesCompleted, roundsCompleted: progress.roundsCompleted });
+    } catch (e) {
+      console.warn('[AnimalHabitats] Progress could not be saved (storage unavailable):', e && e.message);
+    }
+  }
+
+  const progress = loadProgress();
+  let session = null; // created on the first round of this app launch
+
+  function ensureSession() {
+    if (session) return;
+    session = { startedAt: new Date().toISOString(), finished: false, rounds: [] };
+    progress.sessions.push(session);
+    if (progress.sessions.length > 30) progress.sessions.splice(0, progress.sessions.length - 30);
+  }
+
+  // ---------------------------------------------------------------------
+  // Audio: Web Audio tones + optional spoken words
+  // ---------------------------------------------------------------------
+  let actx = null;
+
+  // Browsers only allow audio after a user gesture, so this runs on every pointer down.
+  function unlockAudio() {
+    if (!actx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) { try { actx = new AC(); } catch (e) { actx = null; } }
+    }
+    if (actx && actx.state === 'suspended') actx.resume();
+  }
+
+  function tone(freq, delay, dur, vol = 0.16, type = 'sine') {
+    if (!actx) return;
+    const t = actx.currentTime + delay;
+    const osc = actx.createOscillator();
+    const gain = actx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(vol, t + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    osc.connect(gain).connect(actx.destination);
+    osc.start(t);
+    osc.stop(t + dur + 0.05);
+  }
+
+  // Each habitat always plays the same little tune: predictable, proportional feedback.
+  // Water bubbles upward, land thumps down low, sky trills up high.
+  const LAND_SOUND = {
+    water: () => { tone(523.25, 0, 0.35); tone(880, 0.06, 0.09, 0.06); tone(1174.66, 0.13, 0.09, 0.05); tone(1396.91, 0.2, 0.1, 0.05); },
+    land:  () => { tone(392, 0, 0.4); tone(293.66, 0.09, 0.4, 0.1, 'triangle'); },
+    sky:   () => { tone(659.25, 0, 0.35); tone(1318.5, 0.06, 0.07, 0.05); tone(1568, 0.12, 0.07, 0.05); tone(1318.5, 0.18, 0.08, 0.04); },
+  };
+  const playPickup = () => tone(440, 0, 0.08, 0.05, 'triangle');
+  const playLanding = habitat => LAND_SOUND[habitat]();
+  const playRoundDone = () => [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => tone(f, i * 0.12, 0.5, 0.12));
+
+  // Spoken words via the Web Speech API. Android WebView usually lacks it,
+  // so this quietly does nothing there and the tones carry the feedback.
+  // queue = true lets a sentence finish before the next one starts.
+  function say(text, queue = false) {
+    try {
+      if (!('speechSynthesis' in window)) return;
+      if (!queue) window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'en-US';
+      u.rate = 0.85;
+      u.pitch = 1.15;
+      window.speechSynthesis.speak(u);
+    } catch (e) { /* speech is optional */ }
+  }
+
+  // ---------------------------------------------------------------------
+  // Rounds and difficulty
+  // ---------------------------------------------------------------------
+  function startRound() {
+    ensureSession();
+    const tier = TIERS[state.tier];
+    const habitats = HABITAT_ORDER.slice(0, tier.habitats);
+
+    state.zones = habitats.map(habitat => ({ habitat, count: 0, capacity: tier.perType, bounceT0: -1e9, x: 0, y: 0, w: 0, h: 0, tall: false }));
+
+    const objects = [];
+    habitats.forEach(habitat => {
+      shuffle(KINDS_BY_HABITAT[habitat].slice()).slice(0, tier.perType).forEach(kind => {
+        objects.push({
+          kind,
+          habitat,
+          jx: Math.random() * 2 - 1,   // fixed jitter so homes stay put across resizes
+          jy: Math.random() * 2 - 1,
+          x: 0, y: 0, homeX: 0, homeY: 0, scale: 1,
+          state: 'idle',             // 'idle' | 'drag' | 'return' | 'toZone' | 'placed'
+          anim: null, animP: 0,
+          errors: 0, zone: null, slot: -1, landT0: -1e9,
+        });
+      });
+    });
+    shuffle(objects).forEach((o, i) => { o.homeSlot = i; });
+
+    state.objects = objects;
+    state.roundErrors = 0;
+    state.placedThisRound = 0;
+    state.completeAt = 0;
+    state.particles = [];
+    state.drag = null;
+    computeLayout();
+
+    state.phase = 'play';
+    state.roundStart = now();
+    state.lastInteraction = now();
+    if (state.round === 0) say('Help each animal find its home.');
+    log(`Round ${state.round + 1}/${CONFIG.ROUNDS} started at level ${state.tier + 1}: ${objects.map(o => o.kind).join(', ')}`);
+  }
+
+  function completeRound() {
+    const t = now();
+    const n = state.objects.length;
+    const withErrors = state.objects.filter(o => o.errors > 0).length;
+    const ms = t - state.roundStart;
+    const record = {
+      level: state.tier + 1,
+      habitats: state.zones.length,
+      animals: n,
+      firstTry: n - withErrors,
+      wrongDrops: state.roundErrors,
+      seconds: Math.round(ms / 100) / 10,
+    };
+
+    session.rounds.push(record);
+    progress.roundsCompleted++;
+    progress.placements += n;
+    progress.wrongDrops += state.roundErrors;
+    progress.lastPlayed = new Date().toISOString();
+    state.round++;
+    log('Level completed', record);
+
+    const finalRound = state.round >= CONFIG.ROUNDS;
+    if (finalRound) {
+      session.finished = true;
+      progress.gamesCompleted++;
+    } else {
+      // Praise the effort, not the child's "smartness" (growth mindset).
+      say(state.roundErrors > 0 ? 'You kept trying, and you did it!' : 'Every animal is home!', true);
+    }
+    saveProgress();
+    adjustDifficulty(record, ms);
+
+    playRoundDone();
+    state.zones.forEach(z => { z.bounceT0 = t; spawnParticles(z, t); });
+    state.phase = 'celebrate';
+    state.celebrateStart = t;
+  }
+
+  // Simple DDA: quick and clean -> one step harder; a real struggle -> one step easier.
+  function adjustDifficulty(record, ms) {
+    const fast = ms / record.animals <= CONFIG.FAST_MS_PER_ANIMAL;
+    const before = state.tier;
+    if (record.firstTry === record.animals && fast) {
+      state.tier = Math.min(TIERS.length - 1, state.tier + 1);
+    } else if (record.wrongDrops >= Math.max(3, Math.ceil(record.animals / 2))) {
+      state.tier = Math.max(0, state.tier - 1);
+    }
+    if (state.tier !== before) log(`Difficulty ${state.tier > before ? 'up' : 'down'}: level ${before + 1} -> ${state.tier + 1}`);
+  }
+
+  function enterEnd() {
+    state.phase = 'end';
+    say('Great job! Time to play outside!', true);
+    log('Session finished: end screen shown, no replay offered');
+  }
+
+  // ---------------------------------------------------------------------
+  // Layout
+  // ---------------------------------------------------------------------
+  // The area under the home button (top-right) that must stay free of animals.
+  function homeReserve() {
+    const r = homeEl ? homeEl.getBoundingClientRect() : null;
+    if (!r || !r.width) return { left: W - 72, bottom: 72 };
+    return { left: r.left - CONFIG.HOME_CLEAR_PX, bottom: r.bottom + CONFIG.HOME_CLEAR_PX };
+  }
+
+  // Spread n homes on a grid, skipping any cell that would sit under the home button.
+  function gridHomes(n, ax, ay, aw, ah) {
+    const res = homeReserve();
+    let last = null;
+    for (let extra = 0; extra <= 3; extra++) {
+      const total = n + extra;
+      const rows = Math.ceil(total / clamp(Math.round(Math.sqrt(total * aw / ah)), 1, total));
+      const cols = Math.ceil(total / rows);
+      const cw = aw / cols, ch = ah / rows;
+      const reach = Math.min(cw, ch) * 0.45;
+      const cells = [];
+      for (let i = 0; i < total; i++) {
+        const row = Math.floor(i / cols);
+        const inRow = row === rows - 1 ? total - row * cols : cols;
+        const col = i - row * cols;
+        const rowOffset = (cols - inRow) * cw / 2;   // centre a short last row
+        cells.push({ x: ax + rowOffset + cw * (col + 0.5), y: ay + ch * (row + 0.5) });
+      }
+      const free = cells.filter(c => !(c.x + reach > res.left && c.y - reach < res.bottom));
+      last = { cells: free.length >= n ? free : cells, cw, ch };
+      if (free.length >= n) break;
+    }
+    return last;
+  }
+
+  function computeLayout() {
+    const minDim = Math.min(W, H);
+    const m = clamp(minDim * 0.045, 12, 36);
+    const k = state.zones.length || 3;
+    const portrait = H > W * 1.1;
+
+    // Habitat cards sit along the bottom edge. Portrait cards grow taller to keep room for animals.
+    const zoneW = Math.max(40, Math.min((W - m * (k + 1)) / k, H * 0.4, 340));
+    const zoneH = Math.min(zoneW * (portrait ? 1.4 : 0.82), H * (portrait ? 0.3 : 0.4));
+    const rowW = k * zoneW + (k - 1) * m;
+    const x0 = (W - rowW) / 2;
+    const zoneY = H - m - zoneH;
+    const tall = zoneH > zoneW * 1.15;
+    state.zones.forEach((z, i) => { z.x = x0 + i * (zoneW + m); z.y = zoneY; z.w = zoneW; z.h = zoneH; z.tall = tall; });
+
+    // Animals are spread on a grid in the area above the habitats.
+    const ax = m, ay = m;
+    const aw = W - 2 * m;
+    const ah = Math.max(60, zoneY - m * 1.4 - ay);
+    const n = Math.max(1, state.objects.length);
+    const grid = gridHomes(n, ax, ay, aw, ah);
+
+    // Animal radius. zoneW >= 2.6 * s keeps every drop zone far wider than an animal.
+    let s = clamp(minDim * 0.09, 22, 72);
+    s = Math.min(s, zoneW / 2.6, grid.cw * 0.36, grid.ch * 0.36);
+    L.m = m;
+    L.s = s;
+    L.pr = Math.min(tall ? zoneW * 0.24 : zoneW * 0.15, tall ? zoneH * 0.16 : zoneH * 0.2, s * 0.85);
+
+    state.objects.forEach(o => {
+      const c = grid.cells[o.homeSlot];
+      o.homeX = c.x + o.jx * grid.cw * 0.08;
+      o.homeY = c.y + o.jy * grid.ch * 0.08;
+    });
+    relayoutObjects();
+  }
+
+  // Keep every animal where it belongs after a resize or rotation.
+  function relayoutObjects() {
+    for (const o of state.objects) {
+      if (o.state === 'idle') {
+        o.x = o.homeX; o.y = o.homeY;
+      } else if (o.state === 'return' && o.anim) {
+        o.anim.tx = o.homeX; o.anim.ty = o.homeY;
+      } else if (o.state === 'toZone' && o.anim) {
+        const p = zoneSlotPos(o.zone, o.slot);
+        o.anim.tx = p.x; o.anim.ty = p.y; o.anim.ts = L.pr / L.s;
+      } else if (o.state === 'placed') {
+        const p = zoneSlotPos(o.zone, o.slot);
+        o.x = p.x; o.y = p.y;
+      } else if (o.state === 'drag') {
+        o.x = clamp(o.x, 0, W); o.y = clamp(o.y, 0, H);
+      }
+    }
+  }
+
+  function zoneSlotPos(z, index) {
+    const slots = SLOTS[z.tall ? 'tall' : 'wide'][z.capacity];
+    const f = slots[index] || [0.5, 0.6];
+    return { x: z.x + z.w * f[0], y: z.y + z.h * f[1] };
+  }
+
+  // Generous drop zone: the card plus wide margins. Nearest card wins on overlap.
+  function findDropZone(o) {
+    let best = null, bestD = Infinity;
+    for (const z of state.zones) {
+      const padX = Math.max(L.s * 0.7, z.w * 0.12);
+      const padTop = L.s * 1.3;
+      if (o.x >= z.x - padX && o.x <= z.x + z.w + padX && o.y >= z.y - padTop && o.y <= z.y + z.h + L.m) {
+        const d = Math.hypot(o.x - (z.x + z.w / 2), o.y - (z.y + z.h / 2));
+        if (d < bestD) { best = z; bestD = d; }
+      }
+    }
+    return best;
+  }
+
+  const zoneFor = habitat => state.zones.find(z => z.habitat === habitat) || null;
+
+  // ---------------------------------------------------------------------
+  // Drag and drop
+  // ---------------------------------------------------------------------
+  // Forgiving pick: the nearest animal within 1.5x its radius.
+  function pickObject(p) {
+    let best = null, bestD = Infinity;
+    for (const o of state.objects) {
+      if (o.state !== 'idle' && o.state !== 'return') continue;
+      const d = Math.hypot(p.x - o.x, p.y - o.y);
+      if (d <= L.s * 1.5 && d < bestD) { best = o; bestD = d; }
+    }
+    return best;
+  }
+
+  function beginDrag(o, p) {
+    o.state = 'drag';
+    o.anim = null;
+    o.scale = 1;
+    state.drag = { obj: o, dx: o.x - p.x, dy: o.y - p.y, sx: p.x, sy: p.y, moved: 0 };
+    // Draw the held animal on top of the others.
+    state.objects.splice(state.objects.indexOf(o), 1);
+    state.objects.push(o);
+    playPickup();
+    say(ANIMALS[o.kind].name);
+    log('Picked up', o.kind);
+  }
+
+  function dropObject() {
+    const o = state.drag.obj;
+    const wasTap = state.drag.moved < CONFIG.TAP_SLOP_PX;
+    state.drag = null;
+    const zone = wasTap ? null : findDropZone(o);
+
+    if (zone && zone.habitat === o.habitat) {
+      acceptObject(o, zone);
+    } else {
+      if (zone) {
+        o.errors++;
+        state.roundErrors++;
+        log(`Item rejected: ${o.kind} dropped on ${zone.habitat}, gliding home`);
+      }
+      sendHome(o);
+    }
+  }
+
+  function acceptObject(o, zone) {
+    o.state = 'toZone';
+    o.zone = zone;
+    o.slot = zone.count++;
+    const target = zoneSlotPos(zone, o.slot);
+    o.anim = { fx: o.x, fy: o.y, tx: target.x, ty: target.y, fs: o.scale, ts: L.pr / L.s, t0: now(), dur: CONFIG.TO_ZONE_MS, ease: easeInOutQuad };
+    o.animP = 0;
+  }
+
+  // Montessori control of error: the animal simply glides back to where it started.
+  function sendHome(o) {
+    o.state = 'return';
+    o.anim = { fx: o.x, fy: o.y, tx: o.homeX, ty: o.homeY, fs: o.scale, ts: 1, t0: now(), dur: CONFIG.RETURN_MS, ease: easeOutCubic };
+    o.animP = 0;
+  }
+
+  // Called when an animal finishes gliding into the right habitat.
+  // Sound, habitat bounce and the settling-in motion all start on the same frame (temporal contiguity).
+  function landInZone(o, t) {
+    o.state = 'placed';
+    o.landT0 = t;
+    o.zone.bounceT0 = t;
+    playLanding(o.habitat);
+    say(`${ANIMALS[o.kind].plural} ${HABITATS[o.habitat].verb}.`);
+    state.placedThisRound++;
+    log(`Item successfully placed: ${o.kind} -> ${o.zone.habitat}`);
+    if (state.objects.every(x => x.state === 'placed')) state.completeAt = t + 250;
+  }
+
+  // ---------------------------------------------------------------------
+  // Input: touch + mouse
+  // ---------------------------------------------------------------------
+  let activeTouch = null;
+  let mouseDown = false;
+  let parentTimer = null;
+
+  function toCanvas(clientX, clientY) {
+    const r = canvas.getBoundingClientRect();
+    return { x: clientX - r.left, y: clientY - r.top };
+  }
+
+  function findTouch(list, id) {
+    for (let i = 0; i < list.length; i++) if (list[i].identifier === id) return list[i];
+    return null;
+  }
+
+  function cancelParentHold() {
+    if (parentTimer) { clearTimeout(parentTimer); parentTimer = null; }
+  }
+
+  function onDown(p) {
+    unlockAudio();
+    state.lastInteraction = now();
+
+    if (state.phase === 'start' || state.phase === 'between') {
+      const g = starGeom();
+      if (Math.hypot(p.x - g.cx, p.y - g.cy) <= g.R * 1.8) { startRound(); return; }
+    } else if (state.phase === 'play') {
+      const o = pickObject(p);
+      if (o) { beginDrag(o, p); return; }
+    }
+
+    // Hidden parent view: hold the top-left corner still for 3 seconds.
+    if (p.x < CONFIG.PARENT_CORNER_PX && p.y < CONFIG.PARENT_CORNER_PX) {
+      cancelParentHold();
+      parentTimer = setTimeout(openParent, CONFIG.PARENT_HOLD_MS);
+    }
+  }
+
+  function onMove(p) {
+    if (parentTimer && (p.x >= CONFIG.PARENT_CORNER_PX || p.y >= CONFIG.PARENT_CORNER_PX)) cancelParentHold();
+    if (!state.drag) return;
+    state.lastInteraction = now();
+    const d = state.drag;
+    d.moved = Math.max(d.moved, Math.hypot(p.x - d.sx, p.y - d.sy));
+    d.obj.x = clamp(p.x + d.dx, 0, W);
+    d.obj.y = clamp(p.y + d.dy, 0, H);
+  }
+
+  function onUp() {
+    cancelParentHold();
+    if (state.drag) dropObject();
+  }
+
+  canvas.addEventListener('touchstart', e => {
+    e.preventDefault();
+    if (activeTouch !== null) return;          // one finger at a time
+    const t = e.changedTouches[0];
+    activeTouch = t.identifier;
+    onDown(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  canvas.addEventListener('touchmove', e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (t) onMove(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  const endTouch = e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (!t) return;
+    activeTouch = null;
+    onUp();
+  };
+  canvas.addEventListener('touchend', endTouch, { passive: false });
+  canvas.addEventListener('touchcancel', endTouch, { passive: false });
+
+  canvas.addEventListener('mousedown', e => { mouseDown = true; onDown(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mousemove', e => { if (mouseDown) onMove(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mouseup', () => {
+    if (!mouseDown) return;
+    mouseDown = false;
+    onUp();
+  });
+
+  // ---------------------------------------------------------------------
+  // Parent view (hidden, local data only)
+  // ---------------------------------------------------------------------
+  const parentEl = document.getElementById('parent');
+  const parentBody = document.getElementById('parentBody');
+
+  function el(tag, text) {
+    const node = document.createElement(tag);
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function openParent() {
+    parentTimer = null;
+    const animals = progress.sessions.reduce((a, s) => a + s.rounds.reduce((b, r) => b + r.animals, 0), 0);
+    const firstTry = progress.sessions.reduce((a, s) => a + s.rounds.reduce((b, r) => b + r.firstTry, 0), 0);
+
+    parentBody.textContent = '';
+    parentBody.appendChild(el('div', `Full games finished: ${progress.gamesCompleted}`));
+    parentBody.appendChild(el('div', `Rounds finished: ${progress.roundsCompleted}`));
+    parentBody.appendChild(el('div', `Animals taken home: ${progress.placements}`));
+    parentBody.appendChild(el('div', `Taken home on the first try: ${animals ? Math.round(100 * firstTry / animals) : 0}%`));
+
+    const recent = progress.sessions.slice(-6).reverse();
+    if (recent.length) {
+      const table = el('table');
+      const head = el('tr');
+      ['When', 'Rounds', 'Top level', 'Habitats', 'Slips'].forEach(h => head.appendChild(el('th', h)));
+      table.appendChild(head);
+      recent.forEach(s => {
+        const tr = el('tr');
+        const when = new Date(s.startedAt);
+        tr.appendChild(el('td', when.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' ' +
+          when.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })));
+        tr.appendChild(el('td', `${s.rounds.length}/${CONFIG.ROUNDS}`));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => Math.max(a, r.level), 0) || '-')));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => Math.max(a, r.habitats || 0), 0) || '-')));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => a + r.wrongDrops, 0))));
+        table.appendChild(tr);
+      });
+      parentBody.appendChild(table);
+    }
+    parentEl.hidden = false;
+    log('Parent view opened', progress);
+  }
+
+  parentEl.addEventListener('click', () => { parentEl.hidden = true; });
+
+  // Read-only debug hooks for the Android/desktop console.
+  window.AnimalHabitats = {
+    progress: () => JSON.parse(JSON.stringify(progress)),
+    state: () => ({
+      phase: state.phase,
+      round: state.round,
+      level: state.tier + 1,
+      star: (state.phase === 'start' || state.phase === 'between') ? (g => ({ x: g.cx, y: g.cy }))(starGeom()) : null,
+      zones: state.zones.map(z => ({ habitat: z.habitat, x: z.x + z.w / 2, y: z.y + z.h / 2, w: z.w, h: z.h, count: z.count, capacity: z.capacity })),
+      animals: state.objects.map(o => ({ kind: o.kind, habitat: o.habitat, correctZone: o.habitat, state: o.state, x: o.x, y: o.y, r: o.state === 'placed' ? L.pr : L.s, errors: o.errors })),
+    }),
+  };
+
+  // ---------------------------------------------------------------------
+  // Drawing primitives
+  // ---------------------------------------------------------------------
+  function roundRectPath(x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  // The animal painters below work in "unit space": the animal fits inside a
+  // circle of radius 1 around the origin, facing right. Line widths are in the
+  // same units, so the drawings stay crisp and proportional at any size.
+  const LW = 0.06;
+  function ell(x, y, rx, ry, rot = 0) { ctx.beginPath(); ctx.ellipse(x, y, rx, ry, rot, 0, TAU); }
+  function circ(x, y, r) { ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); }
+
+  // Fill the current path and give it a soft darker outline. fill must be a hex colour.
+  function fillOut(fill, lw = LW) {
+    ctx.fillStyle = fill;
+    ctx.fill();
+    ctx.lineWidth = lw;
+    ctx.strokeStyle = shade(fill, -0.3);
+    ctx.stroke();
+  }
+
+  // Stroke the current path as a thick outlined "limb" (tails, trunks, tentacles).
+  function strokeOut(col, w) {
+    ctx.lineWidth = w + LW * 1.6;
+    ctx.strokeStyle = shade(col, -0.3);
+    ctx.stroke();
+    ctx.lineWidth = w;
+    ctx.strokeStyle = col;
+    ctx.stroke();
+  }
+
+  function eyeDot(x, y, r) {
+    circ(x, y, r);
+    ctx.fillStyle = COLORS.ink;
+    ctx.fill();
+    circ(x - r * 0.3, y - r * 0.35, r * 0.36);
+    ctx.fillStyle = '#fff';
+    ctx.fill();
+  }
+
+  function cheek(x, y, r) {
+    ctx.globalAlpha = 0.4;
+    ell(x, y, r, r * 0.62);
+    ctx.fillStyle = COLORS.cheek;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  function smile(x, y, r) {
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0.15 * Math.PI, 0.85 * Math.PI);
+    ctx.lineWidth = LW * 0.8;
+    ctx.strokeStyle = COLORS.ink;
+    ctx.stroke();
+  }
+
+  function leg(x, top, bottom, w, col, hoof) {
+    ctx.beginPath();
+    roundRectPath(x - w / 2, top, w, bottom - top, w * 0.45);
+    fillOut(col);
+    if (hoof) {
+      ctx.beginPath();
+      roundRectPath(x - w / 2, bottom - w * 0.55, w, w * 0.55, w * 0.3);
+      fillOut(hoof);
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Animals (unit space; m = { amp, ph } for wiggles and wing flaps)
+  // ---------------------------------------------------------------------
+  function drawFish(m) {
+    const body = '#F4A259', fin = '#F6C85F';
+    const wig = Math.sin(m.ph) * m.amp * 0.2;
+    ctx.beginPath();                                           // tail
+    ctx.moveTo(-0.5, 0);
+    ctx.lineTo(-0.96, -0.42 + wig);
+    ctx.quadraticCurveTo(-0.8, wig * 0.5, -0.96, 0.42 + wig);
+    ctx.closePath();
+    fillOut(fin);
+    ctx.beginPath();                                           // top fin
+    ctx.moveTo(-0.32, -0.36);
+    ctx.quadraticCurveTo(-0.08, -0.8, 0.3, -0.4);
+    ctx.closePath();
+    fillOut(fin);
+    ell(0.08, 0, 0.66, 0.46);                                  // body
+    fillOut(body);
+    ctx.save();
+    ell(0.08, 0, 0.66, 0.46);
+    ctx.clip();
+    ctx.fillStyle = shade(body, 0.4);
+    ell(-0.2, 0, 0.07, 0.6); ctx.fill();
+    ell(0.08, 0, 0.07, 0.6); ctx.fill();
+    ctx.restore();
+    ell(0.0, 0.17, 0.16, 0.08, 0.5);                           // side fin
+    fillOut(fin);
+    circ(0.42, -0.1, 0.13);                                    // eye
+    fillOut(COLORS.white, LW * 0.6);
+    eyeDot(0.45, -0.09, 0.075);
+    smile(0.58, 0.08, 0.08);
+    cheek(0.36, 0.14, 0.08);
+  }
+
+  function drawWhale(m) {
+    const body = '#8FA9D6', belly = '#DCE5F3', spray = '#BFE0F5';
+    const sp = 0.65 + 0.35 * Math.sin(m.ph) * m.amp;          // spout height
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = spray;
+    ctx.lineWidth = 0.08;
+    ctx.beginPath();
+    ctx.moveTo(0.28, -0.46); ctx.lineTo(0.28, -0.46 - 0.34 * sp);
+    ctx.moveTo(0.28, -0.6); ctx.quadraticCurveTo(0.1, -0.6 - 0.3 * sp, 0.04, -0.56);
+    ctx.moveTo(0.28, -0.6); ctx.quadraticCurveTo(0.46, -0.6 - 0.3 * sp, 0.52, -0.56);
+    ctx.stroke();
+    ctx.fillStyle = spray;
+    circ(0.0, -0.5, 0.05); ctx.fill();
+    circ(0.56, -0.5, 0.05); ctx.fill();
+
+    const flick = Math.sin(m.ph) * m.amp * 0.12;
+    ctx.beginPath();                                           // tail stem
+    ctx.moveTo(-0.45, 0.05);
+    ctx.quadraticCurveTo(-0.76, 0.0, -0.78, -0.36 + flick);
+    strokeOut(body, 0.2);
+    ell(-0.92, -0.42 + flick, 0.18, 0.08, -0.35); fillOut(body);  // flukes
+    ell(-0.7, -0.6 + flick, 0.18, 0.08, -1.25); fillOut(body);
+
+    ctx.beginPath();                                           // body
+    ctx.moveTo(-0.6, 0.1);
+    ctx.bezierCurveTo(-0.55, -0.5, 0.6, -0.62, 0.9, -0.05);
+    ctx.bezierCurveTo(0.98, 0.45, 0.1, 0.62, -0.6, 0.1);
+    ctx.closePath();
+    fillOut(body);
+    ctx.save();
+    ctx.clip();
+    ctx.fillStyle = belly;
+    ell(0.25, 0.44, 0.72, 0.26); ctx.fill();
+    ctx.strokeStyle = shade(belly, -0.12);
+    ctx.lineWidth = LW * 0.6;
+    for (let i = 0; i < 3; i++) {
+      ctx.beginPath();
+      ctx.moveTo(0.05 + i * 0.18, 0.26);
+      ctx.lineTo(0.0 + i * 0.18, 0.42);
+      ctx.stroke();
+    }
+    ctx.restore();
+    ell(0.12, 0.2, 0.18, 0.08, 0.6); fillOut(body);            // flipper
+    eyeDot(0.55, -0.1, 0.07);
+    ctx.beginPath();
+    ctx.moveTo(0.54, 0.1);
+    ctx.quadraticCurveTo(0.7, 0.2, 0.86, 0.06);
+    ctx.lineWidth = LW * 0.8;
+    ctx.strokeStyle = COLORS.ink;
+    ctx.stroke();
+    cheek(0.64, 0.02, 0.08);
+  }
+
+  function drawOctopus(m) {
+    const body = '#B8A9D9';
+    ctx.lineCap = 'round';
+    for (let i = 0; i < 5; i++) {                              // tentacles
+      const bx = -0.36 + i * 0.18;
+      const dir = (i - 2) * 0.12;
+      const sway = Math.sin(m.ph + i * 1.1) * m.amp * 0.1;
+      const ex = bx + dir * 1.4 + sway, ey = 0.74;
+      const curl = i < 2 ? -1 : 1;
+      ctx.beginPath();
+      ctx.moveTo(bx, 0.0);
+      ctx.quadraticCurveTo(bx + dir * 0.4 - sway, 0.45, ex, ey);
+      ctx.quadraticCurveTo(ex + curl * 0.12, ey + 0.1, ex + curl * 0.16, ey - 0.03);
+      strokeOut(body, 0.15);
+    }
+    ell(0, -0.3, 0.56, 0.5);                                   // head
+    fillOut(body);
+    ctx.fillStyle = shade(body, 0.35);
+    circ(-0.26, -0.55, 0.06); ctx.fill();
+    circ(0.22, -0.62, 0.08); ctx.fill();
+    circ(0.36, -0.42, 0.045); ctx.fill();
+    eyeDot(-0.18, -0.28, 0.08);
+    eyeDot(0.18, -0.28, 0.08);
+    smile(0, -0.16, 0.12);
+    cheek(-0.33, -0.12, 0.08);
+    cheek(0.33, -0.12, 0.08);
+  }
+
+  function drawCow() {
+    const body = COLORS.white, spot = '#8C7563', pink = COLORS.pink, horn = '#F1E3C6';
+    ctx.lineCap = 'round';
+    ctx.beginPath();                                           // tail
+    ctx.moveTo(-0.72, -0.15);
+    ctx.quadraticCurveTo(-0.94, -0.05, -0.88, 0.28);
+    strokeOut(body, 0.05);
+    ell(-0.88, 0.33, 0.06, 0.09); fillOut(spot);
+    [-0.58, -0.36, 0.1, 0.32].forEach(x => leg(x, 0.1, 0.66, 0.15, body, spot));
+    ell(-0.08, 0.33, 0.12, 0.07); fillOut(pink);               // udder
+    ctx.beginPath();                                           // body
+    roundRectPath(-0.78, -0.34, 1.28, 0.64, 0.3);
+    fillOut(body);
+    ctx.save();
+    ctx.clip();
+    ctx.fillStyle = spot;
+    ell(-0.45, -0.18, 0.2, 0.15, 0.3); ctx.fill();
+    ell(0.06, 0.04, 0.16, 0.12, -0.2); ctx.fill();
+    ell(-0.22, 0.27, 0.13, 0.09); ctx.fill();
+    ell(-0.8, 0.06, 0.12, 0.16); ctx.fill();
+    ctx.restore();
+    ell(0.5, -0.6, 0.05, 0.1, -0.4); fillOut(horn);            // horns
+    ell(0.76, -0.6, 0.05, 0.1, 0.4); fillOut(horn);
+    ell(0.36, -0.44, 0.13, 0.065, -0.4); fillOut(body);        // ear
+    ell(0.9, -0.44, 0.13, 0.065, 0.4); fillOut(body);
+    ell(0.63, -0.33, 0.27, 0.27); fillOut(body);               // head
+    ctx.save();
+    ell(0.63, -0.33, 0.27, 0.27);
+    ctx.clip();
+    ctx.fillStyle = spot;
+    ell(0.52, -0.54, 0.13, 0.1); ctx.fill();
+    ctx.restore();
+    ell(0.63, -0.15, 0.25, 0.15); fillOut(pink);               // muzzle
+    ctx.fillStyle = shade(pink, -0.35);
+    ell(0.55, -0.15, 0.03, 0.045); ctx.fill();
+    ell(0.71, -0.15, 0.03, 0.045); ctx.fill();
+    eyeDot(0.54, -0.38, 0.05);
+    eyeDot(0.72, -0.38, 0.05);
+  }
+
+  function drawDog(m) {
+    const body = '#D9B38C', dark = '#A47551', light = '#F1DCC2', collar = '#E58F86';
+    const wag = Math.sin(m.ph) * m.amp * 0.15;
+    ctx.lineCap = 'round';
+    ctx.beginPath();                                           // tail
+    ctx.moveTo(-0.68, -0.12);
+    ctx.quadraticCurveTo(-0.95 + wag, -0.3, -0.84 + wag * 1.5, -0.6);
+    strokeOut(body, 0.12);
+    [-0.55, -0.33, 0.08, 0.28].forEach(x => leg(x, 0.08, 0.64, 0.15, body, light));
+    ctx.beginPath();                                           // body
+    roundRectPath(-0.74, -0.3, 1.16, 0.54, 0.26);
+    fillOut(body);
+    ctx.save();
+    ctx.clip();
+    ctx.fillStyle = light;
+    ell(-0.12, 0.26, 0.42, 0.14); ctx.fill();
+    ctx.restore();
+    ell(0.36, -0.2, 0.07, 0.19, 0.3); fillOut(collar);         // collar
+    circ(0.42, -0.02, 0.05); fillOut(COLORS.star, LW * 0.6);
+    circ(0.56, -0.4, 0.3); fillOut(body);                      // head
+    ell(0.8, -0.31, 0.18, 0.13); fillOut(light);               // snout
+    ell(0.8, -0.15, 0.05, 0.07); fillOut(COLORS.pink);         // tongue
+    ell(0.93, -0.37, 0.07, 0.055);                             // nose
+    ctx.fillStyle = COLORS.ink; ctx.fill();
+    ell(0.4, -0.38, 0.11, 0.22, 0.35); fillOut(dark);          // floppy ear
+    eyeDot(0.63, -0.48, 0.055);
+    cheek(0.66, -0.3, 0.07);
+  }
+
+  function drawRabbit() {
+    const body = '#D6CCC0', inner = COLORS.pink;
+    circ(-0.66, 0.3, 0.16); fillOut(COLORS.white);             // fluffy tail
+    ell(0.0, 0.7, 0.28, 0.09); fillOut(body);                  // back foot
+    ell(-0.1, 0.25, 0.58, 0.46); fillOut(body);                // body
+    ell(0.36, 0.64, 0.13, 0.08); fillOut(body);                // front paw
+    ell(0.27, -0.66, 0.1, 0.32, -0.2); fillOut(body);          // ears
+    ell(0.27, -0.64, 0.05, 0.24, -0.2); ctx.fillStyle = inner; ctx.fill();
+    ell(0.5, -0.68, 0.1, 0.31, 0.15); fillOut(body);
+    ell(0.5, -0.66, 0.05, 0.23, 0.15); ctx.fillStyle = inner; ctx.fill();
+    circ(0.42, -0.2, 0.33); fillOut(body);                     // head
+    ell(0.5, 0.05, 0.22, 0.14); ctx.fillStyle = shade(body, 0.45); ctx.fill(); // chest
+    eyeDot(0.5, -0.27, 0.06);
+    ell(0.73, -0.14, 0.05, 0.04); fillOut(inner, LW * 0.6);   // nose
+    ctx.strokeStyle = shade(body, -0.35);
+    ctx.lineWidth = LW * 0.5;
+    ctx.beginPath();
+    ctx.moveTo(0.66, -0.08); ctx.lineTo(0.94, -0.12);
+    ctx.moveTo(0.66, -0.05); ctx.lineTo(0.93, 0.0);
+    ctx.stroke();
+    cheek(0.56, -0.08, 0.07);
+  }
+
+  function drawLion(m) {
+    const body = '#F2C46B', mane = '#D98F4E', light = '#F9E2AE';
+    const swish = Math.sin(m.ph) * m.amp * 0.1;
+    ctx.lineCap = 'round';
+    ctx.beginPath();                                           // tail
+    ctx.moveTo(-0.7, -0.05);
+    ctx.quadraticCurveTo(-0.96, -0.1, -0.9 + swish, -0.45);
+    strokeOut(body, 0.07);
+    circ(-0.9 + swish, -0.49, 0.09); fillOut(mane);
+    [-0.55, -0.33, 0.06, 0.26].forEach(x => leg(x, 0.08, 0.64, 0.16, body, light));
+    ctx.beginPath();                                           // body
+    roundRectPath(-0.74, -0.28, 1.12, 0.52, 0.25);
+    fillOut(body);
+    // Mane: a ring of puffs. Stroke all first, then fill, so only the outer edge shows a line.
+    const cx = 0.5, cy = -0.32;
+    ctx.beginPath();
+    for (let i = 0; i < 12; i++) {
+      const a = i * TAU / 12;
+      const px = cx + Math.cos(a) * 0.35, py = cy + Math.sin(a) * 0.35;
+      ctx.moveTo(px + 0.14, py);
+      ctx.arc(px, py, 0.14, 0, TAU);
+    }
+    ctx.lineWidth = LW * 2;
+    ctx.strokeStyle = shade(mane, -0.3);
+    ctx.stroke();
+    ctx.fillStyle = mane;
+    ctx.fill();
+    circ(cx, cy, 0.38); ctx.fill();
+    circ(0.33, -0.55, 0.08); fillOut(body);                    // ears
+    circ(0.67, -0.55, 0.08); fillOut(body);
+    circ(cx, cy, 0.27); fillOut(body);                         // face
+    ell(cx, -0.21, 0.14, 0.1); ctx.fillStyle = light; ctx.fill();
+    ctx.beginPath();                                           // nose
+    ctx.moveTo(cx - 0.05, -0.28); ctx.lineTo(cx + 0.05, -0.28); ctx.lineTo(cx, -0.22);
+    ctx.closePath();
+    ctx.fillStyle = COLORS.ink; ctx.fill();
+    ctx.lineWidth = LW * 0.7;                                  // little "w" mouth
+    ctx.strokeStyle = COLORS.ink;
+    for (const side of [-1, 1]) {
+      ctx.beginPath();
+      ctx.arc(cx + side * 0.045, -0.2, 0.045, 0.1 * Math.PI, 0.9 * Math.PI);
+      ctx.stroke();
+    }
+    eyeDot(cx - 0.1, -0.38, 0.045);
+    eyeDot(cx + 0.1, -0.38, 0.045);
+    cheek(cx - 0.17, -0.25, 0.06);
+    cheek(cx + 0.17, -0.25, 0.06);
+  }
+
+  function drawElephant(m) {
+    const body = '#AEB4C4', ear = '#9CA3B6', inner = '#E8B4C8';
+    const curl = Math.sin(m.ph) * m.amp * 0.12;
+    ctx.lineCap = 'round';
+    ctx.beginPath();                                           // tail
+    ctx.moveTo(-0.78, -0.05); ctx.lineTo(-0.92, 0.2);
+    strokeOut(body, 0.05);
+    [-0.6, -0.36, 0.04, 0.26].forEach(x => leg(x, 0.1, 0.66, 0.2, body, null));
+    ctx.fillStyle = COLORS.white;
+    [-0.6, -0.36, 0.04, 0.26].forEach(x => { ell(x, 0.6, 0.06, 0.035); ctx.fill(); });
+    ell(-0.18, -0.02, 0.64, 0.44); fillOut(body);              // body
+    circ(0.42, -0.22, 0.34); fillOut(body);                    // head
+    ctx.beginPath();                                           // trunk
+    ctx.moveTo(0.64, -0.12);
+    ctx.quadraticCurveTo(0.92, 0.0, 0.86, 0.34);
+    ctx.quadraticCurveTo(0.84 + curl, 0.5, 0.96, 0.44 - curl);
+    strokeOut(body, 0.15);
+    ctx.beginPath();                                           // tusk
+    ctx.moveTo(0.6, 0.04);
+    ctx.quadraticCurveTo(0.68, 0.16, 0.78, 0.13);
+    strokeOut(COLORS.white, 0.06);
+    ell(0.2, -0.2, 0.22, 0.3, -0.15); fillOut(ear);            // ear
+    ctx.globalAlpha = 0.55;
+    ell(0.22, -0.18, 0.13, 0.2, -0.15); ctx.fillStyle = inner; ctx.fill();
+    ctx.globalAlpha = 1;
+    eyeDot(0.52, -0.32, 0.05);
+    cheek(0.58, -0.17, 0.07);
+  }
+
+  function drawBird(m) {
+    const body = '#E58F86', wing = '#CC766E', belly = '#FBE3C8', beak = COLORS.orange;
+    const flap = Math.sin(m.ph) * m.amp;
+    ctx.lineCap = 'round';
+    ctx.beginPath();                                           // legs
+    ctx.moveTo(-0.1, 0.5); ctx.lineTo(-0.12, 0.8);
+    ctx.moveTo(0.14, 0.5); ctx.lineTo(0.16, 0.8);
+    ctx.lineWidth = LW;
+    ctx.strokeStyle = shade(beak, -0.2);
+    ctx.stroke();
+    ctx.beginPath();                                           // tail
+    ctx.moveTo(-0.48, -0.05); ctx.lineTo(-0.96, -0.32); ctx.lineTo(-0.9, 0.14);
+    ctx.closePath();
+    fillOut(wing);
+    ctx.beginPath();                                           // head tuft
+    ctx.moveTo(0.08, -0.44);
+    ctx.quadraticCurveTo(0.12, -0.7, 0.3, -0.62);
+    strokeOut(body, 0.05);
+    ell(0, 0.05, 0.62, 0.52); fillOut(body);                   // round body
+    ctx.save();
+    ell(0, 0.05, 0.62, 0.52);
+    ctx.clip();
+    ell(0.18, 0.34, 0.45, 0.34); ctx.fillStyle = belly; ctx.fill();
+    ctx.restore();
+    ctx.save();                                                // wing, hinged at the shoulder
+    ctx.translate(0.02, 0.04);
+    ctx.rotate(-0.12 + flap * 0.9);
+    ell(-0.22, 0, 0.3, 0.17); fillOut(wing);
+    ctx.restore();
+    ctx.beginPath();                                           // beak
+    ctx.moveTo(0.56, -0.13); ctx.lineTo(0.88, -0.02); ctx.lineTo(0.56, 0.08);
+    ctx.closePath();
+    fillOut(beak);
+    eyeDot(0.33, -0.15, 0.07);
+    cheek(0.36, 0.06, 0.08);
+  }
+
+  function drawButterfly(m) {
+    const upper = '#E8B4C8', lower = '#B8A9D9', body = '#6B5A4C';
+    const k = 1 - 0.65 * Math.abs(Math.sin(m.ph) * m.amp);    // wings fold toward the body
+    for (const side of [-1, 1]) {
+      ctx.save();
+      ctx.scale(side * k, 1);
+      ell(0.42, -0.28, 0.42, 0.34, -0.45); fillOut(upper);
+      ctx.fillStyle = COLORS.white;
+      circ(0.52, -0.34, 0.1); ctx.fill();
+      circ(0.3, -0.14, 0.05); ctx.fill();
+      ell(0.32, 0.3, 0.28, 0.24, 0.5); fillOut(lower);
+      ctx.fillStyle = shade(lower, 0.45);
+      circ(0.36, 0.34, 0.08); ctx.fill();
+      ctx.restore();
+    }
+    ctx.lineCap = 'round';
+    ctx.beginPath();                                           // antennae
+    ctx.moveTo(-0.04, -0.56); ctx.quadraticCurveTo(-0.12, -0.78, -0.24, -0.84);
+    ctx.moveTo(0.04, -0.56); ctx.quadraticCurveTo(0.12, -0.78, 0.24, -0.84);
+    ctx.lineWidth = LW * 0.8;
+    ctx.strokeStyle = body;
+    ctx.stroke();
+    ctx.fillStyle = body;
+    circ(-0.25, -0.85, 0.05); ctx.fill();
+    circ(0.25, -0.85, 0.05); ctx.fill();
+    ell(0, 0.04, 0.09, 0.44); fillOut(body);                   // body
+    circ(0, -0.48, 0.13); fillOut(body);                       // head
+    ctx.fillStyle = '#fff';
+    circ(-0.05, -0.5, 0.03); ctx.fill();
+    circ(0.05, -0.5, 0.03); ctx.fill();
+  }
+
+  function drawBee(m) {
+    const yellow = '#F6C85F', stripe = '#5C4B3E', wing = '#EAF4FB';
+    const k = 1 - 0.6 * Math.abs(Math.sin(m.ph) * m.amp);
+    ctx.beginPath();                                           // stinger
+    ctx.moveTo(-0.6, 0.04); ctx.lineTo(-0.86, 0.13); ctx.lineTo(-0.6, 0.22);
+    ctx.closePath();
+    ctx.fillStyle = stripe; ctx.fill();
+    ell(0, 0.12, 0.64, 0.44); fillOut(yellow);                 // body
+    ctx.save();
+    ell(0, 0.12, 0.64, 0.44);
+    ctx.clip();
+    ctx.fillStyle = stripe;
+    ctx.fillRect(-0.44, -0.4, 0.14, 1.1);
+    ctx.fillRect(-0.16, -0.4, 0.14, 1.1);
+    ctx.fillRect(0.12, -0.4, 0.1, 1.1);
+    ctx.restore();
+    ell(0, 0.12, 0.64, 0.44);
+    ctx.lineWidth = LW; ctx.strokeStyle = shade(yellow, -0.3); ctx.stroke();
+    ctx.lineCap = 'round';
+    ctx.beginPath();                                           // antenna
+    ctx.moveTo(0.38, -0.26); ctx.quadraticCurveTo(0.44, -0.5, 0.6, -0.56);
+    ctx.lineWidth = LW * 0.8; ctx.strokeStyle = stripe; ctx.stroke();
+    circ(0.62, -0.57, 0.05); ctx.fillStyle = stripe; ctx.fill();
+    eyeDot(0.4, 0.02, 0.07);
+    smile(0.42, 0.12, 0.11);
+    cheek(0.52, 0.22, 0.07);
+    ctx.save();                                                // wings, see-through, beating
+    ctx.translate(0, -0.28);
+    ctx.scale(1, k);
+    ctx.globalAlpha = 0.8;
+    ell(-0.16, -0.28, 0.2, 0.3, -0.4); fillOut(wing, LW * 0.8);
+    ell(0.12, -0.3, 0.17, 0.27, 0.3); fillOut(wing, LW * 0.8);
+    ctx.restore();
+  }
+
+  function drawOwl(m) {
+    const body = '#B08968', face = '#C9A585', belly = '#EAD7BC', wing = '#8E6B4E', orange = COLORS.orange;
+    const flap = Math.sin(m.ph) * m.amp;
+    ell(-0.15, 0.78, 0.1, 0.06); fillOut(orange);              // feet
+    ell(0.15, 0.78, 0.1, 0.06); fillOut(orange);
+    for (const side of [-1, 1]) {                              // wings
+      ctx.save();
+      ctx.translate(side * 0.4, -0.08);
+      ctx.rotate(-side * (0.12 + flap * 0.8));
+      ell(0, 0.28, 0.16, 0.36); fillOut(wing);
+      ctx.restore();
+    }
+    ctx.beginPath();                                           // ear tufts
+    ctx.moveTo(-0.36, -0.46); ctx.lineTo(-0.42, -0.84); ctx.lineTo(-0.12, -0.6); ctx.closePath();
+    ctx.moveTo(0.36, -0.46); ctx.lineTo(0.42, -0.84); ctx.lineTo(0.12, -0.6); ctx.closePath();
+    fillOut(body);
+    ell(0, 0.05, 0.5, 0.68); fillOut(body);                    // body
+    ctx.save();
+    ell(0, 0.05, 0.5, 0.68);
+    ctx.clip();
+    ell(0, 0.42, 0.34, 0.38); ctx.fillStyle = belly; ctx.fill();
+    ctx.strokeStyle = shade(belly, -0.25);
+    ctx.lineWidth = LW * 0.6;
+    ctx.lineCap = 'round';
+    [[-0.12, 0.22], [0.12, 0.22], [0, 0.38], [-0.14, 0.52], [0.14, 0.52]].forEach(([x, y]) => {
+      ctx.beginPath(); ctx.moveTo(x - 0.05, y); ctx.lineTo(x, y + 0.05); ctx.lineTo(x + 0.05, y); ctx.stroke();
+    });
+    ctx.restore();
+    ell(0, -0.22, 0.44, 0.28); ctx.fillStyle = face; ctx.fill();
+    circ(-0.2, -0.22, 0.19); fillOut(COLORS.white);            // big eyes
+    circ(0.2, -0.22, 0.19); fillOut(COLORS.white);
+    eyeDot(-0.18, -0.2, 0.1);
+    eyeDot(0.18, -0.2, 0.1);
+    ctx.beginPath();                                           // beak
+    ctx.moveTo(-0.07, -0.07); ctx.lineTo(0.07, -0.07); ctx.lineTo(0, 0.07);
+    ctx.closePath();
+    fillOut(orange);
+  }
+
+  const PAINTERS = {
+    fish: drawFish, whale: drawWhale, octopus: drawOctopus,
+    cow: drawCow, dog: drawDog, rabbit: drawRabbit, lion: drawLion, elephant: drawElephant,
+    bird: drawBird, butterfly: drawButterfly, bee: drawBee, owl: drawOwl,
+  };
+
+  // Draw an animal centred at (x, y) with radius r. A lifted animal gets a soft ground shadow.
+  function drawAnimal(kind, x, y, r, m, lifted) {
+    if (lifted) {
+      ctx.save();
+      ctx.globalAlpha = 0.16;
+      ctx.fillStyle = COLORS.ink;
+      ctx.beginPath();
+      ctx.ellipse(x, y + r * 1.15, r * 0.75, r * 0.16, 0, 0, TAU);
+      ctx.fill();
+      ctx.restore();
+    }
+    ctx.save();
+    ctx.translate(x, y);
+    if (m.rot) ctx.rotate(m.rot);
+    ctx.scale(m.flip ? -r : r, r);
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'butt';
+    PAINTERS[kind](m);
+    ctx.restore();
+  }
+
+  // Habitat-specific motion. Free animals stay still; held sky animals flap and
+  // held water animals wiggle. Placed animals play a short "settling in" motion.
+  const REST = { amp: 0, ph: 0, dx: 0, dy: 0, rot: 0, flip: false };
+
+  function heldMotion(o, t) {
+    if (o.habitat === 'sky') return { amp: 0.8, ph: t / 70, dx: 0, dy: 0, rot: 0, flip: false };
+    if (o.habitat === 'water') return { amp: 0.7, ph: t / 140, dx: 0, dy: 0, rot: 0, flip: false };
+    return REST;
+  }
+
+  function settleMotion(o, t, r) {
+    const t0 = state.phase === 'celebrate' ? state.celebrateStart : o.landT0;
+    const p = (t - t0) / CONFIG.SETTLE_MS;
+    const flip = o.slot % 2 === 1;                 // neighbours face each other
+    if (p < 0 || p >= 1) return { amp: 0, ph: 0, dx: 0, dy: 0, rot: 0, flip };
+    const env = Math.sin(Math.PI * p);
+    if (o.habitat === 'water') {
+      // Swims a little forward and back, tail wiggling.
+      return { amp: env, ph: p * TAU * 4, dx: Math.sin(p * TAU) * r * 0.35 * MOTION * (flip ? -1 : 1), dy: 0, rot: Math.sin(p * TAU * 2) * 0.08 * MOTION, flip };
+    }
+    if (o.habitat === 'land') {
+      // Three happy little hops.
+      return { amp: env, ph: p * TAU * 3, dx: 0, dy: -Math.abs(Math.sin(p * Math.PI * 3)) * r * 0.3 * MOTION * (1 - p * 0.4), rot: 0, flip };
+    }
+    // Sky: rises a little while flapping, then settles.
+    return { amp: Math.min(1, env * 3), ph: p * TAU * (reduceMotion ? 3 : 6), dx: 0, dy: -env * r * 0.35 * MOTION, rot: 0, flip };
+  }
+
+  function drawObject(o, t, scaleK) {
+    if (o.state === 'placed') {
+      const mo = settleMotion(o, t, L.pr);
+      drawAnimal(o.kind, o.x + mo.dx, o.y + mo.dy, L.pr, mo, false);
+      return;
+    }
+    const lifted = o.state === 'drag';
+    const r = L.s * o.scale * scaleK * (lifted ? 1.12 : 1);
+    drawAnimal(o.kind, o.x, o.y, r, lifted ? heldMotion(o, t) : REST, lifted);
+  }
+
+  // ---------------------------------------------------------------------
+  // Habitat scenes (drawn inside the clipped card)
+  // ---------------------------------------------------------------------
+  function wavePath(x, y, w, amp, n) {
+    const ww = w / n;
+    ctx.moveTo(x, y);
+    for (let i = 0; i < n; i++) {
+      ctx.quadraticCurveTo(x + ww * (i + 0.25), y - amp, x + ww * (i + 0.5), y);
+      ctx.quadraticCurveTo(x + ww * (i + 0.75), y + amp, x + ww * (i + 1), y);
+    }
+  }
+
+  function drawWaterScene(x, y, w, h) {
+    const u = Math.min(w, h);
+    ctx.fillStyle = '#E4F2F7';
+    ctx.fillRect(x, y, w, h);
+    const sy = y + h * 0.2;
+    const g = ctx.createLinearGradient(0, sy, 0, y + h);
+    g.addColorStop(0, '#A8D5EC');
+    g.addColorStop(1, '#79AFD6');
+    ctx.beginPath();
+    wavePath(x, sy, w, u * 0.035, 4);
+    ctx.lineTo(x + w, y + h);
+    ctx.lineTo(x, y + h);
+    ctx.closePath();
+    ctx.fillStyle = g;
+    ctx.fill();
+    ctx.beginPath();
+    wavePath(x, sy, w, u * 0.035, 4);
+    ctx.lineWidth = Math.max(1.5, u * 0.02);
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.8)';
+    ctx.stroke();
+
+    // Sandy bottom with pebbles.
+    ctx.beginPath();
+    ctx.moveTo(x, y + h * 0.9);
+    ctx.quadraticCurveTo(x + w * 0.5, y + h * 0.84, x + w, y + h * 0.92);
+    ctx.lineTo(x + w, y + h);
+    ctx.lineTo(x, y + h);
+    ctx.closePath();
+    ctx.fillStyle = '#EADBC0';
+    ctx.fill();
+    ctx.fillStyle = '#D2BE9C';
+    [[0.3, 0.94, 0.03], [0.62, 0.92, 0.022], [0.82, 0.96, 0.028]].forEach(([fx, fy, fr]) => {
+      ctx.beginPath(); ctx.ellipse(x + w * fx, y + h * fy, u * fr * 1.4, u * fr, 0, 0, TAU); ctx.fill();
+    });
+
+    // Ripples and bubbles.
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.55)';
+    ctx.lineWidth = Math.max(1, u * 0.012);
+    ctx.beginPath(); ctx.ellipse(x + w * 0.4, sy + h * 0.06, w * 0.1, h * 0.015, 0, 0, TAU); ctx.stroke();
+    ctx.beginPath(); ctx.ellipse(x + w * 0.4, sy + h * 0.06, w * 0.18, h * 0.03, 0, 0, TAU); ctx.stroke();
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.7)';
+    [[0.88, 0.62, 0.025], [0.84, 0.5, 0.018], [0.9, 0.4, 0.013]].forEach(([fx, fy, fr]) => {
+      ctx.beginPath(); ctx.arc(x + w * fx, y + h * fy, u * fr, 0, TAU); ctx.stroke();
+    });
+
+    // Reeds with cattails along the left edge.
+    ctx.lineCap = 'round';
+    [[0.05, 0.1], [0.11, 0.02], [0.16, 0.16]].forEach(([fx, fy]) => {
+      const rx = x + w * fx, top = y + h * fy + u * 0.08;
+      ctx.beginPath();
+      ctx.moveTo(rx, y + h);
+      ctx.quadraticCurveTo(rx + u * 0.02, (top + y + h) / 2, rx, top);
+      ctx.lineWidth = Math.max(1.5, u * 0.022);
+      ctx.strokeStyle = '#7FA86E';
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.ellipse(rx, top, u * 0.025, u * 0.065, 0, 0, TAU);
+      ctx.fillStyle = '#A0785A';
+      ctx.fill();
+    });
+    ctx.beginPath();
+    ctx.moveTo(x + w * 0.08, y + h);
+    ctx.quadraticCurveTo(x + w * 0.2, y + h * 0.55, x + w * 0.26, y + h * 0.42);
+    ctx.lineWidth = Math.max(1.5, u * 0.02);
+    ctx.strokeStyle = '#8DBF7F';
+    ctx.stroke();
+
+    // Lily pad with a little flower, floating on the surface.
+    const lx = x + w * 0.8, ly = sy + u * 0.015;
+    ctx.beginPath();
+    ctx.ellipse(lx, ly, w * 0.13, u * 0.045, 0, 0.35, TAU - 0.35);
+    ctx.lineTo(lx, ly);
+    ctx.closePath();
+    ctx.fillStyle = '#8DBF7F';
+    ctx.fill();
+    ctx.fillStyle = '#E8B4C8';
+    for (let i = 0; i < 5; i++) {
+      const a = -Math.PI / 2 + i * TAU / 5;
+      ctx.beginPath(); ctx.arc(lx - w * 0.04 + Math.cos(a) * u * 0.025, ly - u * 0.025 + Math.sin(a) * u * 0.02, u * 0.02, 0, TAU); ctx.fill();
+    }
+    ctx.fillStyle = COLORS.star;
+    ctx.beginPath(); ctx.arc(lx - w * 0.04, ly - u * 0.025, u * 0.014, 0, TAU); ctx.fill();
+  }
+
+  function drawLandScene(x, y, w, h) {
+    const u = Math.min(w, h);
+    ctx.fillStyle = '#F1F6E6';
+    ctx.fillRect(x, y, w, h);
+
+    // Far hill.
+    ctx.beginPath();
+    ctx.moveTo(x, y + h * 0.42);
+    ctx.quadraticCurveTo(x + w * 0.3, y + h * 0.2, x + w * 0.62, y + h * 0.36);
+    ctx.quadraticCurveTo(x + w * 0.85, y + h * 0.46, x + w, y + h * 0.34);
+    ctx.lineTo(x + w, y + h);
+    ctx.lineTo(x, y + h);
+    ctx.closePath();
+    ctx.fillStyle = '#CDE3BC';
+    ctx.fill();
+
+    // Round bush on the hill.
+    const bx = x + w * 0.8, by = y + h * 0.4;
+    ctx.beginPath();
+    ctx.arc(bx - u * 0.09, by + u * 0.03, u * 0.08, 0, TAU);
+    ctx.moveTo(bx + u * 0.1 + u * 0.075, by + u * 0.04);
+    ctx.arc(bx + u * 0.1, by + u * 0.04, u * 0.075, 0, TAU);
+    ctx.moveTo(bx + u * 0.1, by - u * 0.02);
+    ctx.arc(bx, by - u * 0.02, u * 0.1, 0, TAU);
+    ctx.lineWidth = Math.max(2, u * 0.02);
+    ctx.strokeStyle = '#78A96A';
+    ctx.stroke();
+    ctx.fillStyle = '#8DBF7F';
+    ctx.fill();
+    ctx.fillStyle = '#E58F86';
+    [[-0.05, -0.04], [0.06, 0.02], [-0.1, 0.05]].forEach(([fx, fy]) => {
+      ctx.beginPath(); ctx.arc(bx + u * fx, by + u * fy, u * 0.014, 0, TAU); ctx.fill();
+    });
+
+    // Front meadow.
+    ctx.beginPath();
+    ctx.moveTo(x, y + h * 0.52);
+    ctx.quadraticCurveTo(x + w * 0.5, y + h * 0.4, x + w, y + h * 0.54);
+    ctx.lineTo(x + w, y + h);
+    ctx.lineTo(x, y + h);
+    ctx.closePath();
+    ctx.fillStyle = '#B2D49E';
+    ctx.fill();
+
+    // Grass tufts.
+    ctx.strokeStyle = '#8DBF7F';
+    ctx.lineWidth = Math.max(1.5, u * 0.016);
+    ctx.lineCap = 'round';
+    [[0.18, 0.66], [0.5, 0.9], [0.78, 0.7], [0.36, 0.56]].forEach(([fx, fy]) => {
+      const gx = x + w * fx, gy = y + h * fy, gl = u * 0.05;
+      ctx.beginPath();
+      ctx.moveTo(gx - gl * 0.5, gy - gl * 0.8); ctx.lineTo(gx, gy);
+      ctx.lineTo(gx, gy - gl);
+      ctx.moveTo(gx, gy); ctx.lineTo(gx + gl * 0.5, gy - gl * 0.8);
+      ctx.stroke();
+    });
+
+    // Two little flowers.
+    [[0.1, 0.86, '#E8B4C8'], [0.9, 0.9, COLORS.star]].forEach(([fx, fy, col]) => {
+      const fxp = x + w * fx, fyp = y + h * fy, pr = u * 0.022;
+      ctx.fillStyle = col;
+      for (let i = 0; i < 5; i++) {
+        const a = -Math.PI / 2 + i * TAU / 5;
+        ctx.beginPath(); ctx.arc(fxp + Math.cos(a) * pr * 1.2, fyp + Math.sin(a) * pr * 1.2, pr, 0, TAU); ctx.fill();
+      }
+      ctx.fillStyle = col === COLORS.star ? '#F2A65A' : COLORS.star;
+      ctx.beginPath(); ctx.arc(fxp, fyp, pr * 0.8, 0, TAU); ctx.fill();
+    });
+  }
+
+  function cloud(cx, cy, s) {
+    ctx.beginPath();
+    ctx.arc(cx - s * 0.9, cy + s * 0.15, s * 0.55, 0, TAU);
+    ctx.moveTo(cx + s * 0.9, cy - s * 0.15);
+    ctx.arc(cx, cy - s * 0.15, s * 0.9, 0, TAU);
+    ctx.moveTo(cx + s * 0.95 + s * 0.6, cy + s * 0.15);
+    ctx.arc(cx + s * 0.95, cy + s * 0.15, s * 0.6, 0, TAU);
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fill();
+    ctx.beginPath();
+    roundRectPath(cx - s * 1.4, cy + s * 0.05, s * 2.95, s * 0.68, s * 0.34);
+    ctx.fill();
+  }
+
+  function drawSkyScene(x, y, w, h) {
+    const u = Math.min(w, h);
+    const g = ctx.createLinearGradient(0, y, 0, y + h);
+    g.addColorStop(0, '#BEDCF2');
+    g.addColorStop(1, '#E8F3FB');
+    ctx.fillStyle = g;
+    ctx.fillRect(x, y, w, h);
+
+    ctx.globalAlpha = 0.95;
+    cloud(x + w * 0.28, y + h * 0.18, u * 0.1);
+    cloud(x + w * 0.78, y + h * 0.48, u * 0.08);
+    cloud(x + w * 0.2, y + h * 0.66, u * 0.065);
+    ctx.globalAlpha = 1;
+
+    // A branch reaching in from the right edge, with leaves.
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(x + w + u * 0.05, y + h * 0.8);
+    ctx.quadraticCurveTo(x + w * 0.78, y + h * 0.86, x + w * 0.5, y + h * 0.8);
+    ctx.lineWidth = Math.max(3, u * 0.055);
+    ctx.strokeStyle = '#A0785A';
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(x + w * 0.7, y + h * 0.83);
+    ctx.quadraticCurveTo(x + w * 0.64, y + h * 0.92, x + w * 0.56, y + h * 0.95);
+    ctx.lineWidth = Math.max(2, u * 0.03);
+    ctx.stroke();
+    ctx.fillStyle = '#9CCB9A';
+    ctx.strokeStyle = '#7FAE7D';
+    ctx.lineWidth = Math.max(1, u * 0.01);
+    [[0.52, 0.76, -0.6], [0.62, 0.77, -1.2], [0.86, 0.8, -1.4], [0.56, 0.95, 0.4], [0.76, 0.88, 0.9]].forEach(([fx, fy, a]) => {
+      ctx.beginPath();
+      ctx.ellipse(x + w * fx, y + h * fy, u * 0.05, u * 0.022, a, 0, TAU);
+      ctx.fill();
+      ctx.stroke();
+    });
+  }
+
+  const SCENES = { water: drawWaterScene, land: drawLandScene, sky: drawSkyScene };
+
+  // A habitat card: the little scene, its border, then the animals living there.
+  function drawZone(z, t, hovered, glow, drawContents) {
+    const acc = HABITATS[z.habitat].accent;
+    const cx = z.x + z.w / 2;
+    const base = z.y + z.h;
+    const rad = Math.min(z.w, z.h) * 0.14;
+
+    let sx = 1, sy = 1;
+    const bp = (t - z.bounceT0) / CONFIG.BOUNCE_MS;
+    if (bp >= 0 && bp < 1) {
+      const k = Math.sin(Math.PI * bp) * (reduceMotion ? 0.5 : 1);
+      sx += 0.05 * k;
+      sy -= 0.07 * k;
+    }
+    if (hovered) { sx *= 1.04; sy *= 1.04; }
+
+    ctx.save();
+    ctx.translate(cx, base);
+    ctx.scale(sx, sy);
+    ctx.translate(-cx, -base);
+
+    // Scaffolding hint: a soft glow around the right habitat.
+    if (glow > 0) {
+      const g = L.s * (0.25 + 0.25 * glow);
+      ctx.globalAlpha = 0.25 + 0.4 * glow;
+      ctx.fillStyle = shade(acc, 0.3);
+      ctx.beginPath();
+      roundRectPath(z.x - g, z.y - g, z.w + g * 2, z.h + g * 2, rad + g);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    ctx.save();
+    ctx.beginPath();
+    roundRectPath(z.x, z.y, z.w, z.h, rad);
+    ctx.clip();
+    SCENES[z.habitat](z.x, z.y, z.w, z.h);
+    ctx.restore();
+
+    ctx.beginPath();
+    roundRectPath(z.x, z.y, z.w, z.h, rad);
+    ctx.lineWidth = Math.max(2.5, Math.min(z.w, z.h) * 0.025);
+    ctx.strokeStyle = shade(acc, -0.15);
+    ctx.stroke();
+
+    drawContents();
+    ctx.restore();
+  }
+
+  function drawStar(cx, cy, R, fill, face) {
+    ctx.save();
+    ctx.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const rad = i % 2 === 0 ? R : R * 0.5;
+      const a = -Math.PI / 2 + i * Math.PI / 5;
+      const x = cx + rad * Math.cos(a), y = cy + rad * Math.sin(a);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    ctx.lineJoin = 'round';
+    if (fill) {
+      ctx.fillStyle = fill;
+      ctx.fill();
+      ctx.strokeStyle = fill;            // same-colour stroke rounds the tips
+      ctx.lineWidth = Math.max(2, R * 0.16);
+      ctx.stroke();
+    } else {
+      ctx.strokeStyle = 'rgba(74, 64, 54, 0.25)';
+      ctx.lineWidth = Math.max(2, R * 0.14);
+      ctx.stroke();
+    }
+
+    if (face) {
+      ctx.fillStyle = COLORS.ink;
+      ctx.beginPath(); ctx.arc(cx - R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.arc(cx + R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.strokeStyle = COLORS.ink;
+      ctx.lineWidth = Math.max(2, R * 0.05);
+      ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.arc(cx, cy + R * 0.06, R * 0.17, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+      ctx.globalAlpha = 0.35;
+      ctx.fillStyle = COLORS.cheek;
+      ctx.beginPath(); ctx.ellipse(cx - R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(cx + R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // Same ring of sparkles from every habitat, every time (no random rewards).
+  function spawnParticles(z, t) {
+    const cx = z.x + z.w / 2, cy = z.y;
+    const col = HABITATS[z.habitat].accent;
+    for (let i = 0; i < 10; i++) {
+      const a = -Math.PI / 2 + (i - 4.5) * 0.3;
+      state.particles.push({ x0: cx, y0: cy, dx: Math.cos(a), dy: Math.sin(a), dist: z.w * 0.6, t0: t, life: 900, color: i % 2 ? COLORS.star : col });
+    }
+  }
+
+  function drawParticles(t) {
+    state.particles = state.particles.filter(p => t - p.t0 < p.life);
+    for (const p of state.particles) {
+      const k = (t - p.t0) / p.life;
+      const e = easeOutCubic(k);
+      ctx.globalAlpha = 1 - k;
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x0 + p.dx * p.dist * e, p.y0 + p.dy * p.dist * e, L.s * 0.13 * (1 - k * 0.5), 0, TAU);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------------------------------------------------------------------
+  // Screens
+  // ---------------------------------------------------------------------
+  function starGeom() {
+    return { cx: W / 2, cy: H * 0.42, R: Math.min(W, H) * 0.2 };
+  }
+
+  // Start and between-round screen: one big pulsing star to tap, plus 5 slots
+  // that fill up so the child can see the end coming.
+  function drawStarScreen(t) {
+    const { cx, cy, R } = starGeom();
+    const amp = reduceMotion ? 0.03 : 0.07;
+    const k = 1 + amp * (0.5 - 0.5 * Math.cos(TAU * t / 1400));
+    drawStar(cx, cy, R * k, COLORS.star, true);
+
+    const sr = R * 0.16, gap = sr * 2.8, y = cy + R * 1.35;
+    for (let i = 0; i < CONFIG.ROUNDS; i++) {
+      drawStar(cx + (i - (CONFIG.ROUNDS - 1) / 2) * gap, y, sr, i < state.round ? COLORS.star : null, false);
+    }
+  }
+
+  function fitFont(text, weight, size, maxW) {
+    ctx.font = `${weight} ${size}px ${FONT}`;
+    while (size > 12 && ctx.measureText(text).width > maxW) {
+      size -= 1;
+      ctx.font = `${weight} ${size}px ${FONT}`;
+    }
+    return size;
+  }
+
+  // Static end screen. No buttons: the session is over.
+  function drawEnd() {
+    const gh = H * 0.14;
+    ctx.fillStyle = COLORS.grass;
+    ctx.beginPath();
+    ctx.moveTo(0, H - gh);
+    ctx.quadraticCurveTo(W / 2, H - gh * 1.5, W, H - gh);
+    ctx.lineTo(W, H);
+    ctx.lineTo(0, H);
+    ctx.closePath();
+    ctx.fill();
+
+    const R = Math.min(W, H) * 0.2;
+    const cy = H * 0.36;
+    drawStar(W / 2, cy, R, COLORS.star, true);
+
+    const big = clamp(Math.min(W, H) * 0.1, 26, 68);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = COLORS.ink;
+    const top = cy + R * 1.25;
+    fitFont('Great Job!', 800, big, W * 0.9);
+    ctx.fillText('Great Job!', W / 2, top + big * 0.5);
+    fitFont('Time to play outside!', 700, Math.round(big * 0.62), W * 0.9);
+    ctx.fillText('Time to play outside!', W / 2, top + big * 1.55);
+  }
+
+  // Which animal to pulse and which habitat (if any) to glow right now.
+  function guidance(t) {
+    const out = { target: null, pulse: 1, hintZone: null, glow: 0 };
+    if (state.phase !== 'play') return out;
+    const amp = reduceMotion ? 0.05 : 0.12;
+
+    if (state.drag) {
+      const o = state.drag.obj;
+      if (o.errors >= 2) { out.hintZone = zoneFor(o.habitat); out.glow = 0.5 + 0.5 * Math.sin(TAU * t / 1300); }
+      return out;
+    }
+
+    const idle = t - state.lastInteraction;
+    if (idle <= CONFIG.IDLE_PULSE_MS) return out;
+    out.target = state.objects.find(o => o.state === 'idle') || null;
+    if (!out.target) return out;
+    const wave = 0.5 - 0.5 * Math.cos(TAU * (idle - CONFIG.IDLE_PULSE_MS) / 1300);
+    out.pulse = 1 + amp * wave;
+
+    // Scaffolding: glow the right habitat after repeated slips, or in the very
+    // first round if the child has not found the mechanic yet.
+    const tutorial = state.round === 0 && state.placedThisRound === 0 && idle > CONFIG.TUTORIAL_HINT_MS;
+    if (out.target.errors >= 2 || tutorial) { out.hintZone = zoneFor(out.target.habitat); out.glow = wave; }
+    return out;
+  }
+
+  function drawPlay(t) {
+    const g = guidance(t);
+    const hover = state.drag ? findDropZone(state.drag.obj) : null;
+
+    for (const z of state.zones) {
+      drawZone(z, t, z === hover, z === g.hintZone ? g.glow : 0, () => {
+        for (const o of state.objects) if (o.zone === z && o.state === 'placed') drawObject(o, t, 1);
+      });
+    }
+    for (const o of state.objects) {
+      if (o.state === 'idle' || o.state === 'return' || o.state === 'toZone') {
+        drawObject(o, t, o === g.target ? g.pulse : 1);
+      }
+    }
+    if (state.drag) drawObject(state.drag.obj, t, 1);
+    drawParticles(t);
+  }
+
+  // ---------------------------------------------------------------------
+  // Main loop
+  // ---------------------------------------------------------------------
+  function update(t) {
+    for (const o of state.objects) {
+      const a = o.anim;
+      if (!a) continue;
+      const p = clamp((t - a.t0) / a.dur, 0, 1);
+      const e = a.ease(p);
+      o.x = lerp(a.fx, a.tx, e);
+      o.y = lerp(a.fy, a.ty, e);
+      o.scale = lerp(a.fs, a.ts, e);
+      o.animP = p;
+      if (p >= 1) {
+        o.anim = null;
+        if (o.state === 'return') o.state = 'idle';
+        else if (o.state === 'toZone') landInZone(o, t);
+      }
+    }
+
+    if (state.phase === 'play' && state.completeAt && t >= state.completeAt) {
+      state.completeAt = 0;
+      completeRound();
+    }
+
+    if (state.phase === 'celebrate' && t - state.celebrateStart >= CONFIG.CELEBRATE_MS) {
+      if (state.round >= CONFIG.ROUNDS) enterEnd();
+      else state.phase = 'between';
+    }
+  }
+
+  function render(t) {
+    ctx.fillStyle = COLORS.bg;
+    ctx.fillRect(0, 0, W, H);
+    if (state.phase === 'start' || state.phase === 'between') drawStarScreen(t);
+    else if (state.phase === 'play' || state.phase === 'celebrate') drawPlay(t);
+    else if (state.phase === 'end') drawEnd();
+  }
+
+  let rafId = 0;
+  function frame(t) {
+    update(t);
+    render(t);
+    // The end screen is static: stop the loop entirely.
+    if (state.phase !== 'end') rafId = requestAnimationFrame(frame);
+  }
+
+  function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    DPR = Math.min(window.devicePixelRatio || 1, 2.5);
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    computeLayout();
+    if (state.phase === 'end') render(now());
+  }
+
+  window.addEventListener('resize', resize);
+  window.addEventListener('orientationchange', resize);
+
+  resize();
+  log('Game loaded', { roundsPerSession: CONFIG.ROUNDS, gamesCompletedBefore: progress.gamesCompleted });
+  rafId = requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

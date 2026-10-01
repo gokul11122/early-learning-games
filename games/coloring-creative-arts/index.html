@@ -1,0 +1,1686 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Color the Picture</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
+  body {
+    background: #F6F1E7;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  canvas { display: block; width: 100%; height: 100%; }
+
+  #home {
+    position: fixed; top: max(10px, env(safe-area-inset-top)); right: max(10px, env(safe-area-inset-right));
+    width: 52px; height: 52px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+    background: rgba(255, 253, 248, 0.85); box-shadow: 0 2px 8px rgba(74, 64, 54, 0.15);
+    -webkit-tap-highlight-color: transparent; z-index: 5;
+  }
+  #home:active { transform: scale(0.94); }
+
+  /* Hidden parent view: press and hold the top-left corner for 3 seconds. */
+  #parent {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: rgba(74, 64, 54, 0.55); padding: 16px; box-sizing: border-box; z-index: 10;
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #4A4036;
+  }
+  #parent[hidden] { display: none; }
+  #parent .card { background: #FFFDF8; border-radius: 16px; padding: 20px 22px; max-width: 380px; width: 100%; box-shadow: 0 10px 30px rgba(0,0,0,0.18); max-height: 100%; overflow-y: auto; box-sizing: border-box; }
+  #parent h2 { margin: 0 0 10px; font-size: 18px; }
+  #parent h3 { margin: 14px 0 4px; font-size: 14px; }
+  #parent table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+  #parent th, #parent td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #EDE5D6; }
+  #parent .swatch { display: inline-block; width: 12px; height: 12px; border-radius: 50%; margin-right: 3px; vertical-align: -1px; box-shadow: inset 0 0 0 1px rgba(74,64,54,0.25); }
+  #parent .hint { margin: 12px 0 0; font-size: 12px; opacity: 0.7; }
+</style>
+</head>
+<body>
+<canvas id="game" aria-label="Coloring game"></canvas>
+<a id="home" href="../../index.html" aria-label="Home">
+  <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><path d="M4 11.5 12 5l8 6.5V19a1 1 0 0 1-1 1h-4.5v-5h-5v5H5a1 1 0 0 1-1-1z" fill="none" stroke="#4A4036" stroke-width="2" stroke-linejoin="round"/></svg>
+</a>
+
+<div id="parent" hidden>
+  <div class="card">
+    <h2>Progress on this device</h2>
+    <div id="parentBody"></div>
+    <p class="hint">Stored only on this device. Tap anywhere to close.</p>
+  </div>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  /* =====================================================================
+   * COLORING AND CREATIVE ARTS
+   * ELOF domain: Creative Arts Expression (choosing colours freely)
+   *              + Perceptual/Motor (fine motor: accurate taps on ever
+   *              smaller regions).
+   *
+   * Design rules this file follows (from the brief):
+   *  - Coherence: only the line-art picture and the paint pots are on
+   *    screen. No score, no menus, no text.
+   *  - Creative, so there is no wrong colour: any pot fills any region, and
+   *    any region can be repainted.
+   *  - Fine motor is the challenge: pictures go from 3 big regions to 8 small
+   *    ones. Taps that miss every region simply do nothing (they are only
+   *    counted, for difficulty adjustment and the parent view).
+   *  - Forgiving hitboxes: a region is hit inside its path or within a small
+   *    tolerance of its outline; pots are hit well outside their drawing.
+   *  - Visual prompts: idle pots pulse when no colour is chosen; otherwise an
+   *    empty region glows softly. After 2 misses the nearest empty region glows.
+   *  - When every region has a colour the picture comes alive with one gentle
+   *    animation, always the same for that picture.
+   *  - Natural stopping point: 5 rounds, then a static "play outside" screen
+   *    with no "play again" button.
+   * ===================================================================== */
+
+  // ---------------------------------------------------------------------
+  // Configuration
+  // ---------------------------------------------------------------------
+  const CONFIG = {
+    ROUNDS: 5,                     // hard session limit (natural stopping point)
+    STORAGE_KEY: 'coloring-creative-arts.v1',
+    IDLE_PULSE_MS: 1500,           // idle time before the next step pulses
+    TUTORIAL_HINT_MS: 5000,        // first round: idle time before the stronger hint
+    FILL_MS: 460,                  // "pour" fill animation
+    SPLASH_MS: 520,                // paint droplets after a fill
+    LIFT_MS: 180,                  // pot lift when chosen
+    NUDGE_MS: 520,                 // pots wobble when the picture is tapped before a colour is chosen
+    COMPLETE_DELAY_MS: 250,        // after the last fill finishes, before the picture comes alive
+    CELEBRATE_MS: 3800,            // how long the picture plays before the star screen
+    FAST_MS_PER_REGION: 10000,     // generous: colouring is creative, deliberating is fine
+    HIT_TOLERANCE_PX: 10,          // taps this close to a region's outline still count
+    PARENT_HOLD_MS: 3000,          // hold time for the hidden parent view
+    PARENT_CORNER_PX: 80,
+    HOME_RESERVE_PX: 72,           // top-right corner kept clear for the home button
+  };
+
+  const COLORS = {
+    bg: '#F6F1E7',
+    ink: '#4A4036',
+    paper: '#FFFFFF',
+    jar: '#FFFDF8',
+    rim: '#E6DCCB',
+    star: '#F6C85F',
+    grass: '#B9D7A8',
+    cheek: '#F2A88A',
+  };
+
+  // Paint pots. Each always plays the same note when chosen.
+  const PAINTS = [
+    { key: 'red',    name: 'Red',    hex: '#E8645A', note: 523.25 },
+    { key: 'yellow', name: 'Yellow', hex: '#F6C85F', note: 587.33 },
+    { key: 'blue',   name: 'Blue',   hex: '#5B9BD5', note: 659.25 },
+    { key: 'green',  name: 'Green',  hex: '#7CC47F', note: 783.99 },
+    { key: 'orange', name: 'Orange', hex: '#F39C4F', note: 880.0 },
+    { key: 'purple', name: 'Purple', hex: '#A884CF', note: 1046.5 },
+  ];
+  const PAINT = Object.fromEntries(PAINTS.map(p => [p.key, p]));
+
+  const FONT = 'ui-rounded, "Arial Rounded MT Bold", "Nunito", system-ui, -apple-system, sans-serif';
+
+  // Difficulty ladder for dynamic difficulty adjustment (scaffolding).
+  // Each picture belongs to one tier; region size shrinks as the count grows.
+  const TIERS = [
+    { regions: '3',   paints: 3 },  // 3 big regions; red, yellow, blue
+    { regions: '4-5', paints: 4 },  // + green
+    { regions: '6',   paints: 5 },  // + orange, smaller parts
+    { regions: '7-8', paints: 6 },  // + purple, small parts (beaks, headlights, thin stripes)
+  ];
+
+  const TAU = Math.PI * 2;
+  const reduceMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+
+  // ---------------------------------------------------------------------
+  // Small helpers
+  // ---------------------------------------------------------------------
+  const now = () => performance.now();
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const easeOutCubic = t => 1 - Math.pow(1 - t, 3);
+  const log = (...args) => console.log('[Coloring]', ...args);
+
+  // Mix a hex colour toward black (amt < 0) or white (amt > 0).
+  const shadeCache = new Map();
+  function shade(hex, amt) {
+    const key = hex + amt;
+    if (shadeCache.has(key)) return shadeCache.get(key);
+    const n = parseInt(hex.slice(1), 16);
+    const target = amt < 0 ? 0 : 255;
+    const p = Math.abs(amt);
+    const c = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map(v => Math.round(lerp(v, target, p)));
+    const out = `rgb(${c[0]},${c[1]},${c[2]})`;
+    shadeCache.set(key, out);
+    return out;
+  }
+
+  // ---------------------------------------------------------------------
+  // Canvas setup
+  // ---------------------------------------------------------------------
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  // A separate untransformed context, used only for hit-testing region paths.
+  const hitCtx = document.createElement('canvas').getContext('2d');
+  let W = 0, H = 0, DPR = 1;
+
+  // Layout values recomputed on every resize.
+  // ox, oy, S: the picture's square on screen (picture space is 100 x 100). p: pot size.
+  const L = { m: 16, ox: 0, oy: 0, S: 300, p: 64 };
+
+  // ---------------------------------------------------------------------
+  // Pictures. Each region is a closed Path2D in a 100 x 100 picture space,
+  // listed back to front (later regions are drawn on top and win hit tests).
+  // part: which moving piece it belongs to when the picture comes alive.
+  // ---------------------------------------------------------------------
+  function ellipseTo(p, x, y, rx, ry, rot = 0) {
+    p.moveTo(x + rx * Math.cos(rot), y + rx * Math.sin(rot));
+    p.ellipse(x, y, rx, ry, rot, 0, TAU);
+    p.closePath();
+  }
+  const circleTo = (p, x, y, r) => ellipseTo(p, x, y, r, r);
+  function polyTo(p, pts) {
+    p.moveTo(pts[0][0], pts[0][1]);
+    for (let i = 1; i < pts.length; i++) p.lineTo(pts[i][0], pts[i][1]);
+    p.closePath();
+  }
+  function roundRectTo(p, x, y, w, h, r) {
+    p.moveTo(x + r, y);
+    p.arcTo(x + w, y, x + w, y + h, r);
+    p.arcTo(x + w, y + h, x, y + h, r);
+    p.arcTo(x, y + h, x, y, r);
+    p.arcTo(x, y, x + w, y, r);
+    p.closePath();
+  }
+  // A soft cloud as one outline (no inner lines).
+  function cloudTo(p, x, y) {
+    p.moveTo(x - 12, y + 5);
+    p.quadraticCurveTo(x - 15.5, y - 3, x - 7, y - 3);
+    p.quadraticCurveTo(x - 5, y - 11.5, x + 2, y - 8);
+    p.quadraticCurveTo(x + 9.5, y - 11.5, x + 10, y - 3);
+    p.quadraticCurveTo(x + 16.5, y - 1, x + 12, y + 5);
+    p.closePath();
+  }
+  // Mirror a builder across the vertical centre line x = 50.
+  const mirrored = build => p => build({
+    moveTo: (x, y) => p.moveTo(100 - x, y),
+    lineTo: (x, y) => p.lineTo(100 - x, y),
+    quadraticCurveTo: (a, b, x, y) => p.quadraticCurveTo(100 - a, b, 100 - x, y),
+    bezierCurveTo: (a, b, c, d, x, y) => p.bezierCurveTo(100 - a, b, 100 - c, d, 100 - x, y),
+    closePath: () => p.closePath(),
+  });
+
+  // Pose helpers for the "comes alive" animation. A pose is a list of steps,
+  // each { x, y, r, sx, sy, px, py }: move by (x, y), then rotate/scale about (px, py).
+  const step = (o) => Object.assign({ x: 0, y: 0, r: 0, sx: 1, sy: 1, px: 50, py: 50 }, o);
+
+  const butterflyUpper = p => { p.moveTo(48, 46); p.bezierCurveTo(36, 8, 4, 10, 9, 33); p.bezierCurveTo(12, 45, 30, 50, 48, 49); p.closePath(); };
+  const butterflyLower = p => { p.moveTo(48, 52); p.bezierCurveTo(30, 51, 13, 62, 19, 77); p.bezierCurveTo(25, 90, 45, 78, 48, 58); p.closePath(); };
+  const rocketFin = p => { p.moveTo(38, 55); p.lineTo(22, 76); p.lineTo(22, 82); p.lineTo(38, 74); p.closePath(); };
+  const owlWing = p => { p.moveTo(29, 46); p.bezierCurveTo(16, 54, 17, 72, 31, 80); p.bezierCurveTo(33, 68, 34, 56, 29, 46); p.closePath(); };
+  const BALLOON_MERIDIANS = [-28, -16.8, -5.6, 5.6, 16.8, 28];
+  const balloonStripe = i => p => {
+    const a = BALLOON_MERIDIANS[i] * 4 / 3, b = BALLOON_MERIDIANS[i + 1] * 4 / 3;
+    p.moveTo(50, 7);
+    p.bezierCurveTo(50 + a, 7, 50 + a, 63, 50, 63);
+    p.bezierCurveTo(50 + b, 63, 50 + b, 7, 50, 7);
+    p.closePath();
+  };
+  // Flower petals as one scalloped outline: each petal is the outer arc of a circle.
+  function petalsTo(p, cx, cy, R, r, n) {
+    const half = Math.PI / n;
+    const d = R * Math.cos(half) + Math.sqrt(r * r - Math.pow(R * Math.sin(half), 2));
+    const th = Math.atan2(d * Math.sin(half), d * Math.cos(half) - R);
+    for (let i = 0; i < n; i++) {
+      const a = -Math.PI / 2 + i * TAU / n;
+      p.arc(cx + R * Math.cos(a), cy + R * Math.sin(a), r, a - th, a + th, false);
+    }
+    p.closePath();
+  }
+
+  const PICTURES = [
+    // Tier 0: three big regions ---------------------------------------
+    {
+      id: 'fish', name: 'Fish', tier: 0,
+      regions: [
+        { id: 'tail', part: 'tail', build: p => { p.moveTo(70, 52); p.lineTo(93, 33); p.quadraticCurveTo(85, 52, 93, 71); p.closePath(); } },
+        { id: 'fin', part: 'fin', build: p => { p.moveTo(32, 40); p.quadraticCurveTo(42, 17, 64, 37); p.closePath(); } },
+        { id: 'body', part: 'body', build: p => ellipseTo(p, 46, 53, 31, 20) },
+      ],
+      details(d) {
+        d.part('body', () => {
+          d.eye(29, 48, 4.6);
+          d.arc(25, 55.5, 4, 0.15 * Math.PI, 0.75 * Math.PI);
+          d.arc(33, 53, 11, -0.38 * Math.PI, 0.38 * Math.PI);
+          for (const [x, y] of [[54, 47], [62, 53], [54, 59]]) d.arc(x, y, 3.5, 0.1 * Math.PI, 0.9 * Math.PI, 0.6);
+        });
+        d.part('bubbles', () => { d.ring(14, 30, 3); d.ring(9, 19, 2.2); d.ring(17, 11, 1.5); });
+      },
+      pose(part, k, a) {
+        const bob = Math.sin(k * 2.2) * 2.5 * a;
+        if (part === 'tail') return [step({ y: bob, px: 71, py: 52, r: Math.sin(k * 6) * 0.22 * a })];
+        if (part === 'fin') return [step({ y: bob, px: 48, py: 38, r: Math.sin(k * 6 + 1) * 0.08 * a })];
+        if (part === 'bubbles') return [step({ y: -((k * 6) % 10) * a })];
+        return [step({ y: bob, px: 46, py: 53, r: Math.sin(k * 2.2) * 0.03 * a })];
+      },
+    },
+    {
+      id: 'icecream', name: 'Ice cream', tier: 0,
+      regions: [
+        { id: 'cone', build: p => polyTo(p, [[31, 55], [69, 55], [50, 95]]) },
+        { id: 'top', part: 'top', build: p => circleTo(p, 50, 31, 16) },
+        { id: 'scoop', build: p => {
+          p.moveTo(27, 57); p.bezierCurveTo(23, 35, 77, 35, 73, 57);
+          p.quadraticCurveTo(68, 64, 63, 58); p.quadraticCurveTo(57, 66, 50, 58);
+          p.quadraticCurveTo(43, 65, 37, 58); p.quadraticCurveTo(32, 63, 27, 57);
+          p.closePath();
+        } },
+      ],
+      details(d) {
+        d.part('all', () => {
+          d.clipTo('cone', () => {
+            for (let i = -3; i <= 3; i++) { d.line(50 + i * 7 - 20, 50, 50 + i * 7 + 20, 100, 0.6); d.line(50 + i * 7 + 20, 50, 50 + i * 7 - 20, 100, 0.6); }
+          });
+          d.arc(40, 46, 3, 1.1 * Math.PI, 1.6 * Math.PI, 0.7);
+        });
+        d.part('top', () => {
+          for (const [x, y, r] of [[44, 24, 0.4], [55, 22, -0.5], [50, 30, 0.9], [42, 34, -0.2], [58, 33, 0.3]]) {
+            d.line(x - Math.cos(r) * 1.6, y - Math.sin(r) * 1.6, x + Math.cos(r) * 1.6, y + Math.sin(r) * 1.6, 0.8);
+          }
+        });
+      },
+      pose(part, k, a) {
+        const wob = step({ px: 50, py: 95, r: Math.sin(k * 2.4) * 0.05 * a });
+        if (part === 'top') return [wob, step({ px: 50, py: 46, sx: 1 + Math.sin(k * 4.8) * 0.04 * a, sy: 1 - Math.sin(k * 4.8) * 0.04 * a })];
+        return [wob];
+      },
+    },
+    {
+      id: 'balloons', name: 'Balloons', tier: 0,
+      regions: [
+        { id: 'left', part: 'b0', build: p => { ellipseTo(p, 27, 40, 14.5, 18.5); polyTo(p, [[27, 57], [23.5, 63], [30.5, 63]]); } },
+        { id: 'right', part: 'b2', build: p => { ellipseTo(p, 73, 40, 14.5, 18.5); polyTo(p, [[73, 57], [69.5, 63], [76.5, 63]]); } },
+        { id: 'middle', part: 'b1', build: p => { ellipseTo(p, 50, 30, 15, 19); polyTo(p, [[50, 47.5], [46.5, 53.5], [53.5, 53.5]]); } },
+      ],
+      details(d) {
+        // Strings run from each (moving) knot down to one fixed bow.
+        const knots = [[27, 63, 'b0'], [50, 53.5, 'b1'], [73, 63, 'b2']];
+        d.part('all', () => {
+          for (const [x, y, part] of knots) {
+            const dy = d.offsetY(part);
+            d.curve(x, y + dy, (x + 50) / 2 + (x < 50 ? -4 : x > 50 ? 4 : 3), 76, 50, 88);
+          }
+          d.loop(46, 88, -1); d.loop(54, 88, 1);
+        });
+        for (const [x, y, part] of [[21, 31, 'b0'], [44, 21, 'b1'], [67, 31, 'b2']]) {
+          d.part(part, () => d.arc(x + 6, y + 9, 9, 1.1 * Math.PI, 1.45 * Math.PI, 1, '#FFFFFF'));
+        }
+      },
+      pose(part, k, a) {
+        const i = part === 'b0' ? 0 : part === 'b1' ? 1 : part === 'b2' ? 2 : -1;
+        if (i < 0) return null;
+        const knot = [[27, 63], [50, 53.5], [73, 63]][i];
+        return [step({ y: Math.sin(k * 2 + i * 2.1) * 3 * a, px: knot[0], py: knot[1], r: Math.sin(k * 1.6 + i) * 0.05 * a })];
+      },
+    },
+
+    // Tier 1: four or five regions ------------------------------------
+    {
+      id: 'flower', name: 'Flower', tier: 1,
+      regions: [
+        { id: 'stem', part: 'plant', build: p => polyTo(p, [[46.5, 44], [53.5, 44], [53.5, 74], [46.5, 74]]) },
+        { id: 'leaves', part: 'plant', build: p => {
+          p.moveTo(53, 66); p.quadraticCurveTo(66, 46, 82, 52); p.quadraticCurveTo(74, 70, 53, 69); p.closePath();
+          p.moveTo(47, 62); p.quadraticCurveTo(34, 44, 18, 50); p.quadraticCurveTo(26, 66, 47, 65); p.closePath();
+        } },
+        { id: 'pot', build: p => { polyTo(p, [[31, 78], [69, 78], [64, 96], [36, 96]]); p.rect(27, 69, 46, 9); } },
+        { id: 'petals', part: 'head', build: p => petalsTo(p, 50, 28, 14, 10, 6) },
+        { id: 'center', part: 'head', build: p => circleTo(p, 50, 28, 9.5) },
+      ],
+      details(d) {
+        d.part('plant', () => { d.line(58, 66, 72, 56, 0.6); d.line(42, 62, 28, 53, 0.6); });
+        d.part('head', () => { d.dot(46.5, 26, 1.1); d.dot(53.5, 26, 1.1); d.arc(50, 29, 3.4, 0.2 * Math.PI, 0.8 * Math.PI, 0.7); });
+      },
+      pose(part, k, a) {
+        if (part !== 'plant' && part !== 'head') return null;
+        const sway = step({ px: 50, py: 74, r: Math.sin(k * 1.8) * 0.07 * a });
+        if (part === 'head') return [sway, step({ px: 50, py: 28, r: Math.sin(k * 1.8 + 0.6) * 0.05 * a })];
+        return [sway];
+      },
+    },
+    {
+      id: 'sailboat', name: 'Sailboat', tier: 1,
+      regions: [
+        { id: 'flag', part: 'flag', build: p => polyTo(p, [[51, 4], [71, 10.5], [51, 17.5]]) },
+        { id: 'bigSail', part: 'boat', build: p => { p.moveTo(53.5, 18); p.lineTo(53.5, 61); p.lineTo(84, 61); p.quadraticCurveTo(76, 36, 53.5, 18); p.closePath(); } },
+        { id: 'smallSail', part: 'boat', build: p => { p.moveTo(46.5, 27); p.lineTo(46.5, 61); p.lineTo(22, 61); p.quadraticCurveTo(32, 42, 46.5, 27); p.closePath(); } },
+        { id: 'hull', part: 'boat', build: p => { p.moveTo(14, 65); p.lineTo(86, 65); p.quadraticCurveTo(80, 82, 67, 82); p.lineTo(33, 82); p.quadraticCurveTo(20, 82, 14, 65); p.closePath(); } },
+      ],
+      underDetails(d) {
+        d.part('boat', () => d.line(50, 4, 50, 65, 1.1));
+      },
+      details(d) {
+        d.part('boat', () => { d.ring(38, 73, 2.6); d.ring(50, 73, 2.6); d.ring(62, 73, 2.6); });
+        d.part('all', () => {
+          d.wave(6, 89, 94, 0.9); d.wave(14, 95, 86, 0.7);
+          d.arc(16, 18, 3, 1.15 * Math.PI, 1.85 * Math.PI, 0.7); d.arc(22, 18, 3, 1.15 * Math.PI, 1.85 * Math.PI, 0.7);
+        });
+      },
+      pose(part, k, a) {
+        if (part !== 'boat' && part !== 'flag') return null;
+        const rock = step({ px: 50, py: 82, r: Math.sin(k * 1.8) * 0.06 * a, y: Math.sin(k * 1.8 + 1) * 1.5 * a });
+        if (part === 'flag') return [rock, step({ px: 51, py: 10.75, sx: 1 + Math.sin(k * 7) * 0.14 * a })];
+        return [rock];
+      },
+    },
+    {
+      id: 'turtle', name: 'Turtle', tier: 1,
+      regions: [
+        { id: 'legs', part: 'legs', build: p => { ellipseTo(p, 31, 70, 7.5, 10); ellipseTo(p, 67, 70, 7.5, 10); polyTo(p, [[6, 64], [22, 58], [22, 68]]); } },
+        { id: 'head', part: 'head', build: p => ellipseTo(p, 85, 52, 11, 9.5, -0.2) },
+        { id: 'rim', build: p => { p.moveTo(16, 62); p.lineTo(84, 62); p.quadraticCurveTo(85, 70, 77, 70); p.lineTo(23, 70); p.quadraticCurveTo(15, 70, 16, 62); p.closePath(); } },
+        { id: 'shell', build: p => { p.moveTo(18, 62); p.bezierCurveTo(18, 20, 82, 20, 82, 62); p.closePath(); } },
+        { id: 'plate', build: p => { const pts = []; for (let i = 0; i < 6; i++) { const ang = i * TAU / 6; pts.push([50 + Math.cos(ang) * 10, 45 + Math.sin(ang) * 9]); } polyTo(p, pts); } },
+      ],
+      details(d) {
+        d.part('all', () => {
+          d.clipTo('shell', () => {
+            for (let i = 0; i < 6; i++) {
+              const ang = i * TAU / 6;
+              d.line(50 + Math.cos(ang) * 10, 45 + Math.sin(ang) * 9, 50 + Math.cos(ang) * 30, 45 + Math.sin(ang) * 24, 0.8);
+            }
+          });
+        });
+        d.part('head', () => { d.eye(88, 49, 2.6); d.arc(88, 54, 3.4, 0.2 * Math.PI, 0.7 * Math.PI, 0.7); });
+      },
+      pose(part, k, a) {
+        const bob = step({ y: -Math.abs(Math.sin(k * 3)) * 1.6 * a });
+        if (part === 'head') return [bob, step({ px: 78, py: 58, r: Math.sin(k * 3) * 0.12 * a })];
+        if (part === 'legs') return [step({ px: 50, py: 64, r: Math.sin(k * 6) * 0.03 * a })];
+        return [bob];
+      },
+    },
+
+    // Tier 2: six regions ----------------------------------------------
+    {
+      id: 'butterfly', name: 'Butterfly', tier: 2,
+      regions: [
+        { id: 'wingUL', part: 'wingL', build: butterflyUpper },
+        { id: 'wingUR', part: 'wingR', build: mirrored(butterflyUpper) },
+        { id: 'wingLL', part: 'wingL', build: butterflyLower },
+        { id: 'wingLR', part: 'wingR', build: mirrored(butterflyLower) },
+        { id: 'body', part: 'body', build: p => ellipseTo(p, 50, 57, 4.8, 20) },
+        { id: 'head', part: 'body', build: p => circleTo(p, 50, 32.5, 6.2) },
+      ],
+      details(d) {
+        d.part('wingL', () => { d.ring(26, 30, 5); d.ring(32, 69, 3.6); });
+        d.part('wingR', () => { d.ring(74, 30, 5); d.ring(68, 69, 3.6); });
+        d.part('body', () => {
+          d.curve(47.5, 27.5, 44, 18, 38, 14); d.curve(52.5, 27.5, 56, 18, 62, 14);
+          d.dot(38, 14, 1.6); d.dot(62, 14, 1.6);
+          d.dot(47.8, 32, 0.9); d.dot(52.2, 32, 0.9);
+          for (const y of [50, 57, 64]) d.line(46.5, y, 53.5, y, 0.6);
+        });
+      },
+      pose(part, k, a) {
+        const bob = step({ y: Math.sin(k * 2.5) * 2 * a });
+        if (part === 'wingL' || part === 'wingR') {
+          const f = 1 - (0.5 + 0.5 * Math.sin(k * 5)) * 0.35 * a;
+          return [bob, step({ px: 50, py: 50, sx: f })];
+        }
+        return [bob];
+      },
+    },
+    {
+      id: 'rocket', name: 'Rocket', tier: 2,
+      regions: [
+        { id: 'flame', part: 'flame', build: p => { p.moveTo(40, 76); p.quadraticCurveTo(38, 88, 50, 98); p.quadraticCurveTo(62, 88, 60, 76); p.closePath(); } },
+        { id: 'finL', part: 'ship', build: rocketFin },
+        { id: 'finR', part: 'ship', build: mirrored(rocketFin) },
+        { id: 'body', part: 'ship', build: p => { p.moveTo(37, 32); p.lineTo(63, 32); p.lineTo(63, 74); p.quadraticCurveTo(63, 78, 59, 78); p.lineTo(41, 78); p.quadraticCurveTo(37, 78, 37, 74); p.closePath(); } },
+        { id: 'nose', part: 'ship', build: p => { p.moveTo(37, 33); p.bezierCurveTo(38, 18, 45, 9, 50, 5); p.bezierCurveTo(55, 9, 62, 18, 63, 33); p.closePath(); } },
+        { id: 'window', part: 'ship', build: p => circleTo(p, 50, 48, 7.5) },
+      ],
+      details(d) {
+        d.part('ship', () => {
+          d.arc(50, 48, 4.6, 1.1 * Math.PI, 1.5 * Math.PI, 0.7);
+          for (const y of [62, 70]) { d.dot(41, y, 0.9); d.dot(59, y, 0.9); }
+        });
+        d.part('all', () => { d.twinkle(16, 22, 3.2); d.twinkle(85, 30, 2.6); d.twinkle(82, 72, 2.2); d.twinkle(15, 60, 2); });
+      },
+      pose(part, k, a) {
+        const hover = step({ y: Math.sin(k * 3) * 2.2 * a, px: 50, py: 50, r: Math.sin(k * 1.5) * 0.02 * a });
+        if (part === 'flame') return [hover, step({ px: 50, py: 76, sy: 1 + Math.sin(k * 14) * 0.12 * a, sx: 1 - Math.sin(k * 14) * 0.05 * a })];
+        if (part === 'ship') return [hover];
+        return null;
+      },
+    },
+    {
+      id: 'house', name: 'House and sun', tier: 2,
+      regions: [
+        { id: 'chimney', build: p => p.rect(63, 20, 9.5, 24) },
+        { id: 'roof', build: p => polyTo(p, [[16, 50], [50, 22], [84, 50]]) },
+        { id: 'wall', build: p => p.rect(23, 50, 54, 40) },
+        { id: 'door', build: p => { p.moveTo(43, 90); p.lineTo(43, 72); p.arc(50, 72, 7, Math.PI, TAU); p.lineTo(57, 90); p.closePath(); } },
+        { id: 'windows', build: p => { p.rect(28, 57, 11.5, 11.5); p.rect(60.5, 57, 11.5, 11.5); } },
+        { id: 'sun', part: 'sun', build: p => circleTo(p, 14, 15, 8.5) },
+      ],
+      details(d) {
+        d.part('all', () => {
+          d.line(33.75, 57, 33.75, 68.5, 0.7); d.line(28, 62.75, 39.5, 62.75, 0.7);
+          d.line(66.25, 57, 66.25, 68.5, 0.7); d.line(60.5, 62.75, 72, 62.75, 0.7);
+          d.dot(54, 82, 1.1);
+          d.line(4, 90, 96, 90, 1);
+          for (const x of [10, 15, 86, 91]) d.line(x, 90, x - 1.5, 85.5, 0.7);
+        });
+        d.part('rays', () => {
+          for (let i = 0; i < 8; i++) {
+            const ang = i * TAU / 8 + 0.2;
+            d.line(14 + Math.cos(ang) * 11.5, 15 + Math.sin(ang) * 11.5, 14 + Math.cos(ang) * 15, 15 + Math.sin(ang) * 15, 0.9);
+          }
+        });
+        if (d.k > 0) {
+          // Chimney smoke while the picture is alive.
+          for (let i = 0; i < 3; i++) {
+            const u = ((d.k * 0.5) + i / 3) % 1;
+            d.ring(67.5 + Math.sin(u * 5 + i) * 2.5, 16 - u * 14, 1.6 + u * 2.6, 0.6, 1 - u);
+          }
+        }
+      },
+      pose(part, k, a) {
+        if (part === 'rays') return [step({ px: 14, py: 15, r: k * 0.8 * a })];
+        if (part === 'sun') return [step({ px: 14, py: 15, sx: 1 + Math.sin(k * 3) * 0.06 * a, sy: 1 + Math.sin(k * 3) * 0.06 * a })];
+        return null;
+      },
+    },
+
+    // Tier 3: seven or eight regions, some of them small -----------------
+    {
+      id: 'owl', name: 'Owl', tier: 3,
+      regions: [
+        { id: 'branch', build: p => { p.moveTo(4, 84); p.quadraticCurveTo(50, 78, 96, 82); p.lineTo(96, 90); p.quadraticCurveTo(50, 86, 4, 92); p.closePath(); } },
+        { id: 'body', part: 'owl', build: p => {
+          p.moveTo(28, 30); p.lineTo(31, 14); p.lineTo(42, 24);
+          p.quadraticCurveTo(50, 22, 58, 24); p.lineTo(69, 14); p.lineTo(72, 30);
+          p.bezierCurveTo(80, 44, 80, 84, 50, 84); p.bezierCurveTo(20, 84, 20, 44, 28, 30);
+          p.closePath();
+        } },
+        { id: 'belly', part: 'owl', build: p => ellipseTo(p, 50, 64, 14, 17) },
+        { id: 'wingL', part: 'wingL', build: owlWing },
+        { id: 'wingR', part: 'wingR', build: mirrored(owlWing) },
+        { id: 'eyeL', part: 'owl', build: p => circleTo(p, 40, 39, 8.5) },
+        { id: 'eyeR', part: 'owl', build: p => circleTo(p, 60, 39, 8.5) },
+        { id: 'beak', part: 'owl', build: p => polyTo(p, [[45.5, 47], [54.5, 47], [50, 55]]) },
+      ],
+      details(d) {
+        d.part('owl', () => {
+          d.eye(40, 39.5, 3.6, d.blink); d.eye(60, 39.5, 3.6, d.blink);
+          for (const [x, y] of [[44, 62], [50, 60], [56, 62], [47, 69], [53, 69]]) d.arc(x, y, 2.4, 0.15 * Math.PI, 0.85 * Math.PI, 0.6);
+        });
+        d.part('all', () => { d.line(80, 83, 90, 74, 0.9); d.line(16, 87, 8, 80, 0.9); });
+      },
+      pose(part, k, a) {
+        if (part === 'all') return null;
+        const tilt = step({ px: 50, py: 84, r: Math.sin(k * 1.6) * 0.07 * a });
+        if (part === 'wingL') return [tilt, step({ px: 29, py: 46, r: Math.sin(k * 4) * 0.16 * a })];
+        if (part === 'wingR') return [tilt, step({ px: 71, py: 46, r: -Math.sin(k * 4) * 0.16 * a })];
+        return [tilt];
+      },
+    },
+    {
+      id: 'car', name: 'Car', tier: 3,
+      regions: [
+        { id: 'cabin', part: 'car', build: p => polyTo(p, [[28, 50], [37, 30], [64, 30], [76, 50]]) },
+        { id: 'body', part: 'car', build: p => roundRectTo(p, 8, 50, 84, 23, 6) },
+        { id: 'winBack', part: 'car', build: p => polyTo(p, [[34, 47.5], [40.5, 34], [49, 34], [49, 47.5]]) },
+        { id: 'winFront', part: 'car', build: p => polyTo(p, [[53, 47.5], [53, 34], [62, 34], [69.5, 47.5]]) },
+        { id: 'light', part: 'car', build: p => ellipseTo(p, 86.5, 57.5, 3.8, 3.4) },
+        { id: 'wheelL', part: 'wheelL', build: p => circleTo(p, 28, 73, 10) },
+        { id: 'wheelR', part: 'wheelR', build: p => circleTo(p, 72, 73, 10) },
+      ],
+      details(d) {
+        d.part('car', () => { d.line(51, 52, 51, 70, 0.7); d.line(43, 56, 47, 56, 0.9); d.line(13, 58, 18, 58, 0.9); });
+        for (const [x, part] of [[28, 'wheelL'], [72, 'wheelR']]) {
+          d.part(part, () => {
+            d.ring(x, 73, 3.6);
+            for (let i = 0; i < 3; i++) { const ang = i * TAU / 3; d.line(x + Math.cos(ang) * 3.6, 73 + Math.sin(ang) * 3.6, x + Math.cos(ang) * 8, 73 + Math.sin(ang) * 8, 0.6); }
+          });
+        }
+        d.part('all', () => { for (let x = 6; x < 96; x += 14) d.line(x, 88, x + 7, 88, 0.9); });
+        if (d.k > 0) for (let i = 0; i < 2; i++) { const u = (d.k * 0.7 + i / 2) % 1; d.ring(5 - u * 3, 66 - u * 5, 1.5 + u * 2.2, 0.6, 1 - u); }
+      },
+      pose(part, k, a) {
+        if (part === 'car') return [step({ y: -Math.abs(Math.sin(k * 5)) * 1.6 * a })];
+        if (part === 'wheelL') return [step({ px: 28, py: 73, r: k * 5 * a })];
+        if (part === 'wheelR') return [step({ px: 72, py: 73, r: k * 5 * a })];
+        return null;
+      },
+    },
+    {
+      id: 'hotair', name: 'Hot air balloon', tier: 3,
+      regions: [
+        { id: 'cloudA', part: 'cloudA', build: p => cloudTo(p, 84, 22) },
+        { id: 'cloudB', part: 'cloudB', build: p => cloudTo(p, 16, 80) },
+        { id: 'stripe1', part: 'balloon', build: balloonStripe(0) },
+        { id: 'stripe2', part: 'balloon', build: balloonStripe(1) },
+        { id: 'stripe3', part: 'balloon', build: balloonStripe(2) },
+        { id: 'stripe4', part: 'balloon', build: balloonStripe(3) },
+        { id: 'stripe5', part: 'balloon', build: balloonStripe(4) },
+        { id: 'basket', part: 'balloon', build: p => roundRectTo(p, 40, 75, 20, 14, 3) },
+      ],
+      underDetails(d) {
+        d.part('balloon', () => { d.line(45, 61, 42.5, 75, 0.8); d.line(55, 61, 57.5, 75, 0.8); });
+      },
+      details(d) {
+        d.part('balloon', () => { d.line(41, 80, 59, 80, 0.6); d.line(41, 84.5, 59, 84.5, 0.6); for (const x of [46, 50, 54]) d.line(x, 75, x, 89, 0.5); });
+      },
+      pose(part, k, a) {
+        if (part === 'balloon') return [step({ y: Math.sin(k * 1.5) * 3 * a, px: 50, py: 40, r: Math.sin(k * 1.1) * 0.03 * a })];
+        if (part === 'cloudA') return [step({ x: Math.sin(k * 0.9) * 3 * a })];
+        if (part === 'cloudB') return [step({ x: Math.sin(k * 0.9 + 2) * 3 * a })];
+        return null;
+      },
+    },
+  ];
+
+  // Build each picture's paths once, and find for every region a point that is
+  // really inside its visible part (used for hints and by the debug hook) plus its visible area.
+  function preparePicture(pic) {
+    if (pic.ready) return;
+    pic.regions.forEach(r => { r.path = new Path2D(); r.build(r.path); });
+    const step = 1.5;
+    const acc = pic.regions.map(() => ({ n: 0, sx: 0, sy: 0, pts: [] }));
+    for (let y = step / 2; y < 100; y += step) {
+      for (let x = step / 2; x < 100; x += step) {
+        for (let i = pic.regions.length - 1; i >= 0; i--) {
+          if (hitCtx.isPointInPath(pic.regions[i].path, x, y)) {
+            const a = acc[i];
+            a.n++; a.sx += x; a.sy += y; a.pts.push(x, y);
+            break;
+          }
+        }
+      }
+    }
+    pic.regions.forEach((r, i) => {
+      const a = acc[i];
+      r.area = a.n * step * step;
+      if (!a.n) { r.at = [50, 50]; return; }
+      const cx = a.sx / a.n, cy = a.sy / a.n;
+      let best = 0, bestD = Infinity;
+      for (let j = 0; j < a.pts.length; j += 2) {
+        const d = Math.hypot(a.pts[j] - cx, a.pts[j + 1] - cy);
+        if (d < bestD) { bestD = d; best = j; }
+      }
+      r.at = [a.pts[best], a.pts[best + 1]];
+    });
+    pic.ready = true;
+  }
+
+  // ---------------------------------------------------------------------
+  // Game state
+  // ---------------------------------------------------------------------
+  const state = {
+    phase: 'start',          // 'start' | 'play' | 'celebrate' | 'between' | 'end'
+    round: 0,                // rounds completed this session
+    tier: 0,                 // index into TIERS
+    picture: null,
+    usedPictures: [],        // never repeat a picture within a session
+    regions: [],             // { id, part, path, at, area, color, from, fillT0, fx, fy, fr }
+    pots: [],                // { key, x, y }
+    selected: null,          // chosen paint key
+    selectT0: -1e9,
+    nudgeT0: -1e9,           // pots wobble: "choose a colour first"
+    lastInteraction: 0,
+    roundStart: 0,
+    misses: 0,               // taps on the picture that hit no region
+    missStreak: 0,           // misses since the last fill (drives the hint)
+    lastMiss: null,          // picture-space point of the last miss
+    fills: 0,
+    recolors: 0,
+    completeAt: 0,
+    celebrateStart: 0,
+    splashes: [],
+    particles: [],
+  };
+
+  // ---------------------------------------------------------------------
+  // Local progress tracking (localStorage, never leaves the device)
+  // ---------------------------------------------------------------------
+  function freshProgress() {
+    return { version: 1, gamesCompleted: 0, roundsCompleted: 0, fills: 0, misses: 0, colorCounts: {}, lastPlayed: null, sessions: [] };
+  }
+
+  function loadProgress() {
+    try {
+      const raw = window.localStorage.getItem(CONFIG.STORAGE_KEY);
+      if (raw) {
+        const data = JSON.parse(raw);
+        if (data && data.version === 1 && Array.isArray(data.sessions)) {
+          if (!data.colorCounts) data.colorCounts = {};
+          return data;
+        }
+      }
+    } catch (e) {
+      console.warn('[Coloring] Progress could not be loaded (storage unavailable):', e && e.message);
+    }
+    return freshProgress();
+  }
+
+  function saveProgress() {
+    try {
+      window.localStorage.setItem(CONFIG.STORAGE_KEY, JSON.stringify(progress));
+      log('Progress saved', { gamesCompleted: progress.gamesCompleted, roundsCompleted: progress.roundsCompleted });
+    } catch (e) {
+      console.warn('[Coloring] Progress could not be saved (storage unavailable):', e && e.message);
+    }
+  }
+
+  const progress = loadProgress();
+  let session = null; // created on the first round of this app launch
+
+  function ensureSession() {
+    if (session) return;
+    session = { startedAt: new Date().toISOString(), finished: false, rounds: [] };
+    progress.sessions.push(session);
+    if (progress.sessions.length > 30) progress.sessions.splice(0, progress.sessions.length - 30);
+  }
+
+  // ---------------------------------------------------------------------
+  // Audio: Web Audio tones + optional spoken words
+  // ---------------------------------------------------------------------
+  let actx = null;
+  let noiseBuf = null;
+
+  // Browsers only allow audio after a user gesture, so this runs on every pointer down.
+  function unlockAudio() {
+    if (!actx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) { try { actx = new AC(); } catch (e) { actx = null; } }
+    }
+    if (actx && actx.state === 'suspended') actx.resume();
+  }
+
+  function tone(freq, delay, dur, vol = 0.16, type = 'sine') {
+    if (!actx) return;
+    const t = actx.currentTime + delay;
+    const osc = actx.createOscillator();
+    const gain = actx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(vol, t + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    osc.connect(gain).connect(actx.destination);
+    osc.start(t);
+    osc.stop(t + dur + 0.05);
+  }
+
+  // A soft wet "splash": a short filtered noise swish, a falling bloop and the paint's own note.
+  // The noise is generated once, so every splash sounds the same.
+  function playSplash(paint) {
+    if (!actx) return;
+    try {
+      const t = actx.currentTime;
+      if (!noiseBuf) {
+        noiseBuf = actx.createBuffer(1, Math.floor(actx.sampleRate * 0.3), actx.sampleRate);
+        const data = noiseBuf.getChannelData(0);
+        for (let i = 0; i < data.length; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / data.length);
+      }
+      const src = actx.createBufferSource();
+      src.buffer = noiseBuf;
+      const lp = actx.createBiquadFilter();
+      lp.type = 'lowpass';
+      lp.frequency.setValueAtTime(1800, t);
+      lp.frequency.exponentialRampToValueAtTime(380, t + 0.25);
+      const g = actx.createGain();
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(0.1, t + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.28);
+      src.connect(lp).connect(g).connect(actx.destination);
+      src.start(t);
+      src.stop(t + 0.3);
+
+      const osc = actx.createOscillator();
+      const og = actx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(560, t);
+      osc.frequency.exponentialRampToValueAtTime(240, t + 0.18);
+      og.gain.setValueAtTime(0.0001, t);
+      og.gain.exponentialRampToValueAtTime(0.09, t + 0.015);
+      og.gain.exponentialRampToValueAtTime(0.0001, t + 0.2);
+      osc.connect(og).connect(actx.destination);
+      osc.start(t);
+      osc.stop(t + 0.25);
+    } catch (e) { /* audio is optional */ }
+    tone(paint.note, 0.06, 0.32, 0.06);
+  }
+
+  const playPick = paint => { tone(paint.note, 0, 0.25, 0.12, 'triangle'); tone(paint.note * 2, 0.05, 0.2, 0.04); };
+  const playNudge = () => tone(392, 0, 0.12, 0.05, 'triangle');
+  const playRoundDone = () => [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => tone(f, i * 0.12, 0.5, 0.12));
+
+  // Spoken words via the Web Speech API. Android WebView usually lacks it,
+  // so this quietly does nothing there and the tones carry the feedback.
+  function say(text) {
+    try {
+      if (!('speechSynthesis' in window)) return;
+      window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'en-US';
+      u.rate = 0.85;
+      u.pitch = 1.15;
+      window.speechSynthesis.speak(u);
+    } catch (e) { /* speech is optional */ }
+  }
+
+  // ---------------------------------------------------------------------
+  // Rounds and difficulty
+  // ---------------------------------------------------------------------
+  // Prefer the tier's own pictures; if this session used them all, take the
+  // nearest tier's (easier first), then anything unused.
+  function choosePicture(tierIdx) {
+    const unused = PICTURES.filter(p => !state.usedPictures.includes(p.id));
+    for (const d of [0, -1, 1, -2, 2, -3, 3]) {
+      const pool = unused.filter(p => p.tier === tierIdx + d);
+      if (pool.length) return pool[Math.floor(Math.random() * pool.length)];
+    }
+    return PICTURES[Math.floor(Math.random() * PICTURES.length)];
+  }
+
+  function startRound() {
+    ensureSession();
+    const tier = TIERS[state.tier];
+    const pic = choosePicture(state.tier);
+    preparePicture(pic);
+    state.picture = pic;
+    state.usedPictures.push(pic.id);
+
+    state.regions = pic.regions.map(r => ({
+      id: r.id, part: r.part || 'all', path: r.path, at: r.at, area: r.area,
+      color: null, from: null, fillT0: -1e9, fx: 50, fy: 50, fr: 0,
+    }));
+    state.pots = PAINTS.slice(0, tier.paints).map(p => ({ key: p.key, x: 0, y: 0 }));
+    state.selected = null;
+    state.selectT0 = -1e9;
+    state.nudgeT0 = -1e9;
+    state.misses = 0;
+    state.missStreak = 0;
+    state.lastMiss = null;
+    state.fills = 0;
+    state.recolors = 0;
+    state.completeAt = 0;
+    state.splashes = [];
+    state.particles = [];
+    computeLayout();
+
+    state.phase = 'play';
+    state.roundStart = now();
+    state.lastInteraction = now();
+    if (state.round === 0) say('Pick a color, then tap the picture.');
+    log(`Round ${state.round + 1}/${CONFIG.ROUNDS} started at level ${state.tier + 1}: ${pic.id}, ${pic.regions.length} regions, ${tier.paints} paints`);
+  }
+
+  function completeRound() {
+    const t = now();
+    const n = state.regions.length;
+    const ms = t - state.roundStart;
+    const colors = state.regions.map(r => r.color);
+    const record = {
+      level: state.tier + 1,
+      picture: state.picture.id,
+      regions: n,
+      colors,                           // the colour of each region, in picture order
+      recolors: state.recolors,
+      misses: state.misses,
+      seconds: Math.round(ms / 100) / 10,
+    };
+
+    session.rounds.push(record);
+    progress.roundsCompleted++;
+    progress.fills += state.fills;
+    progress.misses += state.misses;
+    colors.forEach(c => { progress.colorCounts[c] = (progress.colorCounts[c] || 0) + 1; });
+    progress.lastPlayed = new Date().toISOString();
+    state.round++;
+    log('Level completed', record);
+
+    const finalRound = state.round >= CONFIG.ROUNDS;
+    if (finalRound) {
+      session.finished = true;
+      progress.gamesCompleted++;
+    } else {
+      // Praise the choices and the effort, not the child (growth mindset).
+      say('You chose your own colors. Beautiful work!');
+    }
+    saveProgress();
+    adjustDifficulty(record, ms);
+
+    // Same chord and sparkles every time (no random rewards); the picture comes alive.
+    playRoundDone();
+    spawnParticles(t);
+    state.phase = 'celebrate';
+    state.celebrateStart = t;
+  }
+
+  // Simple DDA on fine-motor accuracy: clean taps -> smaller regions; many misses -> bigger ones.
+  function adjustDifficulty(record, ms) {
+    const fast = ms / record.regions <= CONFIG.FAST_MS_PER_REGION;
+    const before = state.tier;
+    if (record.misses <= 1 && fast) {
+      state.tier = Math.min(TIERS.length - 1, state.tier + 1);
+    } else if (record.misses >= Math.max(4, Math.ceil(record.regions * 0.75))) {
+      state.tier = Math.max(0, state.tier - 1);
+    }
+    if (state.tier !== before) log(`Difficulty ${state.tier > before ? 'up' : 'down'}: level ${before + 1} -> ${state.tier + 1}`);
+  }
+
+  function enterEnd() {
+    state.phase = 'end';
+    say('Great job! Time to play outside!');
+    log('Session finished: end screen shown, no replay offered');
+  }
+
+  // ---------------------------------------------------------------------
+  // Layout
+  // ---------------------------------------------------------------------
+  // Landscape: the pots stand in a column (or two) on the right, below the home button.
+  // Portrait: the pots stand in a row (or two) along the bottom.
+  function computeLayout() {
+    const minDim = Math.min(W, H);
+    const m = clamp(minDim * 0.04, 12, 28);
+    const R = CONFIG.HOME_RESERVE_PX;
+    const n = state.pots.length || 3;
+    let p = clamp(minDim * 0.15, 56, 96);
+    const pitchK = 1.22;
+    L.m = m;
+
+    if (W >= H) {
+      const top = R, bottom = H - m;
+      const avail = bottom - top;
+      let cols = 1;
+      while (cols < 3 && Math.ceil(n / cols) * p * pitchK > avail) cols++;
+      const rows = Math.ceil(n / cols);
+      p = Math.max(44, Math.min(p, avail / (rows * pitchK)));
+      const pitch = p * pitchK;
+      const bandW = cols * pitch + m;
+      const y0 = top + (avail - rows * pitch) / 2 + pitch / 2;
+      state.pots.forEach((pt, i) => {
+        const c = Math.floor(i / rows), r = i % rows;
+        pt.x = W - m - pitch * (cols - c - 0.5);
+        pt.y = y0 + r * pitch;
+      });
+      const aw = W - bandW - 2 * m, ah = H - 2 * m;
+      L.S = Math.max(60, Math.min(aw, ah));
+      L.ox = m + (aw - L.S) / 2;
+      L.oy = m + (ah - L.S) / 2;
+    } else {
+      const availW = W - 2 * m;
+      const perRow = Math.max(1, Math.floor(availW / (p * pitchK)));
+      const rows = Math.ceil(n / perRow);
+      const pitch = p * pitchK;
+      const bandH = rows * pitch + m * 0.5;
+      const cols = Math.ceil(n / rows);
+      state.pots.forEach((pt, i) => {
+        const r = Math.floor(i / cols), c = i % cols;
+        const inRow = r === rows - 1 ? n - r * cols : cols;
+        pt.x = W / 2 + (c - (inRow - 1) / 2) * pitch;
+        pt.y = H - m - bandH + m * 0.5 + pitch * (r + 0.5);
+      });
+      // Picture: either below a top band that clears the home button, or narrowed by side bands.
+      const bottom = H - m - bandH - m * 0.5;
+      const s1 = Math.min(W - 2 * m, bottom - R);
+      const s2 = Math.min(W - 2 * R, bottom - m);
+      if (s1 >= s2) {
+        L.S = Math.max(60, s1);
+        L.ox = (W - L.S) / 2;
+        L.oy = R + (bottom - R - L.S) / 2;
+      } else {
+        L.S = Math.max(60, s2);
+        L.ox = (W - L.S) / 2;
+        L.oy = m + (bottom - m - L.S) / 2;
+      }
+    }
+    L.p = p;
+  }
+
+  const toPic = pt => ({ x: (pt.x - L.ox) * 100 / L.S, y: (pt.y - L.oy) * 100 / L.S });
+  const fromPic = (x, y) => ({ x: L.ox + x * L.S / 100, y: L.oy + y * L.S / 100 });
+
+  // Topmost region under the point, using the path itself; failing that, the
+  // topmost region whose outline lies within a small tolerance.
+  function regionAt(pt) {
+    const q = toPic(pt);
+    for (let i = state.regions.length - 1; i >= 0; i--) {
+      if (hitCtx.isPointInPath(state.regions[i].path, q.x, q.y)) return state.regions[i];
+    }
+    hitCtx.lineWidth = 2 * CONFIG.HIT_TOLERANCE_PX * 100 / L.S;
+    for (let i = state.regions.length - 1; i >= 0; i--) {
+      if (hitCtx.isPointInStroke(state.regions[i].path, q.x, q.y)) return state.regions[i];
+    }
+    return null;
+  }
+
+  // Forgiving pick: the nearest pot within ~0.62 of its size (the jar itself is ~0.4 wide each side).
+  function potAt(pt) {
+    let best = null, bestD = Infinity;
+    for (const pot of state.pots) {
+      const d = Math.hypot(pt.x - pot.x, pt.y - pot.y);
+      if (d <= L.p * 0.62 && d < bestD) { best = pot; bestD = d; }
+    }
+    return best;
+  }
+
+  const onPicture = pt => pt.x >= L.ox - 10 && pt.x <= L.ox + L.S + 10 && pt.y >= L.oy - 10 && pt.y <= L.oy + L.S + 10;
+
+  // ---------------------------------------------------------------------
+  // Painting
+  // ---------------------------------------------------------------------
+  function choosePaint(pot, t) {
+    const paint = PAINT[pot.key];
+    if (state.selected !== pot.key) state.selectT0 = t;
+    state.selected = pot.key;
+    playPick(paint);
+    say(paint.name + '!');
+    log('Paint chosen', pot.key);
+  }
+
+  function fillRegion(region, pt, t) {
+    const paint = PAINT[state.selected];
+    const q = toPic(pt);
+    const recolor = region.color !== null;
+    region.from = fillProgress(region, t) < 1 ? region.from : region.color;
+    region.color = paint.key;
+    region.fillT0 = t;
+    region.fx = q.x;
+    region.fy = q.y;
+    // The pour must reach the farthest corner of the region's visible bounds.
+    region.fr = Math.max(Math.hypot(q.x, q.y), Math.hypot(100 - q.x, q.y), Math.hypot(q.x, 100 - q.y), Math.hypot(100 - q.x, 100 - q.y));
+    state.fills++;
+    if (recolor) state.recolors++;
+    state.missStreak = 0;
+    // Sound, pour and droplets start on the same frame (temporal contiguity).
+    playSplash(paint);
+    state.splashes.push({ x: pt.x, y: pt.y, t0: t, color: paint.hex });
+    log(`Item placed: ${region.id} painted ${paint.key}${recolor ? ' (recolor)' : ''}`);
+    if (state.regions.every(r => r.color)) state.completeAt = t + CONFIG.FILL_MS + CONFIG.COMPLETE_DELAY_MS;
+  }
+
+  const fillProgress = (r, t) => clamp((t - r.fillT0) / CONFIG.FILL_MS, 0, 1);
+
+  function handlePlayTap(pt, t) {
+    const pot = potAt(pt);
+    if (pot) { choosePaint(pot, t); return true; }
+    if (!onPicture(pt)) return false;
+    const region = regionAt(pt);
+    if (!state.selected) {
+      // No colour yet: the pots wobble to say "choose one of us first". Not a miss.
+      state.nudgeT0 = t;
+      playNudge();
+      return true;
+    }
+    if (region) {
+      if (region.color !== state.selected) fillRegion(region, pt, t);
+      return true;
+    }
+    // A miss: nothing happens on screen; it is only counted.
+    state.misses++;
+    state.missStreak++;
+    state.lastMiss = toPic(pt);
+    log(`Item rejected: tap missed every region (${state.misses} this round)`);
+    return true;
+  }
+
+  // ---------------------------------------------------------------------
+  // Input: touch + mouse
+  // ---------------------------------------------------------------------
+  let activeTouch = null;
+  let mouseDown = false;
+  let parentTimer = null;
+
+  function toCanvas(clientX, clientY) {
+    const r = canvas.getBoundingClientRect();
+    return { x: clientX - r.left, y: clientY - r.top };
+  }
+
+  function findTouch(list, id) {
+    for (let i = 0; i < list.length; i++) if (list[i].identifier === id) return list[i];
+    return null;
+  }
+
+  function cancelParentHold() {
+    if (parentTimer) { clearTimeout(parentTimer); parentTimer = null; }
+  }
+
+  function onDown(p) {
+    unlockAudio();
+    const t = now();
+    state.lastInteraction = t;
+
+    if (state.phase === 'start' || state.phase === 'between') {
+      const g = starGeom();
+      if (Math.hypot(p.x - g.cx, p.y - g.cy) <= g.R * 1.8) { startRound(); return; }
+    } else if (state.phase === 'play') {
+      if (handlePlayTap(p, t)) return;
+    }
+
+    // Hidden parent view: hold the top-left corner still for 3 seconds.
+    if (p.x < CONFIG.PARENT_CORNER_PX && p.y < CONFIG.PARENT_CORNER_PX) {
+      cancelParentHold();
+      parentTimer = setTimeout(openParent, CONFIG.PARENT_HOLD_MS);
+    }
+  }
+
+  function onMove(p) {
+    if (parentTimer && (p.x >= CONFIG.PARENT_CORNER_PX || p.y >= CONFIG.PARENT_CORNER_PX)) cancelParentHold();
+  }
+
+  function onUp() {
+    cancelParentHold();
+  }
+
+  canvas.addEventListener('touchstart', e => {
+    e.preventDefault();
+    if (activeTouch !== null) return;          // one finger at a time
+    const t = e.changedTouches[0];
+    activeTouch = t.identifier;
+    onDown(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  canvas.addEventListener('touchmove', e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (t) onMove(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  const endTouch = e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (!t) return;
+    activeTouch = null;
+    onUp();
+  };
+  canvas.addEventListener('touchend', endTouch, { passive: false });
+  canvas.addEventListener('touchcancel', endTouch, { passive: false });
+
+  canvas.addEventListener('mousedown', e => { mouseDown = true; onDown(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mousemove', e => { if (mouseDown) onMove(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mouseup', () => {
+    if (!mouseDown) return;
+    mouseDown = false;
+    onUp();
+  });
+
+  // ---------------------------------------------------------------------
+  // Parent view (hidden, local data only)
+  // ---------------------------------------------------------------------
+  const parentEl = document.getElementById('parent');
+  const parentBody = document.getElementById('parentBody');
+
+  function el(tag, text) {
+    const node = document.createElement(tag);
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function swatches(colors) {
+    const wrap = el('span');
+    colors.forEach(c => {
+      const s = el('span');
+      s.className = 'swatch';
+      s.style.background = PAINT[c] ? PAINT[c].hex : '#FFFFFF';
+      s.title = PAINT[c] ? PAINT[c].name : String(c);
+      wrap.appendChild(s);
+    });
+    return wrap;
+  }
+
+  function openParent() {
+    parentTimer = null;
+    const taps = progress.fills + progress.misses;
+    const fav = Object.keys(progress.colorCounts).sort((a, b) => progress.colorCounts[b] - progress.colorCounts[a])[0];
+
+    parentBody.textContent = '';
+    parentBody.appendChild(el('div', `Full games finished: ${progress.gamesCompleted}`));
+    parentBody.appendChild(el('div', `Pictures colored: ${progress.roundsCompleted}`));
+    parentBody.appendChild(el('div', `Taps that landed on a region: ${taps ? Math.round(100 * progress.fills / taps) : 0}%`));
+    if (fav && PAINT[fav]) {
+      const row = el('div', 'Most used color: ');
+      row.appendChild(swatches([fav]));
+      row.appendChild(document.createTextNode(PAINT[fav].name));
+      parentBody.appendChild(row);
+    }
+
+    // The last few pictures with the colours chosen for each region.
+    const pics = progress.sessions.reduce((a, s) => a.concat(s.rounds), []).slice(-6).reverse();
+    if (pics.length) {
+      parentBody.appendChild(el('h3', 'Recent pictures'));
+      pics.forEach(r => {
+        const pic = PICTURES.find(p => p.id === r.picture);
+        const row = el('div');
+        row.appendChild(el('span', (pic ? pic.name : r.picture) + ': '));
+        row.appendChild(swatches(r.colors || []));
+        parentBody.appendChild(row);
+      });
+    }
+
+    const recent = progress.sessions.slice(-6).reverse();
+    if (recent.length) {
+      const table = el('table');
+      const head = el('tr');
+      ['When', 'Pictures', 'Top level', 'Misses'].forEach(h => head.appendChild(el('th', h)));
+      table.appendChild(head);
+      recent.forEach(s => {
+        const tr = el('tr');
+        const when = new Date(s.startedAt);
+        tr.appendChild(el('td', when.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' ' +
+          when.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })));
+        tr.appendChild(el('td', `${s.rounds.length}/${CONFIG.ROUNDS}`));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => Math.max(a, r.level), 0) || '-')));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => a + r.misses, 0))));
+        table.appendChild(tr);
+      });
+      parentBody.appendChild(table);
+    }
+    parentEl.hidden = false;
+    log('Parent view opened', progress);
+  }
+
+  parentEl.addEventListener('click', () => { parentEl.hidden = true; });
+
+  // Read-only debug hooks for the Android/desktop console.
+  // Any colour is "correct": a test can tap any pot, then any region's (x, y).
+  window.ColoringArt = {
+    progress: () => JSON.parse(JSON.stringify(progress)),
+    state: () => ({
+      phase: state.phase,
+      round: state.round,
+      level: state.tier + 1,
+      picture: state.picture ? state.picture.id : null,
+      selected: state.selected,
+      misses: state.misses,
+      pictureBox: { x: L.ox, y: L.oy, size: L.S },
+      pots: state.pots.map(p => ({ color: p.key, x: p.x, y: p.y })),
+      regions: state.regions.map(r => { const s = fromPic(r.at[0], r.at[1]); return { id: r.id, color: r.color, area: Math.round(r.area), x: s.x, y: s.y }; }),
+    }),
+  };
+
+  // ---------------------------------------------------------------------
+  // Drawing the picture
+  // ---------------------------------------------------------------------
+  // Apply a pose (list of steps) in picture space.
+  function applyPose(pose) {
+    if (!pose) return;
+    for (const s of pose) {
+      ctx.translate(s.x + s.px, s.y + s.py);
+      if (s.r) ctx.rotate(s.r);
+      if (s.sx !== 1 || s.sy !== 1) ctx.scale(s.sx, s.sy);
+      ctx.translate(-s.px, -s.py);
+    }
+  }
+
+  // Line-art helpers handed to each picture's details(); all in picture space.
+  function detailKit(k, amp, lw, pic) {
+    const ink = (w) => { ctx.strokeStyle = COLORS.ink; ctx.lineWidth = lw * (w || 1); ctx.lineCap = 'round'; ctx.lineJoin = 'round'; };
+    const d = {
+      k: k > 0 ? k : 0,
+      blink: k > 0 && (k % 2.6) > 2.45,
+      part(name, fn) {
+        ctx.save();
+        if (k > 0 && pic.pose) applyPose(pic.pose(name, k, amp));
+        fn();
+        ctx.restore();
+      },
+      offsetY(name) {
+        const pose = k > 0 && pic.pose ? pic.pose(name, k, amp) : null;
+        return pose ? pose.reduce((a, s) => a + s.y, 0) : 0;
+      },
+      clipTo(regionId, fn) {
+        const r = state.regions.find(x => x.id === regionId);
+        if (!r) return;
+        ctx.save();
+        ctx.clip(r.path);
+        fn();
+        ctx.restore();
+      },
+      line(x1, y1, x2, y2, w) { ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ink(w); ctx.stroke(); },
+      curve(x1, y1, cx, cy, x2, y2, w) { ctx.beginPath(); ctx.moveTo(x1, y1); ctx.quadraticCurveTo(cx, cy, x2, y2); ink(w || 0.7); ctx.stroke(); },
+      arc(x, y, r, a0, a1, w, color) { ctx.beginPath(); ctx.arc(x, y, r, a0, a1); ink(w || 0.8); if (color) ctx.strokeStyle = color; ctx.stroke(); },
+      ring(x, y, r, w, alpha) {
+        ctx.globalAlpha = alpha === undefined ? 1 : alpha;
+        ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ink(w || 0.7); ctx.stroke();
+        ctx.globalAlpha = 1;
+      },
+      dot(x, y, r) { ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.fillStyle = COLORS.ink; ctx.fill(); },
+      // An eye: white with a dark pupil and a tiny shine (a closed line while blinking).
+      eye(x, y, r, closed) {
+        if (closed) { d.line(x - r, y, x + r, y, 0.8); return; }
+        ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.fillStyle = '#FFFFFF'; ctx.fill(); ink(0.7); ctx.stroke();
+        ctx.beginPath(); ctx.arc(x + r * 0.15, y + r * 0.1, r * 0.55, 0, TAU); ctx.fillStyle = COLORS.ink; ctx.fill();
+        ctx.beginPath(); ctx.arc(x + r * 0.32, y - r * 0.12, r * 0.18, 0, TAU); ctx.fillStyle = '#FFFFFF'; ctx.fill();
+      },
+      loop(x, y, side) { ctx.beginPath(); ctx.ellipse(x, y - 0.5, 3.5, 2, side * 0.4, 0, TAU); ink(0.7); ctx.stroke(); },
+      wave(x0, y, x1, w) {
+        ctx.beginPath(); ctx.moveTo(x0, y);
+        for (let x = x0; x < x1; x += 8) ctx.quadraticCurveTo(x + 2, y - 2.5, x + 4, y), ctx.quadraticCurveTo(x + 6, y + 2.5, x + 8, y);
+        ink(w); ctx.stroke();
+      },
+      twinkle(x, y, r) {
+        ctx.beginPath();
+        for (let i = 0; i < 8; i++) {
+          const rad = i % 2 === 0 ? r : r * 0.38;
+          const a = -Math.PI / 2 + i * Math.PI / 4;
+          if (i === 0) ctx.moveTo(x + rad * Math.cos(a), y + rad * Math.sin(a)); else ctx.lineTo(x + rad * Math.cos(a), y + rad * Math.sin(a));
+        }
+        ctx.closePath(); ink(0.6); ctx.stroke();
+      },
+    };
+    return d;
+  }
+
+  // glows: Map(region -> 0..1) of soft golden outlines for idle prompts and hints.
+  function drawPicture(t, glows) {
+    const pic = state.picture;
+    const sc = L.S / 100;
+    const lw = clamp(L.S * 0.013, 2.5, 6) / sc;
+    const alive = state.phase === 'celebrate';
+    const k = alive ? Math.max(0.001, (t - state.celebrateStart) / 1000) : 0;
+    const amp = alive ? (reduceMotion ? 0.35 : 1) * easeOutCubic(clamp(k / 0.5, 0, 1)) : 0;
+
+    ctx.save();
+    ctx.translate(L.ox, L.oy);
+    ctx.scale(sc, sc);
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    const kit = detailKit(k, amp, lw, pic);
+    if (pic.underDetails) pic.underDetails(kit);
+
+    for (const r of state.regions) {
+      ctx.save();
+      if (alive && pic.pose) applyPose(pic.pose(r.part, k, amp));
+      const p = fillProgress(r, t);
+      const hex = r.color ? PAINT[r.color].hex : COLORS.paper;
+      if (p < 1) {
+        // The pour: the new colour spreads out from the tapped point inside the region.
+        ctx.fillStyle = r.from ? PAINT[r.from].hex : COLORS.paper;
+        ctx.fill(r.path);
+        ctx.save();
+        ctx.clip(r.path);
+        const rad = r.fr * easeOutCubic(p);
+        ctx.beginPath();
+        ctx.arc(r.fx, r.fy, rad, 0, TAU);
+        ctx.fillStyle = hex;
+        ctx.fill();
+        ctx.globalAlpha = 0.55 * (1 - p);
+        ctx.lineWidth = lw * 1.6;
+        ctx.strokeStyle = shade(PAINT[r.color].hex, 0.35);
+        ctx.stroke();
+        ctx.restore();
+      } else {
+        ctx.fillStyle = hex;
+        ctx.fill(r.path);
+      }
+      ctx.lineWidth = lw;
+      ctx.strokeStyle = COLORS.ink;
+      ctx.stroke(r.path);
+      ctx.restore();
+    }
+
+    pic.details(kit);
+
+    // Prompts and hints: a soft golden line traced over the region's outline.
+    for (const [r, g] of glows) {
+      if (g <= 0) continue;
+      ctx.save();
+      ctx.globalAlpha = 0.35 + 0.45 * g;
+      ctx.lineWidth = lw * (2 + 1.6 * g);
+      ctx.strokeStyle = COLORS.star;
+      ctx.stroke(r.path);
+      ctx.globalAlpha = 1;
+      ctx.lineWidth = lw;
+      ctx.strokeStyle = COLORS.ink;
+      ctx.stroke(r.path);
+      ctx.restore();
+    }
+    ctx.restore();
+  }
+
+  // ---------------------------------------------------------------------
+  // Drawing the paint pots
+  // ---------------------------------------------------------------------
+  function roundRectPath(x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  // A little glass jar of paint. The chosen one lifts up and gets a soft halo.
+  function drawPot(pot, t, pulse, wobble, glow) {
+    const paint = PAINT[pot.key];
+    const s = L.p * pulse;
+    const chosen = state.selected === pot.key;
+    const lift = chosen ? easeOutCubic(clamp((t - state.selectT0) / CONFIG.LIFT_MS, 0, 1)) : 0;
+    const x = pot.x, y = pot.y - lift * L.p * 0.14;
+
+    // Shadow on the "table" stays put while the jar lifts.
+    ctx.globalAlpha = 0.14 - lift * 0.05;
+    ctx.fillStyle = COLORS.ink;
+    ctx.beginPath();
+    ctx.ellipse(pot.x, pot.y + L.p * 0.42, L.p * 0.32 * (1 - lift * 0.15), L.p * 0.06, 0, 0, TAU);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+
+    ctx.save();
+    ctx.translate(x, y);
+    if (wobble) ctx.rotate(wobble);
+    const k = chosen ? 1 + 0.1 * lift : 1;
+    ctx.scale(k, k);
+
+    if (chosen || glow > 0) {
+      const g = chosen ? 1 : glow;
+      ctx.globalAlpha = 0.25 + 0.3 * g;
+      ctx.fillStyle = chosen ? shade(paint.hex, 0.55) : COLORS.star;
+      ctx.beginPath();
+      ctx.arc(0, s * 0.08, s * 0.55, 0, TAU);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    const bw = s * 0.62, bh = s * 0.58, by = -s * 0.2;
+    // Jar body with the paint inside.
+    ctx.beginPath();
+    roundRectPath(-bw / 2, by, bw, bh, s * 0.14);
+    ctx.fillStyle = COLORS.jar;
+    ctx.fill();
+    ctx.save();
+    ctx.clip();
+    ctx.fillStyle = paint.hex;
+    ctx.fillRect(-bw / 2, by + bh * 0.2, bw, bh);
+    ctx.globalAlpha = 0.25;
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillRect(-bw * 0.36, by + bh * 0.28, bw * 0.12, bh * 0.56);
+    ctx.restore();
+    ctx.lineWidth = Math.max(2, s * 0.04);
+    ctx.strokeStyle = shade(paint.hex, -0.3);
+    ctx.stroke();
+
+    // Rim, and the shiny paint surface seen from just above.
+    ctx.beginPath();
+    roundRectPath(-bw * 0.56, by - s * 0.08, bw * 1.12, s * 0.13, s * 0.06);
+    ctx.fillStyle = COLORS.rim;
+    ctx.fill();
+    ctx.lineWidth = Math.max(1.5, s * 0.03);
+    ctx.strokeStyle = shade(COLORS.rim, -0.3);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.ellipse(0, by - s * 0.015, bw * 0.44, s * 0.045, 0, 0, TAU);
+    ctx.fillStyle = shade(paint.hex, 0.15);
+    ctx.fill();
+
+    // A drip over the lip so each pot reads as "paint", not "button".
+    ctx.beginPath();
+    ctx.moveTo(bw * 0.12, by - s * 0.03);
+    ctx.quadraticCurveTo(bw * 0.2, by + s * 0.1, bw * 0.16, by + s * 0.16);
+    ctx.arc(bw * 0.16 - s * 0.035, by + s * 0.16, s * 0.035, 0, Math.PI);
+    ctx.quadraticCurveTo(bw * 0.04, by + s * 0.05, bw * 0.02, by - s * 0.03);
+    ctx.closePath();
+    ctx.fillStyle = paint.hex;
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // ---------------------------------------------------------------------
+  // Effects and shared screens
+  // ---------------------------------------------------------------------
+  // Paint droplets from the tapped point: the same six every time.
+  function drawSplashes(t) {
+    state.splashes = state.splashes.filter(s => t - s.t0 < CONFIG.SPLASH_MS);
+    for (const s of state.splashes) {
+      const k = (t - s.t0) / CONFIG.SPLASH_MS;
+      const e = easeOutCubic(k);
+      ctx.globalAlpha = 1 - k;
+      ctx.fillStyle = s.color;
+      for (let i = 0; i < 6; i++) {
+        const a = -Math.PI / 2 + (i - 2.5) * 0.55;
+        const dist = L.S * 0.07 * e;
+        ctx.beginPath();
+        ctx.arc(s.x + Math.cos(a) * dist, s.y + Math.sin(a) * dist + L.S * 0.03 * k * k, L.S * 0.011 * (1 - k * 0.4), 0, TAU);
+        ctx.fill();
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawStar(cx, cy, R, fill, face) {
+    ctx.save();
+    ctx.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const rad = i % 2 === 0 ? R : R * 0.5;
+      const a = -Math.PI / 2 + i * Math.PI / 5;
+      const x = cx + rad * Math.cos(a), y = cy + rad * Math.sin(a);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    ctx.lineJoin = 'round';
+    if (fill) {
+      ctx.fillStyle = fill;
+      ctx.fill();
+      ctx.strokeStyle = fill;            // same-colour stroke rounds the tips
+      ctx.lineWidth = Math.max(2, R * 0.16);
+      ctx.stroke();
+    } else {
+      ctx.strokeStyle = 'rgba(74, 64, 54, 0.25)';
+      ctx.lineWidth = Math.max(2, R * 0.14);
+      ctx.stroke();
+    }
+
+    if (face) {
+      ctx.fillStyle = COLORS.ink;
+      ctx.beginPath(); ctx.arc(cx - R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.arc(cx + R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.strokeStyle = COLORS.ink;
+      ctx.lineWidth = Math.max(2, R * 0.05);
+      ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.arc(cx, cy + R * 0.06, R * 0.17, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+      ctx.globalAlpha = 0.35;
+      ctx.fillStyle = COLORS.cheek;
+      ctx.beginPath(); ctx.ellipse(cx - R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(cx + R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // Same ring of sparkles around the finished picture, every time (no random rewards).
+  function spawnParticles(t) {
+    const cx = L.ox + L.S / 2, cy = L.oy + L.S / 2;
+    const used = state.regions.map(r => PAINT[r.color].hex);
+    for (let i = 0; i < 16; i++) {
+      const a = i * TAU / 16;
+      state.particles.push({ x0: cx + Math.cos(a) * L.S * 0.3, y0: cy + Math.sin(a) * L.S * 0.3, dx: Math.cos(a), dy: Math.sin(a), dist: L.S * 0.22, t0: t, life: 1100, color: i % 2 ? COLORS.star : used[i % used.length] });
+    }
+  }
+
+  function drawParticles(t) {
+    state.particles = state.particles.filter(p => t - p.t0 < p.life);
+    for (const p of state.particles) {
+      const k = (t - p.t0) / p.life;
+      const e = easeOutCubic(k);
+      ctx.globalAlpha = 1 - k;
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x0 + p.dx * p.dist * e, p.y0 + p.dy * p.dist * e, L.S * 0.016 * (1 - k * 0.5), 0, TAU);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function starGeom() {
+    return { cx: W / 2, cy: H * 0.42, R: Math.min(W, H) * 0.2 };
+  }
+
+  // Start and between-round screen: one big pulsing star to tap, plus 5 slots
+  // that fill up so the child can see the end coming.
+  function drawStarScreen(t) {
+    const { cx, cy, R } = starGeom();
+    const amp = reduceMotion ? 0.03 : 0.07;
+    const k = 1 + amp * (0.5 - 0.5 * Math.cos(TAU * t / 1400));
+    drawStar(cx, cy, R * k, COLORS.star, true);
+
+    const sr = R * 0.16, gap = sr * 2.8, y = cy + R * 1.35;
+    for (let i = 0; i < CONFIG.ROUNDS; i++) {
+      drawStar(cx + (i - (CONFIG.ROUNDS - 1) / 2) * gap, y, sr, i < state.round ? COLORS.star : null, false);
+    }
+  }
+
+  function fitFont(text, weight, size, maxW) {
+    ctx.font = `${weight} ${size}px ${FONT}`;
+    while (size > 12 && ctx.measureText(text).width > maxW) {
+      size -= 1;
+      ctx.font = `${weight} ${size}px ${FONT}`;
+    }
+    return size;
+  }
+
+  // Static end screen. No buttons: the session is over.
+  function drawEnd() {
+    const gh = H * 0.14;
+    ctx.fillStyle = COLORS.grass;
+    ctx.beginPath();
+    ctx.moveTo(0, H - gh);
+    ctx.quadraticCurveTo(W / 2, H - gh * 1.5, W, H - gh);
+    ctx.lineTo(W, H);
+    ctx.lineTo(0, H);
+    ctx.closePath();
+    ctx.fill();
+
+    const R = Math.min(W, H) * 0.2;
+    const cy = H * 0.36;
+    drawStar(W / 2, cy, R, COLORS.star, true);
+
+    const big = clamp(Math.min(W, H) * 0.1, 26, 68);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = COLORS.ink;
+    const top = cy + R * 1.25;
+    fitFont('Great Job!', 800, big, W * 0.9);
+    ctx.fillText('Great Job!', W / 2, top + big * 0.5);
+    fitFont('Time to play outside!', 700, Math.round(big * 0.62), W * 0.9);
+    ctx.fillText('Time to play outside!', W / 2, top + big * 1.55);
+  }
+
+  // What to prompt right now.
+  //  - No colour chosen and idle: the pots pulse one after another.
+  //  - Colour chosen and idle: the biggest empty region glows softly.
+  //  - After 2 misses: the empty region nearest the last miss glows (scaffolding).
+  //  - First round, mechanic not found after 5 s: a stronger glow on the first pot / an empty region.
+  function guidance(t) {
+    const out = { potPulse: 0, potHint: null, glows: new Map() };
+    if (state.phase !== 'play') return out;
+    const idle = t - state.lastInteraction;
+    const empty = state.regions.filter(r => !r.color);
+    const wave = 0.5 - 0.5 * Math.cos(TAU * Math.max(0, idle - CONFIG.IDLE_PULSE_MS) / 1300);
+    const tutorial = state.round === 0 && state.fills === 0 && idle > CONFIG.TUTORIAL_HINT_MS;
+
+    if (state.missStreak >= 2 && empty.length && state.lastMiss) {
+      const m = state.lastMiss;
+      const near = empty.reduce((a, r) => (Math.hypot(r.at[0] - m.x, r.at[1] - m.y) < Math.hypot(a.at[0] - m.x, a.at[1] - m.y) ? r : a));
+      out.glows.set(near, 0.5 + 0.5 * Math.sin(TAU * t / 1300));
+    }
+    if (idle <= CONFIG.IDLE_PULSE_MS) return out;
+
+    if (!state.selected) {
+      out.potPulse = idle - CONFIG.IDLE_PULSE_MS;
+      if (tutorial && state.pots.length) out.potHint = { pot: state.pots[0], g: wave };
+    } else if (empty.length && !out.glows.size) {
+      const big = empty.reduce((a, r) => (r.area > a.area ? r : a));
+      out.glows.set(big, (tutorial ? 1 : 0.45) * wave);
+    }
+    return out;
+  }
+
+  function drawPlay(t) {
+    const g = guidance(t);
+    drawPicture(t, g.glows);
+
+    // The pots stay on screen while the picture plays, but only prompt during play.
+    {
+      const amp = reduceMotion ? 0.03 : 0.08;
+      const nk = (t - state.nudgeT0) / CONFIG.NUDGE_MS;
+      state.pots.forEach((pot, i) => {
+        // Staggered idle pulse: one pot after another, like a gentle "pick me" wave.
+        let pulse = 1;
+        if (g.potPulse > 0) {
+          const ph = (g.potPulse / 1300 - i * 0.18) * TAU;
+          pulse = 1 + amp * Math.max(0, Math.sin(ph));
+        }
+        const wobble = nk >= 0 && nk < 1 && !reduceMotion ? Math.sin(nk * TAU * 2 + i) * 0.12 * (1 - nk) : 0;
+        const glow = g.potHint && g.potHint.pot === pot ? g.potHint.g : 0;
+        drawPot(pot, t, pulse, wobble, glow);
+      });
+    }
+    drawSplashes(t);
+    drawParticles(t);
+  }
+
+  // ---------------------------------------------------------------------
+  // Main loop
+  // ---------------------------------------------------------------------
+  function update(t) {
+    if (state.phase === 'play' && state.completeAt && t >= state.completeAt) {
+      state.completeAt = 0;
+      completeRound();
+    }
+
+    if (state.phase === 'celebrate' && t - state.celebrateStart >= CONFIG.CELEBRATE_MS) {
+      if (state.round >= CONFIG.ROUNDS) enterEnd();
+      else state.phase = 'between';
+    }
+  }
+
+  function render(t) {
+    ctx.fillStyle = COLORS.bg;
+    ctx.fillRect(0, 0, W, H);
+    if (state.phase === 'start' || state.phase === 'between') drawStarScreen(t);
+    else if (state.phase === 'play' || state.phase === 'celebrate') drawPlay(t);
+    else if (state.phase === 'end') drawEnd();
+  }
+
+  let rafId = 0;
+  function frame(t) {
+    update(t);
+    render(t);
+    // The end screen is static: stop the loop entirely.
+    if (state.phase !== 'end') rafId = requestAnimationFrame(frame);
+  }
+
+  function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    DPR = Math.min(window.devicePixelRatio || 1, 2.5);
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    computeLayout();
+    if (state.phase === 'end') render(now());
+  }
+
+  window.addEventListener('resize', resize);
+  window.addEventListener('orientationchange', resize);
+
+  resize();
+  log('Game loaded', { roundsPerSession: CONFIG.ROUNDS, gamesCompletedBefore: progress.gamesCompleted });
+  rafId = requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

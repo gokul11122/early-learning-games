@@ -1,0 +1,1462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Phonics Sound Blending</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
+  body {
+    background: #F6F1E7;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  canvas { display: block; width: 100%; height: 100%; }
+
+  #home {
+    position: fixed; top: max(10px, env(safe-area-inset-top)); right: max(10px, env(safe-area-inset-right));
+    width: 52px; height: 52px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+    background: rgba(255, 253, 248, 0.85); box-shadow: 0 2px 8px rgba(74, 64, 54, 0.15);
+    -webkit-tap-highlight-color: transparent; z-index: 5;
+  }
+  #home:active { transform: scale(0.94); }
+
+  /* Hidden parent view: press and hold the top-left corner for 3 seconds. */
+  #parent {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: rgba(74, 64, 54, 0.55); padding: 16px; box-sizing: border-box; z-index: 10;
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #4A4036;
+  }
+  #parent[hidden] { display: none; }
+  #parent .card { background: #FFFDF8; border-radius: 16px; padding: 20px 22px; max-width: 380px; width: 100%; box-shadow: 0 10px 30px rgba(0,0,0,0.18); }
+  #parent h2 { margin: 0 0 10px; font-size: 18px; }
+  #parent table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+  #parent th, #parent td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #EDE5D6; }
+  #parent .hint { margin: 12px 0 0; font-size: 12px; opacity: 0.7; }
+</style>
+</head>
+<body>
+<canvas id="game" aria-label="Phonics sound blending game"></canvas>
+<a id="home" href="../../index.html" aria-label="Home">
+  <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><path d="M4 11.5 12 5l8 6.5V19a1 1 0 0 1-1 1h-4.5v-5h-5v5H5a1 1 0 0 1-1-1z" fill="none" stroke="#4A4036" stroke-width="2" stroke-linejoin="round"/></svg>
+</a>
+
+<div id="parent" hidden>
+  <div class="card">
+    <h2>Progress on this device</h2>
+    <div id="parentBody"></div>
+    <p class="hint">Stored only on this device. Tap anywhere to close.</p>
+  </div>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  /* =====================================================================
+   * PHONICS SOUND BLENDING
+   * ELOF domain: Language and Literacy (phonological awareness: blending
+   *              the sounds of consonant-vowel-consonant words).
+   *
+   * Design rules this file follows (from the brief):
+   *  - Coherence: three animal friends, each holding one letter of the word,
+   *    then a slider to blend, then two or three pictures. Nothing else.
+   *  - Each step unlocks the next: tap every friend to hear its sound, slide
+   *    along the arrow to push the sounds together, tap the matching picture.
+   *  - The picture choice is the checkable task and works by sight alone:
+   *    the letters on the signs are the word, so it is playable without speech.
+   *  - Control of error: a wrong picture wobbles and nothing else happens.
+   *  - Self-paced: no timers anywhere the child can see or feel.
+   *  - Natural stopping point: 5 rounds of 2 words, then "play outside".
+   * ===================================================================== */
+
+  // ---------------------------------------------------------------------
+  // Configuration
+  // ---------------------------------------------------------------------
+  const CONFIG = {
+    ROUNDS: 5,                     // hard session limit (natural stopping point)
+    WORDS_PER_ROUND: 2,
+    STORAGE_KEY: 'phonics-sound-blending.v1',
+    IDLE_PULSE_MS: 1500,           // idle time before the next thing to do pulses
+    TUTORIAL_HINT_MS: 5000,        // idle time before the stronger hint
+    HOP_MS: 420,                   // a friend's hop when tapped
+    WOBBLE_MS: 480,                // wrong picture: gentle wobble
+    MERGE_MS: 650,                 // friends huddle together once the slide is done
+    BLEND_TO_PICK_MS: 1500,        // pause after blending before the pictures appear
+    POP_MS: 360,                   // pictures pop in
+    WORD_DONE_MS: 1400,            // after the right picture, before the next word
+    CELEBRATE_MS: 1600,            // round-complete celebration length
+    FAST_MS_PER_WORD: 14000,       // "quick" threshold for difficulty step-up
+    PARENT_HOLD_MS: 3000,          // hold time for the hidden parent view
+    PARENT_CORNER_PX: 80,
+    HOME_RESERVE_PX: 72,           // top-right square kept clear of the home button
+    SLIDE_MAX_STEP: 0.2,           // most the slider may advance in one move (no skipping)
+    SLIDE_DONE: 0.97,              // slider fraction that counts as "blended"
+  };
+
+  const COLORS = {
+    bg: '#F6F1E7',
+    ink: '#4A4036',
+    card: '#FFFDF8',
+    signEdge: '#E3D8C6',
+    track: '#EDE3D2',
+    slide: '#F6C85F',
+    star: '#F6C85F',
+    grass: '#B9D7A8',
+    cheek: '#F2A88A',
+  };
+
+  const FONT = 'ui-rounded, "Arial Rounded MT Bold", "Nunito", system-ui, -apple-system, sans-serif';
+
+  // The three friends never change, so each keeps its own voice (pitch + timbre)
+  // and the child can follow the sounds without speech.
+  const FRIENDS = [
+    { kind: 'elephant', color: '#A9BCD0', accent: '#8FB8DE', note: 261.63, wave: 'triangle' },
+    { kind: 'bear',     color: '#C69C72', accent: '#F2A88A', note: 392.0,  wave: 'sine' },
+    { kind: 'bunny',    color: '#EFE3D3', accent: '#9CCB9A', note: 587.33, wave: 'sine' },
+  ];
+
+  // Phoneme-ish strings that speech synthesis reads as the letter's SOUND, not its name.
+  const SOUNDS = {
+    a: 'ah', b: 'buh', c: 'kuh', d: 'duh', e: 'eh', f: 'fff', g: 'guh', h: 'huh', i: 'ih',
+    m: 'mmm', n: 'nnn', o: 'aw', p: 'puh', r: 'rrr', s: 'sss', t: 'tuh', u: 'uh', x: 'kss',
+  };
+
+  // Every word has a picture drawn in code below.
+  const WORDS = ['cat', 'hat', 'bat', 'dog', 'fox', 'box', 'sun', 'bus', 'bug', 'rug', 'pig', 'bed', 'cup', 'hen', 'pen', 'net', 'map', 'mop'];
+
+  // Difficulty ladder for dynamic difficulty adjustment (scaffolding).
+  const TIERS = [
+    { pictures: 2, similar: false, tapFirst: true  }, // 2 pictures, words share no letters in place
+    { pictures: 3, similar: false, tapFirst: true  }, // 3 pictures, still clearly different
+    { pictures: 3, similar: true,  tapFirst: true  }, // distractors differ by one letter (cat, hat, bat)
+    { pictures: 3, similar: true,  tapFirst: false }, // blend straight away, no forced tap step
+  ];
+
+  const TAU = Math.PI * 2;
+  const reduceMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+
+  // ---------------------------------------------------------------------
+  // Small helpers
+  // ---------------------------------------------------------------------
+  const now = () => performance.now();
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const easeOutCubic = t => 1 - Math.pow(1 - t, 3);
+  const easeInOutQuad = t => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
+  const easeOutBack = t => { const c = 1.6; return 1 + (c + 1) * Math.pow(t - 1, 3) + c * Math.pow(t - 1, 2); };
+  const log = (...args) => console.log('[Blend]', ...args);
+
+  function shuffle(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }
+
+  // Mix a hex colour toward black (amt < 0) or white (amt > 0).
+  const shadeCache = new Map();
+  function shade(hex, amt) {
+    const key = hex + amt;
+    if (shadeCache.has(key)) return shadeCache.get(key);
+    const n = parseInt(hex.slice(1), 16);
+    const target = amt < 0 ? 0 : 255;
+    const p = Math.abs(amt);
+    const c = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map(v => Math.round(lerp(v, target, p)));
+    const out = `rgb(${c[0]},${c[1]},${c[2]})`;
+    shadeCache.set(key, out);
+    return out;
+  }
+
+  // Number of letter positions in which two CVC words differ.
+  const distance = (a, b) => [0, 1, 2].reduce((n, i) => n + (a[i] !== b[i] ? 1 : 0), 0);
+  const hasNeighbour = w => WORDS.some(o => o !== w && distance(o, w) === 1);
+
+  // ---------------------------------------------------------------------
+  // Canvas setup
+  // ---------------------------------------------------------------------
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  let W = 0, H = 0, DPR = 1;
+
+  // Layout values recomputed on every resize.
+  const L = { m: 16, u: 100, baseY: 0, spread: 0, cardS: 100, bandTop: 0, bandH: 0, arrowY: 0 };
+
+  // ---------------------------------------------------------------------
+  // Game state
+  // ---------------------------------------------------------------------
+  const state = {
+    phase: 'start',          // 'start' | 'play' | 'celebrate' | 'between' | 'end'
+    step: 'tap',             // within a word: 'tap' | 'blend' | 'merge' | 'pick' | 'done'
+    round: 0,                // rounds completed this session
+    tier: 0,                 // index into TIERS
+    words: [],               // the round's target words
+    wordIndex: 0,
+    word: '',
+    friends: [],             // { letter, tapped, hopT0, x, y }
+    pictures: [],            // { word, correct, wobbleT0, x, y, s, fade }
+    slide: 0,                // blend slider progress 0..1
+    sliding: false,
+    mergeT0: 0,
+    pickT0: 0,               // when the pictures appeared
+    stepT0: 0,               // when the current step began
+    wordErrors: 0,           // wrong picture taps for the current word
+    lastInteraction: 0,
+    roundStart: 0,
+    roundErrors: 0,          // wrong picture taps this round
+    firstTryWords: 0,
+    completeAt: 0,           // time to fire nextWord() / completeRound()
+    celebrateStart: 0,
+    particles: [],
+    usedWords: new Set(),    // targets already used this session
+  };
+
+  // ---------------------------------------------------------------------
+  // Local progress tracking (localStorage, never leaves the device)
+  // ---------------------------------------------------------------------
+  function freshProgress() {
+    return { version: 1, gamesCompleted: 0, roundsCompleted: 0, wordsBlended: 0, wrongPicks: 0, lastPlayed: null, sessions: [] };
+  }
+
+  function loadProgress() {
+    try {
+      const raw = window.localStorage.getItem(CONFIG.STORAGE_KEY);
+      if (raw) {
+        const data = JSON.parse(raw);
+        if (data && data.version === 1 && Array.isArray(data.sessions)) return data;
+      }
+    } catch (e) {
+      console.warn('[Blend] Progress could not be loaded (storage unavailable):', e && e.message);
+    }
+    return freshProgress();
+  }
+
+  function saveProgress() {
+    try {
+      window.localStorage.setItem(CONFIG.STORAGE_KEY, JSON.stringify(progress));
+      log('Progress saved', { gamesCompleted: progress.gamesCompleted, roundsCompleted: progress.roundsCompleted });
+    } catch (e) {
+      console.warn('[Blend] Progress could not be saved (storage unavailable):', e && e.message);
+    }
+  }
+
+  const progress = loadProgress();
+  let session = null; // created on the first round of this app launch
+
+  function ensureSession() {
+    if (session) return;
+    session = { startedAt: new Date().toISOString(), finished: false, rounds: [] };
+    progress.sessions.push(session);
+    if (progress.sessions.length > 30) progress.sessions.splice(0, progress.sessions.length - 30);
+  }
+
+  // ---------------------------------------------------------------------
+  // Audio: Web Audio tones + optional spoken words
+  // ---------------------------------------------------------------------
+  let actx = null;
+
+  // Browsers only allow audio after a user gesture, so this runs on every pointer down.
+  function unlockAudio() {
+    if (!actx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) { try { actx = new AC(); } catch (e) { actx = null; } }
+    }
+    if (actx && actx.state === 'suspended') actx.resume();
+  }
+
+  function tone(freq, delay, dur, vol = 0.16, type = 'sine') {
+    if (!actx) return;
+    const t = actx.currentTime + delay;
+    const osc = actx.createOscillator();
+    const gain = actx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(vol, t + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    osc.connect(gain).connect(actx.destination);
+    osc.start(t);
+    osc.stop(t + dur + 0.05);
+  }
+
+  // Each friend's voice: a short two-note call in its own pitch and timbre.
+  const playVoice = (i, delay = 0) => { const f = FRIENDS[i]; tone(f.note, delay, 0.22, 0.15, f.wave); tone(f.note * 1.25, delay + 0.08, 0.22, 0.08, f.wave); };
+  const playBlend = () => { [0, 1, 2].forEach(i => playVoice(i, i * 0.16)); FRIENDS.forEach(f => tone(f.note * 2, 0.55, 0.6, 0.06)); };
+  const playChime = () => { tone(659.25, 0, 0.35); tone(987.77, 0.07, 0.4, 0.1); };
+  const playRoundDone = () => [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => tone(f, i * 0.12, 0.5, 0.12));
+
+  // Spoken words via the Web Speech API. Android WebView usually lacks it,
+  // so this quietly does nothing there and the tones carry the feedback.
+  function say(text) {
+    try {
+      if (!('speechSynthesis' in window)) return;
+      window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'en-US';
+      u.rate = 0.8;
+      u.pitch = 1.15;
+      window.speechSynthesis.speak(u);
+    } catch (e) { /* speech is optional */ }
+  }
+
+  // ---------------------------------------------------------------------
+  // Rounds, words and difficulty
+  // ---------------------------------------------------------------------
+  function pickTargets(tier) {
+    let pool = WORDS.filter(w => !state.usedWords.has(w) && (!tier.similar || hasNeighbour(w)));
+    if (pool.length < CONFIG.WORDS_PER_ROUND) pool = WORDS.filter(w => !tier.similar || hasNeighbour(w));
+    // The two words of a round are never one-letter neighbours, so the second
+    // word never shows the very same set of pictures again.
+    const picked = [];
+    for (const w of shuffle(pool.slice())) {
+      if (picked.length >= CONFIG.WORDS_PER_ROUND) break;
+      if (picked.every(p => distance(p, w) >= 2)) picked.push(w);
+    }
+    for (const w of shuffle(WORDS.slice())) {
+      if (picked.length >= CONFIG.WORDS_PER_ROUND) break;
+      if (!picked.includes(w) && (!tier.similar || hasNeighbour(w))) picked.push(w);
+    }
+    picked.forEach(w => state.usedWords.add(w));
+    return picked;
+  }
+
+  // Distractor pictures: clearly different words on the easy levels,
+  // nearest neighbours (one letter changed) on the harder ones.
+  function distractorsFor(target, tier) {
+    const others = shuffle(WORDS.filter(w => w !== target));
+    const need = tier.pictures - 1;
+    if (tier.similar) {
+      return others.sort((a, b) => distance(a, target) - distance(b, target)).slice(0, need);
+    }
+    const minD = tier.pictures === 2 ? 3 : 2;
+    const far = others.filter(w => distance(w, target) >= minD);
+    return (far.length >= need ? far : others).slice(0, need);
+  }
+
+  function startRound() {
+    ensureSession();
+    const tier = TIERS[state.tier];
+    state.words = pickTargets(tier);
+    state.wordIndex = 0;
+    state.roundErrors = 0;
+    state.firstTryWords = 0;
+    state.completeAt = 0;
+    state.particles = [];
+    state.phase = 'play';
+    state.roundStart = now();
+    setupWord();
+    if (state.round === 0) say('Tap each friend to hear its sound.');
+    log(`Round ${state.round + 1}/${CONFIG.ROUNDS} started at level ${state.tier + 1}: ${state.words.join(', ')}`);
+  }
+
+  function setupWord() {
+    const tier = TIERS[state.tier];
+    const t = now();
+    state.word = state.words[state.wordIndex];
+    state.friends = [0, 1, 2].map(i => ({ letter: state.word[i], tapped: false, hopT0: t + i * 90, x: 0, y: 0 }));
+    const choices = shuffle([state.word].concat(distractorsFor(state.word, tier)));
+    state.pictures = choices.map(w => ({ word: w, correct: w === state.word, wobbleT0: -1e9, x: 0, y: 0, s: 0, fade: 0 }));
+    state.slide = 0;
+    state.sliding = false;
+    state.wordErrors = 0;
+    state.step = tier.tapFirst ? 'tap' : 'blend';
+    state.stepT0 = t;
+    state.lastInteraction = t;
+    computeLayout();
+    log(`Word ${state.wordIndex + 1}/${CONFIG.WORDS_PER_ROUND}: "${state.word}", pictures ${choices.join(', ')}${tier.tapFirst ? '' : ' (no tap step)'}`);
+  }
+
+  function tapFriend(i) {
+    const f = state.friends[i];
+    f.hopT0 = now();
+    playVoice(i);
+    say(SOUNDS[f.letter]);
+    if (!f.tapped) {
+      f.tapped = true;
+      log(`Friend ${i + 1} tapped: "${f.letter}" says "${SOUNDS[f.letter]}"`);
+    }
+    if (state.step === 'tap' && state.friends.every(x => x.tapped)) {
+      state.step = 'blend';
+      state.stepT0 = now();
+      log('All sounds heard: blend slider ready');
+    }
+  }
+
+  // The slide reached the end: the friends huddle together and the word is spoken.
+  function finishBlend() {
+    const t = now();
+    state.slide = 1;
+    state.sliding = false;
+    state.step = 'merge';
+    state.stepT0 = t;
+    state.mergeT0 = t;
+    playBlend();
+    say(state.word.split('').map(l => SOUNDS[l]).join('... ') + '... ' + state.word + '!');
+    log(`Blended: ${state.word.split('').join('-')} -> ${state.word}`);
+  }
+
+  function tapPicture(pic) {
+    const t = now();
+    if (pic.correct) {
+      state.step = 'done';
+      state.stepT0 = t;
+      if (state.wordErrors === 0) state.firstTryWords++;
+      playChime();
+      say(`${state.word}! You put the sounds together!`);
+      state.friends.forEach((f, i) => { f.hopT0 = t + i * 80; });
+      spawnParticles(pic.x, pic.y - pic.s * 0.4, pic.s, t);
+      state.completeAt = t + CONFIG.WORD_DONE_MS;
+      log(`Answer accepted: picture "${pic.word}" for "${state.word}"`);
+    } else {
+      pic.wobbleT0 = t;
+      state.wordErrors++;
+      state.roundErrors++;
+      log(`Answer rejected: picture "${pic.word}" for "${state.word}" (slips on this word: ${state.wordErrors})`);
+    }
+  }
+
+  function nextWordOrFinish() {
+    state.wordIndex++;
+    if (state.wordIndex < CONFIG.WORDS_PER_ROUND) setupWord();
+    else completeRound();
+  }
+
+  function completeRound() {
+    const t = now();
+    const ms = t - state.roundStart;
+    const n = CONFIG.WORDS_PER_ROUND;
+    const record = {
+      level: state.tier + 1,
+      words: state.words.join(' '),
+      items: n,
+      firstTry: state.firstTryWords,
+      slips: state.roundErrors,
+      seconds: Math.round(ms / 100) / 10,
+    };
+
+    session.rounds.push(record);
+    progress.roundsCompleted++;
+    progress.wordsBlended += n;
+    progress.wrongPicks += state.roundErrors;
+    progress.lastPlayed = new Date().toISOString();
+    state.round++;
+    log('Level completed', record);
+
+    const finalRound = state.round >= CONFIG.ROUNDS;
+    if (finalRound) {
+      session.finished = true;
+      progress.gamesCompleted++;
+    } else {
+      // Praise the effort, not the child's "smartness" (growth mindset).
+      say(state.roundErrors > 0 ? 'You kept trying, and you found the words!' : 'You listened to every sound!');
+    }
+    saveProgress();
+    adjustDifficulty(record, ms);
+
+    playRoundDone();
+    state.friends.forEach((f, i) => { f.hopT0 = t + i * 100; });
+    state.phase = 'celebrate';
+    state.celebrateStart = t;
+  }
+
+  // Simple DDA: quick and clean -> one step harder; a real struggle -> one step easier.
+  function adjustDifficulty(record, ms) {
+    const fast = ms / record.items <= CONFIG.FAST_MS_PER_WORD;
+    const before = state.tier;
+    if (record.firstTry === record.items && fast) {
+      state.tier = Math.min(TIERS.length - 1, state.tier + 1);
+    } else if (record.slips >= 3) {
+      state.tier = Math.max(0, state.tier - 1);
+    }
+    if (state.tier !== before) log(`Difficulty ${state.tier > before ? 'up' : 'down'}: level ${before + 1} -> ${state.tier + 1}`);
+  }
+
+  function enterEnd() {
+    state.phase = 'end';
+    say('Great job! Time to play outside!');
+    log('Session finished: end screen shown, no replay offered');
+  }
+
+  // ---------------------------------------------------------------------
+  // Layout
+  // ---------------------------------------------------------------------
+  // Top: the three friends. Bottom band: the blend slider, later the pictures.
+  function computeLayout() {
+    const minDim = Math.min(W, H);
+    const m = clamp(minDim * 0.045, 12, 36);
+    const bandH = clamp(H * 0.36, 120, 380);
+    const bandTop = H - bandH;
+
+    const stageBottom = bandTop - m * 0.4;
+    const fit = top => {
+      const stageH = Math.max(80, stageBottom - top);
+      const u = Math.min((W - 2 * m) / 3.3, stageH / 1.66, 230);
+      const spread = Math.min(u * 1.14, (W - 2 * m - u) / 2);
+      return { top, stageH, u, spread };
+    };
+    // Keep the right-hand friend out from under the home button.
+    let f = fit(m);
+    if (W / 2 + f.spread + f.u * 0.62 > W - CONFIG.HOME_RESERVE_PX) f = fit(Math.max(m, CONFIG.HOME_RESERVE_PX));
+
+    L.m = m;
+    L.u = f.u;
+    L.spread = f.spread;
+    L.baseY = f.top + (f.stageH + f.u * 1.62) / 2;
+    L.bandTop = bandTop;
+    L.bandH = bandH;
+    L.arrowY = bandTop + Math.min(bandH * 0.32, f.u * 0.55);
+
+    // Picture cards in one row across the band.
+    const k = Math.max(1, state.pictures.length);
+    const s = Math.min((W - 2 * m - (k - 1) * m) / k, bandH - 1.4 * m, 240);
+    L.cardS = s;
+    const rowW = k * s + (k - 1) * m;
+    state.pictures.forEach((p, i) => {
+      p.s = s;
+      p.x = (W - rowW) / 2 + s / 2 + i * (s + m);
+      p.y = bandTop + bandH / 2 - m * 0.2;
+    });
+  }
+
+  // Friend positions: spread out while listening, huddled together once blended.
+  function mergeAmount(t) {
+    if (state.step === 'tap') return 0;
+    if (state.step === 'blend') return state.slide * 0.45;
+    const p = clamp((t - state.mergeT0) / CONFIG.MERGE_MS, 0, 1);
+    return lerp(0.45, 1, easeInOutQuad(p));
+  }
+
+  function friendX(i, merge) {
+    const spreadX = W / 2 + (i - 1) * L.spread;
+    const huddleX = W / 2 + (i - 1) * L.u * 0.72;
+    return lerp(spreadX, huddleX, merge);
+  }
+
+  function arrowGeom() {
+    return { x0: W / 2 - L.spread, x1: W / 2 + L.spread, y: L.arrowY };
+  }
+
+  // ---------------------------------------------------------------------
+  // Input: touch + mouse
+  // ---------------------------------------------------------------------
+  let activeTouch = null;
+  let mouseDown = false;
+  let parentTimer = null;
+
+  function toCanvas(clientX, clientY) {
+    const r = canvas.getBoundingClientRect();
+    return { x: clientX - r.left, y: clientY - r.top };
+  }
+
+  function findTouch(list, id) {
+    for (let i = 0; i < list.length; i++) if (list[i].identifier === id) return list[i];
+    return null;
+  }
+
+  function cancelParentHold() {
+    if (parentTimer) { clearTimeout(parentTimer); parentTimer = null; }
+  }
+
+  // Forgiving hit test: a friend's whole body plus a margin; nearest wins.
+  function friendAt(p) {
+    let best = -1, bestD = Infinity;
+    const t = now();
+    const merge = mergeAmount(t);
+    state.friends.forEach((f, i) => {
+      const x = friendX(i, merge);
+      const halfW = Math.max(L.u * 0.6, 34);
+      if (Math.abs(p.x - x) <= halfW && p.y >= L.baseY - L.u * 1.75 && p.y <= L.baseY + L.u * 0.15) {
+        const d = Math.abs(p.x - x);
+        if (d < bestD) { best = i; bestD = d; }
+      }
+    });
+    return best;
+  }
+
+  function pictureAt(p) {
+    let best = null, bestD = Infinity;
+    for (const pic of state.pictures) {
+      const half = pic.s * 0.5 * 1.3;
+      if (Math.abs(p.x - pic.x) <= half && Math.abs(p.y - pic.y) <= half) {
+        const d = Math.hypot(p.x - pic.x, p.y - pic.y);
+        if (d < bestD) { best = pic; bestD = d; }
+      }
+    }
+    return best;
+  }
+
+  // The slider is forgiving: anywhere near the arrow band, as long as the
+  // finger is not far ahead of where the colour has reached.
+  function slideTol() { return Math.max(48, L.u * 0.55); }
+
+  function slideFraction(x) {
+    const a = arrowGeom();
+    return (x - a.x0) / Math.max(1, a.x1 - a.x0);
+  }
+
+  function trySlide(p) {
+    if (Math.abs(p.y - L.arrowY) > slideTol() * 1.6) return;
+    const f = slideFraction(p.x);
+    if (f <= state.slide) return;
+    const before = state.slide;
+    state.slide = Math.min(f, state.slide + CONFIG.SLIDE_MAX_STEP, 1);
+    // Each letter's dot lights up with that friend's voice as the colour passes it.
+    for (let i = 1; i < 3; i++) {
+      const at = i / 2;
+      if (before < at && state.slide >= at) { playVoice(i); state.friends[i].hopT0 = now(); }
+    }
+    if (state.slide >= CONFIG.SLIDE_DONE) finishBlend();
+  }
+
+  function onDown(p) {
+    unlockAudio();
+    state.lastInteraction = now();
+
+    if (state.phase === 'start' || state.phase === 'between') {
+      const g = starGeom();
+      if (Math.hypot(p.x - g.cx, p.y - g.cy) <= g.R * 1.8) { startRound(); return; }
+    } else if (state.phase === 'play') {
+      if (state.step === 'pick') {
+        const pic = pictureAt(p);
+        if (pic) { tapPicture(pic); return; }
+      }
+      if (state.step === 'blend') {
+        const tol = slideTol();
+        const headX = arrowGeom().x0 + state.slide * (arrowGeom().x1 - arrowGeom().x0);
+        if (Math.abs(p.y - L.arrowY) <= tol && p.x >= arrowGeom().x0 - tol * 1.5 && p.x <= headX + tol * 1.6) {
+          state.sliding = true;
+          if (state.slide === 0) { playVoice(0); state.friends[0].hopT0 = now(); }
+          trySlide(p);
+          return;
+        }
+      }
+      if (state.step === 'tap' || state.step === 'blend' || state.step === 'pick') {
+        const i = friendAt(p);
+        if (i >= 0) { tapFriend(i); return; }
+      }
+    }
+
+    // Hidden parent view: hold the top-left corner still for 3 seconds.
+    if (p.x < CONFIG.PARENT_CORNER_PX && p.y < CONFIG.PARENT_CORNER_PX) {
+      cancelParentHold();
+      parentTimer = setTimeout(openParent, CONFIG.PARENT_HOLD_MS);
+    }
+  }
+
+  function onMove(p) {
+    if (parentTimer && (p.x >= CONFIG.PARENT_CORNER_PX || p.y >= CONFIG.PARENT_CORNER_PX)) cancelParentHold();
+    if (!state.sliding || state.step !== 'blend') return;
+    state.lastInteraction = now();
+    trySlide(p);
+  }
+
+  // Lifting the finger keeps the colour where it got to; the next slide continues.
+  function onUp() {
+    cancelParentHold();
+    state.sliding = false;
+  }
+
+  canvas.addEventListener('touchstart', e => {
+    e.preventDefault();
+    if (activeTouch !== null) return;          // one finger at a time
+    const t = e.changedTouches[0];
+    activeTouch = t.identifier;
+    onDown(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  canvas.addEventListener('touchmove', e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (t) onMove(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  const endTouch = e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (!t) return;
+    activeTouch = null;
+    onUp();
+  };
+  canvas.addEventListener('touchend', endTouch, { passive: false });
+  canvas.addEventListener('touchcancel', endTouch, { passive: false });
+
+  canvas.addEventListener('mousedown', e => { mouseDown = true; onDown(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mousemove', e => { if (mouseDown) onMove(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mouseup', () => {
+    if (!mouseDown) return;
+    mouseDown = false;
+    onUp();
+  });
+
+  // ---------------------------------------------------------------------
+  // Parent view (hidden, local data only)
+  // ---------------------------------------------------------------------
+  const parentEl = document.getElementById('parent');
+  const parentBody = document.getElementById('parentBody');
+
+  function el(tag, text) {
+    const node = document.createElement(tag);
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function openParent() {
+    parentTimer = null;
+    const words = progress.sessions.reduce((a, s) => a + s.rounds.reduce((b, r) => b + r.items, 0), 0);
+    const firstTry = progress.sessions.reduce((a, s) => a + s.rounds.reduce((b, r) => b + r.firstTry, 0), 0);
+
+    parentBody.textContent = '';
+    parentBody.appendChild(el('div', `Full games finished: ${progress.gamesCompleted}`));
+    parentBody.appendChild(el('div', `Rounds finished: ${progress.roundsCompleted}`));
+    parentBody.appendChild(el('div', `Words blended: ${progress.wordsBlended}`));
+    parentBody.appendChild(el('div', `Right picture on the first try: ${words ? Math.round(100 * firstTry / words) : 0}%`));
+
+    const recent = progress.sessions.slice(-6).reverse();
+    if (recent.length) {
+      const table = el('table');
+      const head = el('tr');
+      ['When', 'Rounds', 'Top level', 'Slips'].forEach(h => head.appendChild(el('th', h)));
+      table.appendChild(head);
+      recent.forEach(s => {
+        const tr = el('tr');
+        const when = new Date(s.startedAt);
+        tr.appendChild(el('td', when.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' ' +
+          when.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })));
+        tr.appendChild(el('td', `${s.rounds.length}/${CONFIG.ROUNDS}`));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => Math.max(a, r.level), 0) || '-')));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => a + r.slips, 0))));
+        table.appendChild(tr);
+      });
+      parentBody.appendChild(table);
+      const last = recent[0].rounds.map(r => r.words).join(', ');
+      if (last) parentBody.appendChild(el('p', `Latest words: ${last}`));
+    }
+    parentEl.hidden = false;
+    log('Parent view opened', progress);
+  }
+
+  parentEl.addEventListener('click', () => { parentEl.hidden = true; });
+
+  // Read-only debug hooks for the Android/desktop console.
+  window.PhonicsBlend = {
+    progress: () => JSON.parse(JSON.stringify(progress)),
+    state: () => {
+      const merge = mergeAmount(now());
+      const a = arrowGeom();
+      return {
+        phase: state.phase,
+        step: state.step,
+        round: state.round,
+        level: state.tier + 1,
+        word: state.word,
+        wordIndex: state.wordIndex,
+        star: (state.phase === 'start' || state.phase === 'between') ? { x: starGeom().cx, y: starGeom().cy } : null,
+        friends: state.friends.map((f, i) => ({ letter: f.letter, tapped: f.tapped, x: friendX(i, merge), y: L.baseY - L.u * 0.6 })),
+        slider: state.step === 'blend' ? { x0: a.x0, x1: a.x1, y: a.y, progress: state.slide } : null,
+        pictures: state.step === 'pick' ? state.pictures.map(p => ({ word: p.word, correct: p.correct, x: p.x, y: p.y })) : [],
+      };
+    },
+  };
+
+  // ---------------------------------------------------------------------
+  // Drawing primitives
+  // ---------------------------------------------------------------------
+  function roundRectPath(x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  // Characters and pictures below are drawn in a unit space that the caller scales.
+  // Line widths scale with it.
+  function paint(fill, lw = 0.07) {
+    ctx.fillStyle = fill;
+    ctx.fill();
+    ctx.lineWidth = lw;
+    ctx.strokeStyle = shade(fill, -0.3);
+    ctx.stroke();
+  }
+  function circle(x, y, r) { ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); }
+  function ellipse(x, y, rx, ry, rot = 0) { ctx.beginPath(); ctx.ellipse(x, y, rx, ry, rot, 0, TAU); }
+  function dot(x, y, r, fill = COLORS.ink) { circle(x, y, r); ctx.fillStyle = fill; ctx.fill(); }
+  function line(pts, color, w) {
+    ctx.beginPath();
+    pts.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+    ctx.strokeStyle = color; ctx.lineWidth = w; ctx.stroke();
+  }
+  function tube(build, fill, w) {
+    ctx.beginPath(); build();
+    ctx.strokeStyle = shade(fill, -0.3); ctx.lineWidth = w + 0.12; ctx.stroke();
+    ctx.beginPath(); build();
+    ctx.strokeStyle = fill; ctx.lineWidth = w; ctx.stroke();
+  }
+  function shine(x, y, rx, ry, rot = -0.6) {
+    ctx.globalAlpha = 0.4; ellipse(x, y, rx, ry, rot); ctx.fillStyle = '#fff'; ctx.fill(); ctx.globalAlpha = 1;
+  }
+  function smile(x, y, r, w = 0.06) {
+    ctx.beginPath(); ctx.arc(x, y, r, 0.15 * Math.PI, 0.85 * Math.PI);
+    ctx.strokeStyle = COLORS.ink; ctx.lineWidth = w; ctx.stroke();
+  }
+  function cheeks(x1, x2, y, r) {
+    ctx.globalAlpha = 0.4;
+    ellipse(x1, y, r, r * 0.65); ctx.fillStyle = COLORS.cheek; ctx.fill();
+    ellipse(x2, y, r, r * 0.65); ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------------------------------------------------------------------
+  // The three friends (unit space: feet at 0, about 1.62 tall, 1 wide)
+  // ---------------------------------------------------------------------
+  const FRIEND_DRAW = {
+    elephant(c) {
+      for (const s of [-1, 1]) {
+        ellipse(s * 0.34, -1.0, 0.26, 0.31, s * 0.15); paint(c, 0.035);
+        ctx.globalAlpha = 0.55; ellipse(s * 0.36, -0.99, 0.15, 0.2, s * 0.15); ctx.fillStyle = '#E8B4C8'; ctx.fill(); ctx.globalAlpha = 1;
+      }
+      for (const x of [-0.2, 0.08]) { ctx.beginPath(); roundRectPath(x, -0.24, 0.13, 0.24, 0.05); paint(c, 0.03); }
+      ellipse(0, -0.44, 0.37, 0.42); paint(c, 0.035);
+      circle(0, -1.0, 0.31); paint(c, 0.035);
+      tube(() => { ctx.moveTo(0.04, -0.9); ctx.quadraticCurveTo(0.1, -0.78, 0.28, -0.84); ctx.quadraticCurveTo(0.4, -0.9, 0.4, -1.06); }, c, 0.1);
+      dot(-0.11, -1.04, 0.04); dot(0.13, -1.04, 0.04);
+      dot(-0.1, -1.055, 0.013, '#fff'); dot(0.14, -1.055, 0.013, '#fff');
+      cheeks(-0.2, 0.22, -0.94, 0.05);
+    },
+    bear(c) {
+      for (const s of [-1, 1]) { circle(s * 0.24, -1.27, 0.11); paint(c, 0.035); dot(s * 0.24, -1.27, 0.055, '#E8CDAE'); }
+      for (const s of [-1, 1]) { ellipse(s * 0.17, -0.05, 0.14, 0.08); paint(c, 0.03); }
+      ellipse(0, -0.44, 0.39, 0.43); paint(c, 0.035);
+      circle(0, -1.0, 0.33); paint(c, 0.035);
+      ellipse(0, -0.92, 0.15, 0.11); paint('#E8CDAE', 0.025);
+      ellipse(0, -0.96, 0.06, 0.04); ctx.fillStyle = COLORS.ink; ctx.fill();
+      smile(0, -0.93, 0.05, 0.02);
+      dot(-0.12, -1.07, 0.04); dot(0.12, -1.07, 0.04);
+      dot(-0.11, -1.085, 0.013, '#fff'); dot(0.13, -1.085, 0.013, '#fff');
+      cheeks(-0.21, 0.21, -0.97, 0.05);
+    },
+    bunny(c) {
+      for (const s of [-1, 1]) {
+        ellipse(s * 0.12, -1.36, 0.085, 0.25, s * 0.14); paint(c, 0.03);
+        ellipse(s * 0.12, -1.34, 0.04, 0.17, s * 0.14); ctx.fillStyle = '#F4B6C2'; ctx.fill();
+      }
+      circle(0.34, -0.26, 0.08); paint('#FFFDF8', 0.025);
+      for (const s of [-1, 1]) { ellipse(s * 0.16, -0.05, 0.15, 0.07); paint(c, 0.03); }
+      ellipse(0, -0.44, 0.36, 0.42); paint(c, 0.035);
+      circle(0, -1.0, 0.3); paint(c, 0.035);
+      dot(-0.11, -1.05, 0.038); dot(0.11, -1.05, 0.038);
+      dot(-0.1, -1.063, 0.012, '#fff'); dot(0.12, -1.063, 0.012, '#fff');
+      ctx.beginPath(); ctx.moveTo(-0.03, -0.96); ctx.lineTo(0.03, -0.96); ctx.lineTo(0, -0.93); ctx.closePath(); ctx.fillStyle = '#E58C9A'; ctx.fill();
+      ctx.beginPath(); ctx.moveTo(-0.06, -0.89); ctx.quadraticCurveTo(-0.03, -0.86, 0, -0.9); ctx.quadraticCurveTo(0.03, -0.86, 0.06, -0.89);
+      ctx.strokeStyle = COLORS.ink; ctx.lineWidth = 0.02; ctx.stroke();
+      for (const s of [-1, 1]) for (const dy of [-0.95, -0.91]) line([[s * 0.1, dy], [s * 0.3, dy + (dy + 0.93) * 1.5]], shade(c, -0.35), 0.012);
+      cheeks(-0.19, 0.19, -0.95, 0.045);
+    },
+  };
+
+  // Hop: a quick, gentle jump with a little squash on landing.
+  function hopOffset(f, t) {
+    const p = (t - f.hopT0) / CONFIG.HOP_MS;
+    if (p < 0 || p >= 1) return { dy: 0, sx: 1, sy: 1 };
+    const h = reduceMotion ? 0.05 : 0.17;
+    const k = Math.sin(Math.PI * p);
+    return { dy: -h * k, sx: 1 - 0.04 * k, sy: 1 + 0.05 * k };
+  }
+
+  function friendTransform(i, t, merge, pulse) {
+    const f = state.friends[i];
+    const x = friendX(i, merge);
+    const hop = hopOffset(f, t);
+    ctx.translate(x, L.baseY + hop.dy * L.u);
+    ctx.scale(L.u * hop.sx * pulse, L.u * hop.sy * pulse);
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+  }
+
+  function drawFriendBody(i, t, merge, pulse, glow) {
+    ctx.save();
+    friendTransform(i, t, merge, pulse);
+    if (glow > 0) {
+      ctx.globalAlpha = 0.25 + 0.35 * glow;
+      ellipse(0, -0.75, 0.62, 0.95); ctx.fillStyle = shade(FRIENDS[i].accent, 0.35); ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+    ctx.globalAlpha = 0.12; ellipse(0, 0.01, 0.42, 0.06); ctx.fillStyle = COLORS.ink; ctx.fill(); ctx.globalAlpha = 1;
+    FRIEND_DRAW[FRIENDS[i].kind](FRIENDS[i].color);
+    ctx.restore();
+  }
+
+  // The sign with the letter, plus the two paws holding it. Drawn after all
+  // bodies so huddled friends never hide each other's letters.
+  function drawFriendSign(i, t, merge, pulse) {
+    const f = state.friends[i];
+    const fr = FRIENDS[i];
+    ctx.save();
+    friendTransform(i, t, merge, pulse);
+    ctx.beginPath();
+    roundRectPath(-0.33, -0.84, 0.66, 0.58, 0.1);
+    ctx.fillStyle = COLORS.card; ctx.fill();
+    ctx.lineWidth = f.tapped || state.step !== 'tap' ? 0.05 : 0.035;
+    ctx.strokeStyle = f.tapped || state.step !== 'tap' ? fr.accent : COLORS.signEdge;
+    ctx.stroke();
+    // Shared baseline so the three letters read as one word. The text is drawn
+    // at 100x scale because some browsers mis-render sub-pixel font sizes.
+    ctx.save();
+    ctx.scale(0.01, 0.01);
+    ctx.font = `800 46px ${FONT}`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = COLORS.ink;
+    ctx.fillText(f.letter, 0, -43);
+    ctx.restore();
+    for (const s of [-1, 1]) { circle(s * 0.25, -0.82, 0.075); paint(fr.color, 0.025); }
+    ctx.restore();
+  }
+
+  // ---------------------------------------------------------------------
+  // The word pictures (unit space: fits a circle of radius 1)
+  // ---------------------------------------------------------------------
+  const PICS = {
+    cat() {
+      for (const s of [-1, 1]) {
+        ctx.beginPath(); ctx.moveTo(s * 0.62, -0.1); ctx.lineTo(s * 0.55, -0.82); ctx.lineTo(s * 0.12, -0.5); ctx.closePath(); paint('#F2B67A');
+        ctx.beginPath(); ctx.moveTo(s * 0.5, -0.25); ctx.lineTo(s * 0.48, -0.65); ctx.lineTo(s * 0.24, -0.47); ctx.closePath(); ctx.fillStyle = '#F4B6C2'; ctx.fill();
+      }
+      ellipse(0, 0.1, 0.72, 0.64); paint('#F2B67A');
+      dot(-0.26, 0.0, 0.09); dot(0.26, 0.0, 0.09);
+      dot(-0.23, -0.03, 0.03, '#fff'); dot(0.29, -0.03, 0.03, '#fff');
+      ctx.beginPath(); ctx.moveTo(-0.08, 0.16); ctx.lineTo(0.08, 0.16); ctx.lineTo(0, 0.25); ctx.closePath(); ctx.fillStyle = '#E58C9A'; ctx.fill();
+      ctx.beginPath(); ctx.moveTo(-0.16, 0.34); ctx.quadraticCurveTo(-0.08, 0.42, 0, 0.3); ctx.quadraticCurveTo(0.08, 0.42, 0.16, 0.34);
+      ctx.strokeStyle = COLORS.ink; ctx.lineWidth = 0.045; ctx.stroke();
+      for (const s of [-1, 1]) for (const dy of [0.2, 0.32]) line([[s * 0.32, dy], [s * 0.82, dy - 0.06 + (dy - 0.2)]], shade('#F2B67A', -0.4), 0.03);
+    },
+    hat() {
+      ellipse(0, 0.48, 0.92, 0.22); paint('#B8A9D9');
+      ctx.beginPath(); ctx.moveTo(-0.5, 0.45); ctx.lineTo(-0.44, -0.55); ctx.quadraticCurveTo(0, -0.68, 0.44, -0.55); ctx.lineTo(0.5, 0.45);
+      ctx.quadraticCurveTo(0, 0.58, -0.5, 0.45); ctx.closePath(); paint('#B8A9D9');
+      ctx.beginPath(); ctx.moveTo(-0.48, 0.12); ctx.quadraticCurveTo(0, 0.24, 0.48, 0.12); ctx.lineTo(0.49, 0.32); ctx.quadraticCurveTo(0, 0.44, -0.49, 0.32); ctx.closePath(); paint('#E8B4C8', 0.05);
+      circle(0.3, 0.22, 0.12); paint('#F4D35E', 0.04);
+      shine(-0.25, -0.3, 0.08, 0.2, 0);
+    },
+    bat() {
+      const c = '#9C8FB8';
+      for (const s of [-1, 1]) {
+        ctx.beginPath();
+        ctx.moveTo(s * 0.2, -0.2);
+        ctx.quadraticCurveTo(s * 0.6, -0.55, s * 0.95, -0.3);
+        ctx.quadraticCurveTo(s * 0.82, -0.05, s * 0.86, 0.12);
+        ctx.quadraticCurveTo(s * 0.7, 0.0, s * 0.6, 0.18);
+        ctx.quadraticCurveTo(s * 0.45, 0.05, s * 0.35, 0.25);
+        ctx.quadraticCurveTo(s * 0.28, 0.12, s * 0.18, 0.2);
+        ctx.closePath(); paint(c);
+      }
+      for (const s of [-1, 1]) { ctx.beginPath(); ctx.moveTo(s * 0.08, -0.32); ctx.lineTo(s * 0.22, -0.6); ctx.lineTo(s * 0.26, -0.26); ctx.closePath(); paint(c, 0.05); }
+      ellipse(0, -0.02, 0.27, 0.34); paint(c);
+      dot(-0.1, -0.1, 0.07, '#fff'); dot(0.1, -0.1, 0.07, '#fff');
+      dot(-0.09, -0.09, 0.035); dot(0.11, -0.09, 0.035);
+      smile(0, 0.02, 0.08, 0.035);
+      ctx.fillStyle = '#fff';
+      ctx.beginPath(); ctx.moveTo(-0.05, 0.09); ctx.lineTo(-0.02, 0.15); ctx.lineTo(0.0, 0.09); ctx.closePath(); ctx.fill();
+      cheeks(-0.16, 0.16, 0.02, 0.05);
+    },
+    dog() {
+      ellipse(-0.6, 0.05, 0.22, 0.42, 0.25); paint('#A9805C');
+      ellipse(0.6, 0.05, 0.22, 0.42, -0.25); paint('#A9805C');
+      ellipse(0, 0.02, 0.6, 0.66); paint('#D9B48F');
+      ellipse(0.25, -0.15, 0.2, 0.18, 0.3); ctx.fillStyle = shade('#D9B48F', -0.15); ctx.fill();
+      dot(-0.22, -0.12, 0.08); dot(0.24, -0.12, 0.08);
+      dot(-0.2, -0.15, 0.025, '#fff'); dot(0.26, -0.15, 0.025, '#fff');
+      ellipse(0, 0.25, 0.26, 0.2); ctx.fillStyle = '#F0DCC2'; ctx.fill();
+      ellipse(0, 0.16, 0.11, 0.08); ctx.fillStyle = COLORS.ink; ctx.fill();
+      ctx.beginPath(); ctx.moveTo(-0.12, 0.33); ctx.quadraticCurveTo(0, 0.42, 0.12, 0.33);
+      ctx.strokeStyle = COLORS.ink; ctx.lineWidth = 0.045; ctx.stroke();
+      ellipse(0.04, 0.46, 0.08, 0.1); ctx.fillStyle = '#E58C9A'; ctx.fill();
+    },
+    fox() {
+      const c = '#F2A65A';
+      for (const s of [-1, 1]) {
+        ctx.beginPath(); ctx.moveTo(s * 0.7, -0.25); ctx.lineTo(s * 0.62, -0.9); ctx.lineTo(s * 0.22, -0.52); ctx.closePath(); paint(c);
+        ctx.beginPath(); ctx.moveTo(s * 0.58, -0.38); ctx.lineTo(s * 0.56, -0.72); ctx.lineTo(s * 0.34, -0.52); ctx.closePath(); ctx.fillStyle = '#5A5048'; ctx.fill();
+      }
+      ctx.beginPath(); ctx.moveTo(-0.78, -0.3); ctx.quadraticCurveTo(-0.6, 0.35, 0, 0.72); ctx.quadraticCurveTo(0.6, 0.35, 0.78, -0.3);
+      ctx.quadraticCurveTo(0, -0.7, -0.78, -0.3); ctx.closePath(); paint(c);
+      ctx.beginPath(); ctx.moveTo(-0.66, -0.02); ctx.quadraticCurveTo(-0.28, 0.06, 0, 0.26); ctx.quadraticCurveTo(0.28, 0.06, 0.66, -0.02);
+      ctx.quadraticCurveTo(0.5, 0.42, 0, 0.72); ctx.quadraticCurveTo(-0.5, 0.42, -0.66, -0.02); ctx.closePath();
+      ctx.fillStyle = '#FFF4DE'; ctx.fill();
+      ellipse(0, 0.62, 0.1, 0.07); ctx.fillStyle = COLORS.ink; ctx.fill();
+      dot(-0.26, -0.12, 0.075); dot(0.26, -0.12, 0.075);
+      dot(-0.24, -0.15, 0.025, '#fff'); dot(0.28, -0.15, 0.025, '#fff');
+      smile(0, 0.42, 0.1, 0.04);
+    },
+    box() {
+      const c = '#D9AE72';
+      ctx.beginPath(); ctx.moveTo(-0.62, -0.25); ctx.lineTo(-0.95, -0.55); ctx.lineTo(-0.45, -0.62); ctx.lineTo(-0.3, -0.25); ctx.closePath(); paint('#E2BF8E');
+      ctx.beginPath(); ctx.moveTo(0.62, -0.25); ctx.lineTo(0.95, -0.55); ctx.lineTo(0.45, -0.62); ctx.lineTo(0.3, -0.25); ctx.closePath(); paint('#E2BF8E');
+      ctx.beginPath(); ctx.moveTo(-0.62, -0.25); ctx.lineTo(0.62, -0.25); ctx.lineTo(0.5, -0.4); ctx.lineTo(-0.5, -0.4); ctx.closePath(); paint('#8A6D4B', 0.04);
+      ctx.beginPath(); roundRectPath(-0.65, -0.28, 1.3, 1.0, 0.06); paint(c);
+      ctx.beginPath(); ctx.rect(-0.12, -0.28, 0.24, 0.45); ctx.fillStyle = '#EAD2A8'; ctx.fill();
+      ctx.globalAlpha = 0.5; line([[-0.45, 0.45], [-0.2, 0.45]], shade(c, -0.3), 0.05); line([[-0.45, 0.56], [-0.28, 0.56]], shade(c, -0.3), 0.05); ctx.globalAlpha = 1;
+    },
+    sun() {
+      for (let i = 0; i < 10; i++) {
+        const a = i * TAU / 10;
+        ctx.beginPath(); ctx.moveTo(Math.cos(a) * 0.62, Math.sin(a) * 0.62); ctx.lineTo(Math.cos(a) * 0.92, Math.sin(a) * 0.92);
+        ctx.strokeStyle = '#F2B84B'; ctx.lineWidth = 0.13; ctx.lineCap = 'round'; ctx.stroke();
+      }
+      circle(0, 0, 0.5); paint('#F6C85F');
+      dot(-0.17, -0.07, 0.06); dot(0.17, -0.07, 0.06);
+      smile(0, 0.04, 0.2, 0.05);
+      cheeks(-0.3, 0.3, 0.1, 0.08);
+    },
+    bus() {
+      const c = '#F4D35E';
+      ctx.beginPath(); roundRectPath(-0.95, -0.5, 1.9, 0.86, 0.16); paint(c);
+      ctx.beginPath(); ctx.rect(-0.95, 0.06, 1.9, 0.08); ctx.fillStyle = '#E9776B'; ctx.fill();
+      for (let i = 0; i < 4; i++) { ctx.beginPath(); roundRectPath(-0.82 + i * 0.36, -0.38, 0.27, 0.27, 0.05); paint('#CFE3F1', 0.04); }
+      ctx.beginPath(); roundRectPath(0.62, -0.38, 0.22, 0.6, 0.04); paint('#CFE3F1', 0.04);
+      line([[0.73, -0.38], [0.73, 0.22]], shade('#CFE3F1', -0.3), 0.03);
+      for (const x of [-0.55, 0.5]) { circle(x, 0.38, 0.2); paint('#5A5048'); dot(x, 0.38, 0.08, '#D8D2C8'); }
+      dot(0.9, 0.24, 0.05, '#FFFDF8');
+    },
+    bug() {
+      line([[-0.12, -0.62], [-0.28, -0.85]], COLORS.ink, 0.05); line([[0.12, -0.62], [0.28, -0.85]], COLORS.ink, 0.05);
+      dot(-0.28, -0.86, 0.05); dot(0.28, -0.86, 0.05);
+      for (const s of [-1, 1]) for (const y of [-0.15, 0.15, 0.42]) line([[s * 0.4, y], [s * 0.72, y + 0.08]], '#5A5048', 0.06);
+      circle(0, -0.5, 0.24); paint('#5A5048');
+      ellipse(0, 0.1, 0.56, 0.62); paint('#E9776B');
+      line([[0, -0.45], [0, 0.72]], '#5A5048', 0.05);
+      for (const [x, y, r] of [[-0.26, -0.1, 0.1], [0.26, -0.1, 0.1], [-0.3, 0.28, 0.09], [0.3, 0.28, 0.09], [-0.12, 0.5, 0.07], [0.12, 0.5, 0.07]]) dot(x, y, r, '#5A5048');
+      dot(-0.09, -0.55, 0.06, '#fff'); dot(0.09, -0.55, 0.06, '#fff');
+      dot(-0.08, -0.54, 0.03); dot(0.1, -0.54, 0.03);
+      shine(-0.25, -0.25, 0.1, 0.06);
+    },
+    rug() {
+      for (let i = 0; i <= 6; i++) {
+        const y = -0.45 + i * 0.15;
+        line([[-0.8, y], [-0.95, y]], '#C9A27E', 0.04); line([[0.8, y], [0.95, y]], '#C9A27E', 0.04);
+      }
+      ctx.beginPath(); roundRectPath(-0.82, -0.52, 1.64, 1.04, 0.06); paint('#E9776B');
+      ctx.beginPath(); roundRectPath(-0.68, -0.38, 1.36, 0.76, 0.04); paint('#F4D35E', 0.04);
+      ctx.beginPath(); roundRectPath(-0.54, -0.24, 1.08, 0.48, 0.03); paint('#8FB8DE', 0.04);
+      ctx.beginPath(); ctx.moveTo(0, -0.2); ctx.lineTo(0.3, 0); ctx.lineTo(0, 0.2); ctx.lineTo(-0.3, 0); ctx.closePath(); paint('#FFFDF8', 0.04);
+    },
+    pig() {
+      for (const s of [-1, 1]) { ctx.beginPath(); ctx.moveTo(s * 0.62, -0.32); ctx.lineTo(s * 0.62, -0.82); ctx.lineTo(s * 0.2, -0.58); ctx.closePath(); paint('#F4B6C2'); }
+      ellipse(0, 0.05, 0.74, 0.66); paint('#F4B6C2');
+      dot(-0.28, -0.12, 0.08); dot(0.28, -0.12, 0.08);
+      dot(-0.26, -0.15, 0.025, '#fff'); dot(0.3, -0.15, 0.025, '#fff');
+      ellipse(0, 0.2, 0.28, 0.2); paint('#EE9AAC', 0.05);
+      ellipse(-0.1, 0.2, 0.05, 0.08); ctx.fillStyle = shade('#EE9AAC', -0.4); ctx.fill();
+      ellipse(0.1, 0.2, 0.05, 0.08); ctx.fill();
+      smile(0, 0.36, 0.14, 0.045);
+      cheeks(-0.5, 0.5, 0.15, 0.1);
+    },
+    bed() {
+      const wood = '#B98A63';
+      ctx.beginPath(); roundRectPath(-0.92, -0.62, 0.18, 1.3, 0.08); paint(wood);
+      ctx.beginPath(); roundRectPath(0.76, -0.2, 0.16, 0.88, 0.07); paint(wood);
+      ctx.beginPath(); roundRectPath(-0.78, 0.02, 1.58, 0.3, 0.06); paint('#FFF4DE');
+      ellipse(-0.52, -0.06, 0.24, 0.13); paint('#FFFDF8', 0.05);
+      ctx.beginPath(); ctx.moveTo(-0.3, -0.12); ctx.quadraticCurveTo(0.2, -0.22, 0.8, -0.08); ctx.lineTo(0.8, 0.3); ctx.lineTo(-0.3, 0.3); ctx.closePath(); paint('#8FB8DE');
+      for (const x of [-0.05, 0.25, 0.55]) dot(x, 0.1, 0.05, '#FFFDF8');
+      ctx.beginPath(); ctx.rect(-0.78, 0.32, 1.58, 0.1); paint(wood, 0.04);
+    },
+    cup() {
+      tube(() => { ctx.arc(0.52, 0.02, 0.26, -0.5 * Math.PI, 0.5 * Math.PI); }, '#8FB8DE', 0.12);
+      ctx.beginPath();
+      ctx.moveTo(-0.58, -0.45); ctx.lineTo(0.5, -0.45); ctx.lineTo(0.38, 0.5);
+      ctx.quadraticCurveTo(0.35, 0.65, 0.2, 0.65); ctx.lineTo(-0.28, 0.65);
+      ctx.quadraticCurveTo(-0.43, 0.65, -0.46, 0.5); ctx.closePath();
+      paint('#8FB8DE');
+      ellipse(-0.04, -0.45, 0.54, 0.12); paint('#B98A63', 0.05);
+      ellipse(-0.04, 0.72, 0.78, 0.13); paint('#FFFDF8', 0.05);
+      dot(-0.2, 0.08, 0.08, '#FFFDF8'); dot(0.1, 0.25, 0.06, '#FFFDF8');
+      for (const x of [-0.2, 0.12]) {
+        ctx.beginPath(); ctx.moveTo(x, -0.62); ctx.bezierCurveTo(x - 0.12, -0.72, x + 0.12, -0.82, x, -0.95);
+        ctx.strokeStyle = 'rgba(74,64,54,0.3)'; ctx.lineWidth = 0.05; ctx.stroke();
+      }
+    },
+    hen() {
+      const c = '#D9A066';
+      line([[-0.12, 0.55], [-0.15, 0.85]], '#F2A65A', 0.06); line([[0.12, 0.55], [0.12, 0.85]], '#F2A65A', 0.06);
+      line([[-0.24, 0.86], [-0.06, 0.86]], '#F2A65A', 0.05); line([[0.02, 0.86], [0.22, 0.86]], '#F2A65A', 0.05);
+      ctx.beginPath(); ctx.moveTo(-0.85, -0.25); ctx.quadraticCurveTo(-0.7, 0.05, -0.55, 0.0);
+      ctx.bezierCurveTo(-0.65, 0.6, 0.4, 0.75, 0.55, 0.15); ctx.quadraticCurveTo(0.6, -0.05, 0.42, -0.25);
+      ctx.quadraticCurveTo(-0.1, -0.05, -0.5, -0.15); ctx.quadraticCurveTo(-0.62, -0.5, -0.85, -0.25); ctx.closePath(); paint(c);
+      circle(0.42, -0.42, 0.26); paint(c);
+      for (const [x, y] of [[0.3, -0.7], [0.42, -0.74], [0.54, -0.68]]) { circle(x, y, 0.08); paint('#E9776B', 0.03); }
+      ctx.beginPath(); ctx.moveTo(0.66, -0.46); ctx.lineTo(0.86, -0.4); ctx.lineTo(0.66, -0.34); ctx.closePath(); paint('#F4D35E', 0.03);
+      ellipse(0.62, -0.24, 0.05, 0.08); ctx.fillStyle = '#E9776B'; ctx.fill();
+      dot(0.48, -0.46, 0.05);
+      ctx.beginPath(); ctx.moveTo(-0.25, 0.1); ctx.quadraticCurveTo(0.05, 0.45, 0.3, 0.1); ctx.strokeStyle = shade(c, -0.3); ctx.lineWidth = 0.05; ctx.stroke();
+    },
+    pen() {
+      ctx.save(); ctx.rotate(-0.7);
+      ctx.beginPath(); roundRectPath(-0.92, -0.14, 0.42, 0.28, 0.08); paint('#5F86B5', 0.05);
+      line([[-0.85, -0.17], [-0.45, -0.2]], '#C3C9D1', 0.06);
+      ctx.beginPath(); ctx.rect(-0.52, -0.12, 1.06, 0.24); paint('#8FB8DE', 0.05);
+      ctx.beginPath(); ctx.moveTo(0.54, -0.12); ctx.lineTo(0.82, -0.04); ctx.lineTo(0.82, 0.04); ctx.lineTo(0.54, 0.12); ctx.closePath(); paint('#C3C9D1', 0.04);
+      dot(0.86, 0, 0.045);
+      ctx.restore();
+      ctx.beginPath(); ctx.moveTo(0.55, 0.6); ctx.bezierCurveTo(0.7, 0.5, 0.75, 0.75, 0.92, 0.62); ctx.strokeStyle = '#5F86B5'; ctx.lineWidth = 0.05; ctx.stroke();
+    },
+    net() {
+      tube(() => { ctx.moveTo(-0.85, 0.85); ctx.lineTo(-0.15, 0.08); }, '#B98A63', 0.1);
+      ctx.save();
+      ctx.beginPath(); ctx.moveTo(-0.1, -0.05); ctx.quadraticCurveTo(0.2, 0.75, 0.55, 0.55); ctx.quadraticCurveTo(0.95, 0.3, 0.6, -0.3); ctx.closePath();
+      ctx.fillStyle = 'rgba(255,253,248,0.85)'; ctx.fill();
+      ctx.clip();
+      ctx.strokeStyle = '#B9C7D3'; ctx.lineWidth = 0.035;
+      for (let i = -1; i <= 1.2; i += 0.16) { ctx.beginPath(); ctx.moveTo(i, -0.5); ctx.lineTo(i + 0.8, 0.8); ctx.stroke(); ctx.beginPath(); ctx.moveTo(i, 0.8); ctx.lineTo(i + 0.8, -0.5); ctx.stroke(); }
+      ctx.restore();
+      ctx.beginPath(); ctx.moveTo(-0.1, -0.05); ctx.quadraticCurveTo(0.2, 0.75, 0.55, 0.55); ctx.quadraticCurveTo(0.95, 0.3, 0.6, -0.3);
+      ctx.strokeStyle = '#B9C7D3'; ctx.lineWidth = 0.04; ctx.stroke();
+      ellipse(0.25, -0.18, 0.37, 0.15, -0.35); ctx.strokeStyle = shade('#9CCB9A', -0.3); ctx.lineWidth = 0.13; ctx.stroke();
+      ctx.strokeStyle = '#9CCB9A'; ctx.lineWidth = 0.08; ctx.stroke();
+    },
+    map() {
+      const panels = [[-0.85, -0.55, -0.3, -0.45], [-0.3, -0.45, 0.3, -0.55], [0.3, -0.55, 0.85, -0.45]];
+      panels.forEach(([x1, y1, x2, y2], i) => {
+        ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.lineTo(x2, y2 + 1.05); ctx.lineTo(x1, y1 + 1.05); ctx.closePath();
+        paint(i === 1 ? '#F3E6C8' : '#F8EED8', 0.05);
+      });
+      ellipse(-0.35, -0.1, 0.32, 0.22, 0.3); ctx.fillStyle = '#B9D7A8'; ctx.fill();
+      ellipse(0.42, 0.18, 0.28, 0.2, -0.2); ctx.fill();
+      ctx.setLineDash([0.07, 0.07]);
+      ctx.beginPath(); ctx.moveTo(-0.6, 0.35); ctx.quadraticCurveTo(-0.2, 0.45, 0.0, 0.05); ctx.quadraticCurveTo(0.2, -0.3, 0.5, -0.2);
+      ctx.strokeStyle = '#8A6D4B'; ctx.lineWidth = 0.04; ctx.stroke();
+      ctx.setLineDash([]);
+      line([[0.44, -0.3], [0.62, -0.12]], '#E9776B', 0.08); line([[0.62, -0.3], [0.44, -0.12]], '#E9776B', 0.08);
+    },
+    mop() {
+      tube(() => { ctx.moveTo(0.55, -0.92); ctx.lineTo(-0.05, 0.3); }, '#8FB8DE', 0.09);
+      ctx.save(); ctx.translate(-0.1, 0.38); ctx.rotate(0.45);
+      ctx.beginPath(); roundRectPath(-0.3, -0.1, 0.6, 0.14, 0.05); paint('#C3C9D1', 0.04);
+      for (let i = 0; i < 8; i++) {
+        const x = -0.26 + i * 0.075;
+        ctx.beginPath(); ctx.moveTo(x, 0.02); ctx.quadraticCurveTo(x + (i % 2 ? 0.06 : -0.06), 0.3, x + (i - 3.5) * 0.04, 0.52);
+        ctx.strokeStyle = shade('#FFF4DE', -0.25); ctx.lineWidth = 0.09; ctx.stroke();
+        ctx.strokeStyle = '#FFF4DE'; ctx.lineWidth = 0.05; ctx.stroke();
+      }
+      ctx.restore();
+    },
+  };
+
+  function drawPicture(pic, t, glow, pulse) {
+    let rot = 0;
+    const wp = (t - pic.wobbleT0) / CONFIG.WOBBLE_MS;
+    if (wp >= 0 && wp < 1) rot = Math.sin(wp * Math.PI * 5) * (1 - wp) * (reduceMotion ? 0.05 : 0.14);
+
+    // Pop in when the pictures arrive; the right one bounces when chosen.
+    let sc = 1;
+    if (state.step === 'pick' || state.step === 'done') {
+      const pp = clamp((t - state.pickT0) / CONFIG.POP_MS, 0, 1);
+      sc = reduceMotion ? 1 : lerp(0.6, 1, easeOutBack(pp));
+      ctx.globalAlpha = clamp(pp * 2, 0, 1);
+    }
+    if (state.step === 'done' || state.phase === 'celebrate') {
+      const dp = clamp((t - state.stepT0) / 500, 0, 1);
+      if (pic.correct) sc *= 1 + 0.1 * Math.sin(Math.PI * dp);
+      else ctx.globalAlpha = 1 - 0.75 * dp;
+    }
+    sc *= pulse;
+
+    const s = pic.s;
+    ctx.save();
+    ctx.translate(pic.x, pic.y);
+    ctx.rotate(rot);
+    ctx.scale(sc, sc);
+    if (glow > 0) {
+      const g = s * (0.06 + 0.06 * glow);
+      ctx.save();
+      ctx.globalAlpha *= 0.3 + 0.4 * glow;
+      ctx.beginPath(); roundRectPath(-s / 2 - g, -s / 2 - g, s + 2 * g, s + 2 * g, s * 0.16 + g);
+      ctx.fillStyle = COLORS.slide; ctx.fill();
+      ctx.restore();
+    }
+    ctx.save();
+    ctx.globalAlpha *= 0.12;
+    ctx.beginPath(); roundRectPath(-s / 2, -s / 2 + s * 0.04, s, s, s * 0.16);
+    ctx.fillStyle = COLORS.ink; ctx.fill();
+    ctx.restore();
+    ctx.beginPath(); roundRectPath(-s / 2, -s / 2, s, s, s * 0.16);
+    ctx.fillStyle = COLORS.card; ctx.fill();
+    ctx.lineWidth = Math.max(2, s * 0.02);
+    ctx.strokeStyle = COLORS.signEdge; ctx.stroke();
+    ctx.scale(s * 0.38, s * 0.38);
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    PICS[pic.word]();
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  // The blend slider: a soft track, colour that fills as the finger slides,
+  // a dot under each letter, and a round knob that says "drag me".
+  function drawSlider(t, pulse, ghost) {
+    const a = arrowGeom();
+    const u = L.u;
+    const lw = Math.max(14, u * 0.16);
+    const head = a.x0 + state.slide * (a.x1 - a.x0);
+    let alpha = 1;
+    if (state.step === 'merge') alpha = 1 - clamp((t - state.stepT0) / 400, 0, 1);
+    if (alpha <= 0) return;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.lineCap = 'round';
+    const xs = a.x0 - u * 0.15, xe = a.x1 + u * 0.08;
+    ctx.beginPath(); ctx.moveTo(xs, a.y); ctx.lineTo(xe, a.y);
+    ctx.strokeStyle = COLORS.track; ctx.lineWidth = lw; ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(xe + lw * 0.2, a.y - lw * 1.1); ctx.lineTo(xe + lw * 1.5, a.y); ctx.lineTo(xe + lw * 0.2, a.y + lw * 1.1); ctx.closePath();
+    ctx.lineJoin = 'round';
+    ctx.fillStyle = state.slide >= CONFIG.SLIDE_DONE ? COLORS.slide : COLORS.track;
+    ctx.strokeStyle = ctx.fillStyle; ctx.lineWidth = lw * 0.4;
+    ctx.fill(); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(xs, a.y); ctx.lineTo(Math.max(xs + 0.1, head), a.y);
+    ctx.strokeStyle = COLORS.slide; ctx.lineWidth = lw; ctx.stroke();
+    for (let i = 0; i < 3; i++) {
+      const x = a.x0 + (a.x1 - a.x0) * i / 2;
+      const lit = state.slide >= i / 2 && (state.slide > 0 || state.sliding);
+      ctx.beginPath(); ctx.arc(x, a.y, lw * 0.28, 0, TAU);
+      ctx.fillStyle = lit ? FRIENDS[i].accent : '#FFFDF8'; ctx.fill();
+    }
+    const kr = Math.max(22, u * 0.2) * pulse;
+    ctx.beginPath(); ctx.arc(head, a.y, kr, 0, TAU);
+    ctx.fillStyle = COLORS.card; ctx.fill();
+    ctx.lineWidth = Math.max(3, kr * 0.22); ctx.strokeStyle = COLORS.slide; ctx.stroke();
+    if (ghost >= 0) {
+      // Hint: a see-through "finger" sliding along the arrow.
+      const gx = lerp(head, a.x1, easeInOutQuad(ghost));
+      ctx.globalAlpha = alpha * 0.45 * Math.sin(Math.PI * ghost);
+      ctx.beginPath(); ctx.arc(gx, a.y, kr * 0.85, 0, TAU);
+      ctx.fillStyle = COLORS.ink; ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawStar(cx, cy, R, fill, face) {
+    ctx.save();
+    ctx.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const rad = i % 2 === 0 ? R : R * 0.5;
+      const a = -Math.PI / 2 + i * Math.PI / 5;
+      const x = cx + rad * Math.cos(a), y = cy + rad * Math.sin(a);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    ctx.lineJoin = 'round';
+    if (fill) {
+      ctx.fillStyle = fill;
+      ctx.fill();
+      ctx.strokeStyle = fill;            // same-colour stroke rounds the tips
+      ctx.lineWidth = Math.max(2, R * 0.16);
+      ctx.stroke();
+    } else {
+      ctx.strokeStyle = 'rgba(74, 64, 54, 0.25)';
+      ctx.lineWidth = Math.max(2, R * 0.14);
+      ctx.stroke();
+    }
+
+    if (face) {
+      ctx.fillStyle = COLORS.ink;
+      ctx.beginPath(); ctx.arc(cx - R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.arc(cx + R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.strokeStyle = COLORS.ink;
+      ctx.lineWidth = Math.max(2, R * 0.05);
+      ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.arc(cx, cy + R * 0.06, R * 0.17, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+      ctx.globalAlpha = 0.35;
+      ctx.fillStyle = COLORS.cheek;
+      ctx.beginPath(); ctx.ellipse(cx - R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(cx + R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // Same ring of sparkles for every right answer (no random rewards).
+  function spawnParticles(x, y, size, t) {
+    for (let i = 0; i < 10; i++) {
+      const a = -Math.PI / 2 + (i - 4.5) * 0.3;
+      state.particles.push({ x0: x, y0: y, dx: Math.cos(a), dy: Math.sin(a), dist: size * 0.75, t0: t, life: 900, color: i % 2 ? COLORS.star : FRIENDS[i % 3].accent });
+    }
+  }
+
+  function drawParticles(t) {
+    state.particles = state.particles.filter(p => t - p.t0 < p.life);
+    for (const p of state.particles) {
+      const k = (t - p.t0) / p.life;
+      const e = easeOutCubic(k);
+      ctx.globalAlpha = 1 - k;
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x0 + p.dx * p.dist * e, p.y0 + p.dy * p.dist * e, L.u * 0.06 * (1 - k * 0.5), 0, TAU);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------------------------------------------------------------------
+  // Screens
+  // ---------------------------------------------------------------------
+  function starGeom() {
+    return { cx: W / 2, cy: H * 0.42, R: Math.min(W, H) * 0.2 };
+  }
+
+  // Start and between-round screen: one big pulsing star to tap, plus 5 slots
+  // that fill up so the child can see the end coming.
+  function drawStarScreen(t) {
+    const { cx, cy, R } = starGeom();
+    const amp = reduceMotion ? 0.03 : 0.07;
+    const k = 1 + amp * (0.5 - 0.5 * Math.cos(TAU * t / 1400));
+    drawStar(cx, cy, R * k, COLORS.star, true);
+
+    const sr = R * 0.16, gap = sr * 2.8, y = cy + R * 1.35;
+    for (let i = 0; i < CONFIG.ROUNDS; i++) {
+      drawStar(cx + (i - (CONFIG.ROUNDS - 1) / 2) * gap, y, sr, i < state.round ? COLORS.star : null, false);
+    }
+  }
+
+  function fitFont(text, weight, size, maxW) {
+    ctx.font = `${weight} ${size}px ${FONT}`;
+    while (size > 12 && ctx.measureText(text).width > maxW) {
+      size -= 1;
+      ctx.font = `${weight} ${size}px ${FONT}`;
+    }
+    return size;
+  }
+
+  // Static end screen. No buttons: the session is over.
+  function drawEnd() {
+    const gh = H * 0.14;
+    ctx.fillStyle = COLORS.grass;
+    ctx.beginPath();
+    ctx.moveTo(0, H - gh);
+    ctx.quadraticCurveTo(W / 2, H - gh * 1.5, W, H - gh);
+    ctx.lineTo(W, H);
+    ctx.lineTo(0, H);
+    ctx.closePath();
+    ctx.fill();
+
+    const R = Math.min(W, H) * 0.2;
+    const cy = H * 0.36;
+    drawStar(W / 2, cy, R, COLORS.star, true);
+
+    const big = clamp(Math.min(W, H) * 0.1, 26, 68);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = COLORS.ink;
+    const top = cy + R * 1.25;
+    fitFont('Great Job!', 800, big, W * 0.9);
+    ctx.fillText('Great Job!', W / 2, top + big * 0.5);
+    fitFont('Time to play outside!', 700, Math.round(big * 0.62), W * 0.9);
+    ctx.fillText('Time to play outside!', W / 2, top + big * 1.55);
+  }
+
+  // What to pulse or glow right now, depending on the step.
+  function guidance(t) {
+    const out = { friend: -1, friendPulse: 1, friendGlow: 0, knobPulse: 1, ghost: -1, picPulse: 1, picGlow: 0 };
+    if (state.phase !== 'play') return out;
+    const amp = reduceMotion ? 0.04 : 0.1;
+    const idle = t - Math.max(state.lastInteraction, state.stepT0);
+    const wave = idle > CONFIG.IDLE_PULSE_MS ? 0.5 - 0.5 * Math.cos(TAU * (idle - CONFIG.IDLE_PULSE_MS) / 1300) : 0;
+    const hintTime = idle > CONFIG.TUTORIAL_HINT_MS;
+
+    if (state.step === 'tap') {
+      out.friend = state.friends.findIndex(f => !f.tapped);
+      out.friendPulse = 1 + amp * 0.6 * wave;
+      if (state.round === 0 && hintTime) out.friendGlow = wave;
+    } else if (state.step === 'blend' && !state.sliding) {
+      out.knobPulse = 1 + amp * 2 * wave;
+      if (hintTime) out.ghost = ((idle - CONFIG.TUTORIAL_HINT_MS) % 1800) / 1800;
+    } else if (state.step === 'pick') {
+      out.picPulse = 1 + amp * 0.35 * wave;
+      // Scaffolding: glow the right picture after 2 slips on this word, or in
+      // the very first round if the child has not found the mechanic yet.
+      if (state.wordErrors >= 2) out.picGlow = 0.5 + 0.5 * Math.sin(TAU * t / 1300);
+      else if (state.round === 0 && state.wordIndex === 0 && hintTime) out.picGlow = wave;
+    }
+    return out;
+  }
+
+  function drawPlay(t) {
+    const g = guidance(t);
+    const merge = mergeAmount(t);
+
+    if (state.step === 'blend' || state.step === 'merge') drawSlider(t, g.knobPulse, g.ghost);
+
+    const order = [0, 2, 1];   // middle friend in front when they huddle
+    for (const i of order) drawFriendBody(i, t, merge, i === g.friend ? g.friendPulse : 1, i === g.friend ? g.friendGlow : 0);
+    for (const i of order) drawFriendSign(i, t, merge, i === g.friend ? g.friendPulse : 1);
+
+    if (state.step === 'pick' || state.step === 'done' || state.phase === 'celebrate') {
+      for (const pic of state.pictures) drawPicture(pic, t, pic.correct ? g.picGlow : 0, g.picPulse);
+    }
+    drawParticles(t);
+  }
+
+  // ---------------------------------------------------------------------
+  // Main loop
+  // ---------------------------------------------------------------------
+  function update(t) {
+    if (state.phase === 'play' && state.step === 'merge' && t - state.stepT0 >= CONFIG.BLEND_TO_PICK_MS) {
+      state.step = 'pick';
+      state.stepT0 = t;
+      state.pickT0 = t;
+      state.lastInteraction = t;
+      log('Pictures shown: tap the one for', state.word);
+    }
+
+    if (state.phase === 'play' && state.completeAt && t >= state.completeAt) {
+      state.completeAt = 0;
+      nextWordOrFinish();
+    }
+
+    if (state.phase === 'celebrate' && t - state.celebrateStart >= CONFIG.CELEBRATE_MS) {
+      if (state.round >= CONFIG.ROUNDS) enterEnd();
+      else state.phase = 'between';
+    }
+  }
+
+  function render(t) {
+    ctx.fillStyle = COLORS.bg;
+    ctx.fillRect(0, 0, W, H);
+    if (state.phase === 'start' || state.phase === 'between') drawStarScreen(t);
+    else if (state.phase === 'play' || state.phase === 'celebrate') drawPlay(t);
+    else if (state.phase === 'end') drawEnd();
+  }
+
+  let rafId = 0;
+  function frame(t) {
+    update(t);
+    render(t);
+    // The end screen is static: stop the loop entirely.
+    if (state.phase !== 'end') rafId = requestAnimationFrame(frame);
+  }
+
+  function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    DPR = Math.min(window.devicePixelRatio || 1, 2.5);
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    computeLayout();
+    if (state.phase === 'end') render(now());
+  }
+
+  window.addEventListener('resize', resize);
+  window.addEventListener('orientationchange', resize);
+
+  resize();
+  log('Game loaded', { roundsPerSession: CONFIG.ROUNDS, wordsPerRound: CONFIG.WORDS_PER_ROUND, gamesCompletedBefore: progress.gamesCompleted });
+  rafId = requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,1893 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Five Senses Sorting</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
+  body {
+    background: #F6F1E7;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  canvas { display: block; width: 100%; height: 100%; }
+
+  #home {
+    position: fixed; top: max(10px, env(safe-area-inset-top)); right: max(10px, env(safe-area-inset-right));
+    width: 52px; height: 52px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+    background: rgba(255, 253, 248, 0.85); box-shadow: 0 2px 8px rgba(74, 64, 54, 0.15);
+    -webkit-tap-highlight-color: transparent; z-index: 5;
+  }
+  #home:active { transform: scale(0.94); }
+
+  /* Hidden parent view: press and hold the top-left corner for 3 seconds. */
+  #parent {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: rgba(74, 64, 54, 0.55); padding: 16px; box-sizing: border-box; z-index: 10;
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #4A4036;
+  }
+  #parent[hidden] { display: none; }
+  #parent .card { background: #FFFDF8; border-radius: 16px; padding: 20px 22px; max-width: 380px; width: 100%; box-shadow: 0 10px 30px rgba(0,0,0,0.18); }
+  #parent h2 { margin: 0 0 10px; font-size: 18px; }
+  #parent table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+  #parent th, #parent td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #EDE5D6; }
+  #parent .hint { margin: 12px 0 0; font-size: 12px; opacity: 0.7; }
+</style>
+</head>
+<body>
+<canvas id="game" aria-label="Five senses sorting game"></canvas>
+<a id="home" href="../../index.html" aria-label="Home">
+  <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><path d="M4 11.5 12 5l8 6.5V19a1 1 0 0 1-1 1h-4.5v-5h-5v5H5a1 1 0 0 1-1-1z" fill="none" stroke="#4A4036" stroke-width="2" stroke-linejoin="round"/></svg>
+</a>
+
+<div id="parent" hidden>
+  <div class="card">
+    <h2>Progress on this device</h2>
+    <div id="parentBody"></div>
+    <p class="hint">Stored only on this device. Tap anywhere to close.</p>
+  </div>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  /* =====================================================================
+   * FIVE SENSES SORTING
+   * ELOF domain: Scientific Reasoning (the body and the senses)
+   *              + Perceptual/Motor (fine motor drag-and-drop).
+   *
+   * Sense "stations" sit along the bottom: eye, ear, nose, mouth (tongue)
+   * and hand. The child carries each thing to the sense we use for it.
+   * Every object was chosen to point at one sense only (a rainbow is for
+   * looking, a bell for listening, a soft blanket for touching).
+   * A correct drop plays that object's sensory moment: the bell rings, the
+   * drum booms, steam swirls up to the nose, the tongue licks.
+   *
+   * Design rules this file follows (from SPEC.md):
+   *  - Coherence: only objects and stations on screen. No score, no menus,
+   *    no text during play.
+   *  - Control of error: an object dropped on the wrong sense glides back
+   *    home. No buzzer, no red X. The rejection itself is the feedback.
+   *  - Forgiving hitboxes: each station card is far larger than an object.
+   *  - Visual prompts: the next object pulses gently when the child is idle.
+   *  - Self-paced: no timers anywhere the child can see or feel.
+   *  - Natural stopping point: 5 rounds, then a static "play outside" screen
+   *    with no "play again" button.
+   * ===================================================================== */
+
+  // ---------------------------------------------------------------------
+  // Configuration
+  // ---------------------------------------------------------------------
+  const CONFIG = {
+    ROUNDS: 5,                     // hard session limit (natural stopping point)
+    STORAGE_KEY: 'five-senses-sorting.v1',
+    IDLE_PULSE_MS: 1500,           // idle time before the next object pulses
+    TUTORIAL_HINT_MS: 5000,        // first round: idle time before the right station glows too
+    RETURN_MS: 380,                // wrong drop: glide-home duration
+    TO_STATION_MS: 260,            // right drop: glide-into-station duration
+    BOUNCE_MS: 320,                // station squash when an object lands
+    FX_MS: 1500,                   // length of the sensory moment after a correct drop
+    CELEBRATE_MS: 1700,            // round-complete celebration length
+    FAST_MS_PER_OBJECT: 5000,      // "quick" threshold for difficulty step-up
+    PARENT_HOLD_MS: 3000,          // hold time for the hidden parent view
+    PARENT_CORNER_PX: 80,
+    TAP_SLOP_PX: 12,               // movement below this is a tap, not a drop
+    HOME_CLEAR_PX: 8,              // extra gap kept around the home button
+    TWO_ROW_MIN_W: 104,            // a single row of stations narrower than this wraps to two rows
+  };
+
+  const COLORS = {
+    bg: '#F6F1E7',
+    ink: '#4A4036',
+    star: '#F6C85F',
+    grass: '#B9D7A8',
+    cheek: '#F2A88A',
+    white: '#FFFDF8',
+    skin: '#F3CFAE',
+    tongue: '#F29BA6',
+  };
+
+  const FONT = 'ui-rounded, "Arial Rounded MT Bold", "Nunito", system-ui, -apple-system, sans-serif';
+
+  // The five senses. verb + organ build the spoken sentence:
+  // "We hear the bell with our ears."
+  const SENSES = {
+    eye:   { verb: 'see',   organ: 'eyes',   word: 'seeing',   color: '#8FB8DE' },
+    ear:   { verb: 'hear',  organ: 'ears',   word: 'hearing',  color: '#B8A9D9' },
+    nose:  { verb: 'smell', organ: 'nose',   word: 'smelling', color: '#9CCB9A' },
+    mouth: { verb: 'taste', organ: 'tongue', word: 'tasting',  color: '#F2A88A' },
+    hand:  { verb: 'feel',  organ: 'hands',  word: 'touching', color: '#F4D35E' },
+  };
+  const SENSE_ORDER = ['eye', 'ear', 'nose', 'mouth', 'hand'];
+
+  // Two clear objects per sense.
+  const OBJECTS = {
+    rainbow:  { sense: 'eye',   name: 'rainbow',    phrase: 'the rainbow' },
+    stars:    { sense: 'eye',   name: 'stars',      phrase: 'the stars' },
+    bell:     { sense: 'ear',   name: 'bell',       phrase: 'the bell' },
+    drum:     { sense: 'ear',   name: 'drum',       phrase: 'the drum' },
+    flower:   { sense: 'nose',  name: 'flower',     phrase: 'the flower' },
+    pie:      { sense: 'nose',  name: 'pie',        phrase: 'the warm pie' },
+    icecream: { sense: 'mouth', name: 'ice cream',  phrase: 'the ice cream' },
+    lemon:    { sense: 'mouth', name: 'lemon',      phrase: 'the sour lemon' },
+    teddy:    { sense: 'hand',  name: 'teddy bear', phrase: 'the soft teddy bear' },
+    blanket:  { sense: 'hand',  name: 'blanket',    phrase: 'the soft blanket' },
+  };
+  const KINDS_BY_SENSE = {};
+  Object.keys(OBJECTS).forEach(k => {
+    const s = OBJECTS[k].sense;
+    (KINDS_BY_SENSE[s] = KINDS_BY_SENSE[s] || []).push(k);
+  });
+
+  // Difficulty ladder for dynamic difficulty adjustment (scaffolding):
+  // more senses to choose between, always two objects per sense.
+  const TIERS = [
+    { senses: 2, perType: 2 },     // 4 objects
+    { senses: 3, perType: 2 },     // 6 objects
+    { senses: 4, perType: 2 },     // 8 objects
+    { senses: 5, perType: 2 },     // 10 objects, all five senses
+  ];
+
+  // Where placed objects rest on a station card (fractions of its size), and the icon.
+  const SLOTS = [[0.27, 0.8], [0.73, 0.8]];
+  const ICON_POS = [0.5, 0.37];
+
+  const TAU = Math.PI * 2;
+  const reduceMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  const MOTION = reduceMotion ? 0.4 : 1;
+
+  // ---------------------------------------------------------------------
+  // Small helpers
+  // ---------------------------------------------------------------------
+  const now = () => performance.now();
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const easeOutCubic = t => 1 - Math.pow(1 - t, 3);
+  const easeInOutQuad = t => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
+  const log = (...args) => console.log('[FiveSenses]', ...args);
+
+  function shuffle(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }
+
+  // Mix a hex colour toward black (amt < 0) or white (amt > 0).
+  const shadeCache = new Map();
+  function shade(hex, amt) {
+    const key = hex + amt;
+    if (shadeCache.has(key)) return shadeCache.get(key);
+    const n = parseInt(hex.slice(1), 16);
+    const target = amt < 0 ? 0 : 255;
+    const p = Math.abs(amt);
+    const c = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map(v => Math.round(lerp(v, target, p)));
+    const out = `rgb(${c[0]},${c[1]},${c[2]})`;
+    shadeCache.set(key, out);
+    return out;
+  }
+
+  // ---------------------------------------------------------------------
+  // Canvas setup
+  // ---------------------------------------------------------------------
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const homeEl = document.getElementById('home');
+  let W = 0, H = 0, DPR = 1;
+
+  // Layout values recomputed on every resize. s = free object radius, pr = placed radius.
+  const L = { m: 16, s: 40, pr: 20 };
+
+  // ---------------------------------------------------------------------
+  // Game state
+  // ---------------------------------------------------------------------
+  const state = {
+    phase: 'start',          // 'start' | 'play' | 'celebrate' | 'between' | 'end'
+    round: 0,                // rounds completed this session
+    tier: 0,                 // index into TIERS
+    stations: [],            // sense cards along the bottom
+    objects: [],
+    drag: null,              // { obj, dx, dy, sx, sy, moved }
+    lastInteraction: 0,
+    roundStart: 0,
+    roundErrors: 0,          // wrong-station drops this round
+    placedThisRound: 0,
+    completeAt: 0,           // time to fire completeRound()
+    celebrateStart: 0,
+    particles: [],
+  };
+
+  // ---------------------------------------------------------------------
+  // Local progress tracking (localStorage, never leaves the device)
+  // ---------------------------------------------------------------------
+  function freshProgress() {
+    return {
+      version: 1, gamesCompleted: 0, roundsCompleted: 0, placements: 0, wrongDrops: 0,
+      slipsBySense: { eye: 0, ear: 0, nose: 0, mouth: 0, hand: 0 },
+      lastPlayed: null, sessions: [],
+    };
+  }
+
+  function loadProgress() {
+    try {
+      const raw = window.localStorage.getItem(CONFIG.STORAGE_KEY);
+      if (raw) {
+        const data = JSON.parse(raw);
+        if (data && data.version === 1 && Array.isArray(data.sessions)) {
+          if (!data.slipsBySense) data.slipsBySense = freshProgress().slipsBySense;
+          return data;
+        }
+      }
+    } catch (e) {
+      console.warn('[FiveSenses] Progress could not be loaded (storage unavailable):', e && e.message);
+    }
+    return freshProgress();
+  }
+
+  function saveProgress() {
+    try {
+      window.localStorage.setItem(CONFIG.STORAGE_KEY, JSON.stringify(progress));
+      log('Progress saved', { gamesCompleted: progress.gamesCompleted, roundsCompleted: progress.roundsCompleted });
+    } catch (e) {
+      console.warn('[FiveSenses] Progress could not be saved (storage unavailable):', e && e.message);
+    }
+  }
+
+  const progress = loadProgress();
+  let session = null; // created on the first round of this app launch
+
+  function ensureSession() {
+    if (session) return;
+    session = { startedAt: new Date().toISOString(), finished: false, rounds: [] };
+    progress.sessions.push(session);
+    if (progress.sessions.length > 30) progress.sessions.splice(0, progress.sessions.length - 30);
+  }
+
+  // ---------------------------------------------------------------------
+  // Audio: Web Audio tones + optional spoken words
+  // ---------------------------------------------------------------------
+  let actx = null;
+  let noiseBuf = null;
+
+  // Browsers only allow audio after a user gesture, so this runs on every pointer down.
+  function unlockAudio() {
+    if (!actx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) { try { actx = new AC(); } catch (e) { actx = null; } }
+    }
+    if (actx && actx.state === 'suspended') actx.resume();
+  }
+
+  function tone(freq, delay, dur, vol = 0.16, type = 'sine') {
+    if (!actx) return;
+    const t = actx.currentTime + delay;
+    const osc = actx.createOscillator();
+    const gain = actx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(vol, t + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    osc.connect(gain).connect(actx.destination);
+    osc.start(t);
+    osc.stop(t + dur + 0.05);
+  }
+
+  // A tone whose pitch slides from f0 to f1 (drum boom, licking "slurp").
+  function glide(f0, f1, delay, dur, vol = 0.14, type = 'sine') {
+    if (!actx) return;
+    const t = actx.currentTime + delay;
+    const osc = actx.createOscillator();
+    const gain = actx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(f0, t);
+    osc.frequency.exponentialRampToValueAtTime(f1, t + dur);
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(vol, t + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    osc.connect(gain).connect(actx.destination);
+    osc.start(t);
+    osc.stop(t + dur + 0.05);
+  }
+
+  // A soft filtered puff of air (sniffing).
+  function puff(delay, dur, vol = 0.08, freq = 1600) {
+    if (!actx) return;
+    if (!noiseBuf) {
+      noiseBuf = actx.createBuffer(1, Math.floor(actx.sampleRate * 0.5), actx.sampleRate);
+      const d = noiseBuf.getChannelData(0);
+      for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    }
+    const t = actx.currentTime + delay;
+    const src = actx.createBufferSource();
+    src.buffer = noiseBuf;
+    const filter = actx.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.frequency.value = freq;
+    filter.Q.value = 1.4;
+    const gain = actx.createGain();
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(vol, t + dur * 0.6);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    src.connect(filter).connect(gain).connect(actx.destination);
+    src.start(t);
+    src.stop(t + dur + 0.05);
+  }
+
+  // Every object always plays the same sensory sound when it lands: predictable feedback.
+  const SOUNDS = {
+    rainbow:  () => [523.25, 587.33, 659.25, 783.99, 880, 1046.5].forEach((f, i) => tone(f, i * 0.07, 0.4, 0.08)),
+    stars:    () => [1567.98, 2093, 1760, 2349.32].forEach((f, i) => tone(f, i * 0.12, 0.25, 0.05)),
+    bell:     () => [0, 0.42].forEach(d => { tone(1318.5, d, 1.0, 0.12); tone(2637, d, 0.45, 0.035); tone(1975.5, d + 0.01, 0.6, 0.04); }),
+    drum:     () => { glide(160, 50, 0, 0.45, 0.4); glide(160, 50, 0.3, 0.45, 0.32); },
+    flower:   () => { puff(0, 0.2); puff(0.25, 0.22); tone(392, 0.55, 0.5, 0.1, 'triangle'); tone(523.25, 0.7, 0.5, 0.08); },
+    pie:      () => { puff(0, 0.2); puff(0.25, 0.22); tone(349.23, 0.55, 0.5, 0.1, 'triangle'); tone(523.25, 0.7, 0.5, 0.08); },
+    icecream: () => { glide(380, 760, 0, 0.16, 0.08); glide(380, 760, 0.22, 0.16, 0.08); tone(523.25, 0.5, 0.3, 0.1); tone(659.25, 0.62, 0.4, 0.1); },
+    lemon:    () => { glide(380, 760, 0, 0.16, 0.08); glide(380, 760, 0.22, 0.16, 0.08); glide(700, 560, 0.5, 0.35, 0.08, 'triangle'); },
+    teddy:    () => { tone(392, 0, 0.25, 0.09, 'triangle'); tone(392, 0.25, 0.25, 0.09, 'triangle'); tone(523.25, 0.5, 0.5, 0.08); },
+    blanket:  () => { tone(349.23, 0, 0.25, 0.09, 'triangle'); tone(349.23, 0.25, 0.25, 0.09, 'triangle'); tone(523.25, 0.5, 0.5, 0.08); },
+  };
+  const playPickup = () => tone(440, 0, 0.08, 0.05, 'triangle');
+  const playRoundDone = () => [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => tone(f, i * 0.12, 0.5, 0.12));
+
+  // Spoken words via the Web Speech API. Android WebView usually lacks it,
+  // so this quietly does nothing there and the tones carry the feedback.
+  // queue = true lets a sentence finish before the next one starts.
+  function say(text, queue = false) {
+    try {
+      if (!('speechSynthesis' in window)) return;
+      if (!queue) window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'en-US';
+      u.rate = 0.85;
+      u.pitch = 1.15;
+      window.speechSynthesis.speak(u);
+    } catch (e) { /* speech is optional */ }
+  }
+
+  // ---------------------------------------------------------------------
+  // Rounds and difficulty
+  // ---------------------------------------------------------------------
+  function startRound() {
+    ensureSession();
+    const tier = TIERS[state.tier];
+    const senses = tier.senses === SENSE_ORDER.length
+      ? SENSE_ORDER.slice()
+      : shuffle(SENSE_ORDER.slice()).slice(0, tier.senses).sort((a, b) => SENSE_ORDER.indexOf(a) - SENSE_ORDER.indexOf(b));
+
+    state.stations = senses.map(sense => ({
+      sense, count: 0, capacity: tier.perType, bounceT0: -1e9, fxT0: -1e9, fxSlot: 0, x: 0, y: 0, w: 0, h: 0,
+    }));
+
+    const objects = [];
+    senses.forEach(sense => {
+      shuffle(KINDS_BY_SENSE[sense].slice()).slice(0, tier.perType).forEach(kind => {
+        objects.push({
+          kind,
+          sense,
+          jx: Math.random() * 2 - 1,   // fixed jitter so homes stay put across resizes
+          jy: Math.random() * 2 - 1,
+          x: 0, y: 0, homeX: 0, homeY: 0, scale: 1,
+          state: 'idle',             // 'idle' | 'drag' | 'return' | 'toStation' | 'placed'
+          anim: null, animP: 0,
+          errors: 0, station: null, slot: -1, landT0: -1e9,
+        });
+      });
+    });
+    shuffle(objects).forEach((o, i) => { o.homeSlot = i; });
+
+    state.objects = objects;
+    state.roundErrors = 0;
+    state.placedThisRound = 0;
+    state.completeAt = 0;
+    state.particles = [];
+    state.drag = null;
+    computeLayout();
+
+    state.phase = 'play';
+    state.roundStart = now();
+    state.lastInteraction = now();
+    if (state.round === 0) {
+      // Name only the helpers that are on screen: "the ears or the hands".
+      const names = senses.map(s => `the ${SENSES[s].organ}`);
+      const list = names.length > 1 ? `${names.slice(0, -1).join(', ')} or ${names[names.length - 1]}` : names[0];
+      say(`How do we know it? Bring each thing to ${list}.`);
+    }
+    log(`Round ${state.round + 1}/${CONFIG.ROUNDS} started at level ${state.tier + 1}: senses ${senses.join(', ')}`);
+  }
+
+  function completeRound() {
+    const t = now();
+    const n = state.objects.length;
+    const withErrors = state.objects.filter(o => o.errors > 0).length;
+    const ms = t - state.roundStart;
+    const record = {
+      level: state.tier + 1,
+      senses: state.stations.length,
+      objects: n,
+      firstTry: n - withErrors,
+      wrongDrops: state.roundErrors,
+      seconds: Math.round(ms / 100) / 10,
+    };
+
+    session.rounds.push(record);
+    progress.roundsCompleted++;
+    progress.placements += n;
+    progress.wrongDrops += state.roundErrors;
+    progress.lastPlayed = new Date().toISOString();
+    state.round++;
+    log('Level completed', record);
+
+    const finalRound = state.round >= CONFIG.ROUNDS;
+    if (finalRound) {
+      session.finished = true;
+      progress.gamesCompleted++;
+    } else {
+      // Praise the effort, not the child's "smartness" (growth mindset).
+      say(state.roundErrors > 0 ? 'You kept trying, and you did it!' : 'You found a sense for everything!', true);
+    }
+    saveProgress();
+    adjustDifficulty(record, ms);
+
+    playRoundDone();
+    state.stations.forEach(st => { st.bounceT0 = t; spawnParticles(st, t); });
+    state.phase = 'celebrate';
+    state.celebrateStart = t;
+  }
+
+  // Simple DDA: quick and clean -> one step harder; a real struggle -> one step easier.
+  function adjustDifficulty(record, ms) {
+    const fast = ms / record.objects <= CONFIG.FAST_MS_PER_OBJECT;
+    const before = state.tier;
+    if (record.firstTry === record.objects && fast) {
+      state.tier = Math.min(TIERS.length - 1, state.tier + 1);
+    } else if (record.wrongDrops >= Math.max(3, Math.ceil(record.objects / 2))) {
+      state.tier = Math.max(0, state.tier - 1);
+    }
+    if (state.tier !== before) log(`Difficulty ${state.tier > before ? 'up' : 'down'}: level ${before + 1} -> ${state.tier + 1}`);
+  }
+
+  function enterEnd() {
+    state.phase = 'end';
+    say('Great job! Time to play outside!', true);
+    log('Session finished: end screen shown, no replay offered');
+  }
+
+  // ---------------------------------------------------------------------
+  // Layout
+  // ---------------------------------------------------------------------
+  // The area under the home button (top-right) that must stay free of objects.
+  function homeReserve() {
+    const r = homeEl ? homeEl.getBoundingClientRect() : null;
+    if (!r || !r.width) return { left: W - 72, bottom: 72 };
+    return { left: r.left - CONFIG.HOME_CLEAR_PX, bottom: r.bottom + CONFIG.HOME_CLEAR_PX };
+  }
+
+  // Spread n homes on a grid, skipping any cell that would sit under the home button.
+  function gridHomes(n, ax, ay, aw, ah) {
+    const res = homeReserve();
+    let last = null;
+    for (let extra = 0; extra <= 3; extra++) {
+      const total = n + extra;
+      const rows = Math.ceil(total / clamp(Math.round(Math.sqrt(total * aw / ah)), 1, total));
+      const cols = Math.ceil(total / rows);
+      const cw = aw / cols, ch = ah / rows;
+      const reach = Math.min(cw, ch) * 0.45;
+      const cells = [];
+      for (let i = 0; i < total; i++) {
+        const row = Math.floor(i / cols);
+        const inRow = row === rows - 1 ? total - row * cols : cols;
+        const col = i - row * cols;
+        const rowOffset = (cols - inRow) * cw / 2;   // centre a short last row
+        cells.push({ x: ax + rowOffset + cw * (col + 0.5), y: ay + ch * (row + 0.5) });
+      }
+      const free = cells.filter(c => !(c.x + reach > res.left && c.y - reach < res.bottom));
+      last = { cells: free.length >= n ? free : cells, cw, ch };
+      if (free.length >= n) break;
+    }
+    return last;
+  }
+
+  function computeLayout() {
+    const minDim = Math.min(W, H);
+    const m = clamp(minDim * 0.045, 12, 36);
+    const k = state.stations.length || 3;
+    const portrait = H > W * 1.1;
+
+    // Stations sit along the bottom. Narrow screens (portrait phones) wrap 4-5 stations
+    // into two rows: the first row holds the extra one, both rows are centred.
+    // Two rows are used only when they really give bigger cards than one row.
+    const cardSize = twoRows => {
+      const perRow = twoRows ? Math.ceil(k / 2) : k;
+      const w = Math.max(40, Math.min((W - m * (perRow + 1)) / perRow, H * (twoRows ? 0.19 : 0.34), 260));
+      const h = Math.min(w * (portrait ? 1.2 : 0.98), H * (twoRows ? 0.2 : 0.36));
+      return { perRow, w, h, size: Math.min(w, h) };
+    };
+    const one = cardSize(false);
+    const two = k >= 4 ? cardSize(true) : null;
+    const twoRows = !!two && (one.w < CONFIG.TWO_ROW_MIN_W || portrait) && two.size > one.size * 1.1;
+    const { perRow, w: stW, h: stH } = twoRows ? two : one;
+    const rows = twoRows ? 2 : 1;
+    const bottomY = H - m - stH;
+    state.stations.forEach((st, i) => {
+      const row = twoRows && i >= perRow ? 1 : 0;
+      const inRow = row === 0 ? Math.min(perRow, k) : k - perRow;
+      const col = row === 0 ? i : i - perRow;
+      const rowW = inRow * stW + (inRow - 1) * m;
+      st.x = (W - rowW) / 2 + col * (stW + m);
+      st.y = bottomY - (rows - 1 - row) * (stH + m);
+      st.w = stW;
+      st.h = stH;
+    });
+    const topY = bottomY - (rows - 1) * (stH + m);
+
+    // Objects are spread on a grid in the area above the stations.
+    const ax = m, ay = m;
+    const aw = W - 2 * m;
+    const ah = Math.max(60, topY - m * 1.4 - ay);
+    const n = Math.max(1, state.objects.length);
+    const grid = gridHomes(n, ax, ay, aw, ah);
+
+    // Object radius. stW >= 2.6 * s keeps every drop zone far wider than an object.
+    let s = clamp(minDim * 0.09, 22, 72);
+    s = Math.min(s, stW / 2.6, grid.cw * 0.36, grid.ch * 0.36);
+    L.m = m;
+    L.s = s;
+    L.pr = Math.min(stW * 0.19, stH * 0.15, s * 0.85);
+
+    state.objects.forEach(o => {
+      const c = grid.cells[o.homeSlot];
+      o.homeX = c.x + o.jx * grid.cw * 0.08;
+      o.homeY = c.y + o.jy * grid.ch * 0.08;
+    });
+    relayoutObjects();
+  }
+
+  // Keep every object where it belongs after a resize or rotation.
+  function relayoutObjects() {
+    for (const o of state.objects) {
+      if (o.state === 'idle') {
+        o.x = o.homeX; o.y = o.homeY;
+      } else if (o.state === 'return' && o.anim) {
+        o.anim.tx = o.homeX; o.anim.ty = o.homeY;
+      } else if (o.state === 'toStation' && o.anim) {
+        const p = slotPos(o.station, o.slot);
+        o.anim.tx = p.x; o.anim.ty = p.y; o.anim.ts = L.pr / L.s;
+      } else if (o.state === 'placed') {
+        const p = slotPos(o.station, o.slot);
+        o.x = p.x; o.y = p.y;
+      } else if (o.state === 'drag') {
+        o.x = clamp(o.x, 0, W); o.y = clamp(o.y, 0, H);
+      }
+    }
+  }
+
+  function slotPos(st, index) {
+    const f = SLOTS[index] || SLOTS[0];
+    return { x: st.x + st.w * f[0], y: st.y + st.h * f[1] };
+  }
+
+  function iconGeom(st) {
+    return { x: st.x + st.w * ICON_POS[0], y: st.y + st.h * ICON_POS[1], r: Math.min(st.w * 0.3, st.h * 0.26) };
+  }
+
+  // Generous drop zone: the card plus margins. Nearest card wins on overlap (two rows).
+  function findDropStation(o) {
+    let best = null, bestD = Infinity;
+    for (const st of state.stations) {
+      const padX = Math.max(L.s * 0.6, st.w * 0.1);
+      const padTop = L.s * 1.3;
+      if (o.x >= st.x - padX && o.x <= st.x + st.w + padX && o.y >= st.y - padTop && o.y <= st.y + st.h + L.m) {
+        const d = Math.hypot(o.x - (st.x + st.w / 2), o.y - (st.y + st.h / 2));
+        if (d < bestD) { best = st; bestD = d; }
+      }
+    }
+    return best;
+  }
+
+  const stationFor = sense => state.stations.find(st => st.sense === sense) || null;
+
+  // ---------------------------------------------------------------------
+  // Drag and drop
+  // ---------------------------------------------------------------------
+  // Forgiving pick: the nearest object within 1.5x its radius.
+  function pickObject(p) {
+    let best = null, bestD = Infinity;
+    for (const o of state.objects) {
+      if (o.state !== 'idle' && o.state !== 'return') continue;
+      const d = Math.hypot(p.x - o.x, p.y - o.y);
+      if (d <= L.s * 1.5 && d < bestD) { best = o; bestD = d; }
+    }
+    return best;
+  }
+
+  function beginDrag(o, p) {
+    o.state = 'drag';
+    o.anim = null;
+    o.scale = 1;
+    state.drag = { obj: o, dx: o.x - p.x, dy: o.y - p.y, sx: p.x, sy: p.y, moved: 0 };
+    // Draw the held object on top of the others.
+    state.objects.splice(state.objects.indexOf(o), 1);
+    state.objects.push(o);
+    playPickup();
+    say(OBJECTS[o.kind].name);
+    log('Picked up', o.kind);
+  }
+
+  function dropObject() {
+    const o = state.drag.obj;
+    const wasTap = state.drag.moved < CONFIG.TAP_SLOP_PX;
+    state.drag = null;
+    const st = wasTap ? null : findDropStation(o);
+
+    if (st && st.sense === o.sense) {
+      acceptObject(o, st);
+    } else {
+      if (st) {
+        o.errors++;
+        state.roundErrors++;
+        progress.slipsBySense[o.sense] = (progress.slipsBySense[o.sense] || 0) + 1;
+        log(`Item rejected: ${o.kind} dropped on ${st.sense}, gliding home`);
+      }
+      sendHome(o);
+    }
+  }
+
+  function acceptObject(o, st) {
+    o.state = 'toStation';
+    o.station = st;
+    o.slot = st.count++;
+    const target = slotPos(st, o.slot);
+    o.anim = { fx: o.x, fy: o.y, tx: target.x, ty: target.y, fs: o.scale, ts: L.pr / L.s, t0: now(), dur: CONFIG.TO_STATION_MS, ease: easeInOutQuad };
+    o.animP = 0;
+  }
+
+  // Montessori control of error: the object simply glides back to where it started.
+  function sendHome(o) {
+    o.state = 'return';
+    o.anim = { fx: o.x, fy: o.y, tx: o.homeX, ty: o.homeY, fs: o.scale, ts: 1, t0: now(), dur: CONFIG.RETURN_MS, ease: easeOutCubic };
+    o.animP = 0;
+  }
+
+  // Called when an object finishes gliding onto the right station. The sensory sound,
+  // station bounce and both animations (object + sense icon) start on the same frame.
+  function landInStation(o, t) {
+    const st = o.station;
+    const info = SENSES[o.sense];
+    o.state = 'placed';
+    o.landT0 = t;
+    st.bounceT0 = t;
+    st.fxT0 = t;
+    st.fxSlot = o.slot;
+    SOUNDS[o.kind]();
+    say(`We ${info.verb} ${OBJECTS[o.kind].phrase} with our ${info.organ}.`);
+    state.placedThisRound++;
+    log(`Item successfully placed: ${o.kind} -> ${st.sense}`);
+    if (state.objects.every(x => x.state === 'placed')) state.completeAt = t + 400;
+  }
+
+  // ---------------------------------------------------------------------
+  // Input: touch + mouse
+  // ---------------------------------------------------------------------
+  let activeTouch = null;
+  let mouseDown = false;
+  let parentTimer = null;
+
+  function toCanvas(clientX, clientY) {
+    const r = canvas.getBoundingClientRect();
+    return { x: clientX - r.left, y: clientY - r.top };
+  }
+
+  function findTouch(list, id) {
+    for (let i = 0; i < list.length; i++) if (list[i].identifier === id) return list[i];
+    return null;
+  }
+
+  function cancelParentHold() {
+    if (parentTimer) { clearTimeout(parentTimer); parentTimer = null; }
+  }
+
+  function onDown(p) {
+    unlockAudio();
+    state.lastInteraction = now();
+
+    if (state.phase === 'start' || state.phase === 'between') {
+      const g = starGeom();
+      if (Math.hypot(p.x - g.cx, p.y - g.cy) <= g.R * 1.8) { startRound(); return; }
+    } else if (state.phase === 'play') {
+      const o = pickObject(p);
+      if (o) { beginDrag(o, p); return; }
+    }
+
+    // Hidden parent view: hold the top-left corner still for 3 seconds.
+    if (p.x < CONFIG.PARENT_CORNER_PX && p.y < CONFIG.PARENT_CORNER_PX) {
+      cancelParentHold();
+      parentTimer = setTimeout(openParent, CONFIG.PARENT_HOLD_MS);
+    }
+  }
+
+  function onMove(p) {
+    if (parentTimer && (p.x >= CONFIG.PARENT_CORNER_PX || p.y >= CONFIG.PARENT_CORNER_PX)) cancelParentHold();
+    if (!state.drag) return;
+    state.lastInteraction = now();
+    const d = state.drag;
+    d.moved = Math.max(d.moved, Math.hypot(p.x - d.sx, p.y - d.sy));
+    d.obj.x = clamp(p.x + d.dx, 0, W);
+    d.obj.y = clamp(p.y + d.dy, 0, H);
+  }
+
+  function onUp() {
+    cancelParentHold();
+    if (state.drag) dropObject();
+  }
+
+  canvas.addEventListener('touchstart', e => {
+    e.preventDefault();
+    if (activeTouch !== null) return;          // one finger at a time
+    const t = e.changedTouches[0];
+    activeTouch = t.identifier;
+    onDown(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  canvas.addEventListener('touchmove', e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (t) onMove(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  const endTouch = e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (!t) return;
+    activeTouch = null;
+    onUp();
+  };
+  canvas.addEventListener('touchend', endTouch, { passive: false });
+  canvas.addEventListener('touchcancel', endTouch, { passive: false });
+
+  canvas.addEventListener('mousedown', e => { mouseDown = true; onDown(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mousemove', e => { if (mouseDown) onMove(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mouseup', () => {
+    if (!mouseDown) return;
+    mouseDown = false;
+    onUp();
+  });
+
+  // ---------------------------------------------------------------------
+  // Parent view (hidden, local data only)
+  // ---------------------------------------------------------------------
+  const parentEl = document.getElementById('parent');
+  const parentBody = document.getElementById('parentBody');
+
+  function el(tag, text) {
+    const node = document.createElement(tag);
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function openParent() {
+    parentTimer = null;
+    const objects = progress.sessions.reduce((a, s) => a + s.rounds.reduce((b, r) => b + r.objects, 0), 0);
+    const firstTry = progress.sessions.reduce((a, s) => a + s.rounds.reduce((b, r) => b + r.firstTry, 0), 0);
+    const slips = progress.slipsBySense || {};
+    const tricky = SENSE_ORDER.filter(k => slips[k] > 0).sort((a, b) => slips[b] - slips[a]);
+
+    parentBody.textContent = '';
+    parentBody.appendChild(el('div', `Full games finished: ${progress.gamesCompleted}`));
+    parentBody.appendChild(el('div', `Rounds finished: ${progress.roundsCompleted}`));
+    parentBody.appendChild(el('div', `Things sorted: ${progress.placements}`));
+    parentBody.appendChild(el('div', `Sorted on the first try: ${objects ? Math.round(100 * firstTry / objects) : 0}%`));
+    parentBody.appendChild(el('div', `Most slips: ${tricky.length ? tricky.slice(0, 2).map(k => `${SENSES[k].word} (${slips[k]})`).join(', ') : 'none yet'}`));
+
+    const recent = progress.sessions.slice(-6).reverse();
+    if (recent.length) {
+      const table = el('table');
+      const head = el('tr');
+      ['When', 'Rounds', 'Top level', 'Senses', 'Slips'].forEach(h => head.appendChild(el('th', h)));
+      table.appendChild(head);
+      recent.forEach(s => {
+        const tr = el('tr');
+        const when = new Date(s.startedAt);
+        tr.appendChild(el('td', when.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' ' +
+          when.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })));
+        tr.appendChild(el('td', `${s.rounds.length}/${CONFIG.ROUNDS}`));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => Math.max(a, r.level), 0) || '-')));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => Math.max(a, r.senses || 0), 0) || '-')));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => a + r.wrongDrops, 0))));
+        table.appendChild(tr);
+      });
+      parentBody.appendChild(table);
+    }
+    parentEl.hidden = false;
+    log('Parent view opened', progress);
+  }
+
+  parentEl.addEventListener('click', () => { parentEl.hidden = true; });
+
+  // Read-only debug hooks for the Android/desktop console.
+  window.FiveSenses = {
+    progress: () => JSON.parse(JSON.stringify(progress)),
+    state: () => ({
+      phase: state.phase,
+      round: state.round,
+      level: state.tier + 1,
+      star: (state.phase === 'start' || state.phase === 'between') ? (g => ({ x: g.cx, y: g.cy }))(starGeom()) : null,
+      stations: state.stations.map(st => ({ sense: st.sense, x: st.x + st.w / 2, y: st.y + st.h / 2, w: st.w, h: st.h, count: st.count, capacity: st.capacity })),
+      objects: state.objects.map(o => ({ kind: o.kind, sense: o.sense, correctStation: o.sense, state: o.state, x: o.x, y: o.y, r: o.state === 'placed' ? L.pr : L.s, errors: o.errors })),
+    }),
+  };
+
+  // ---------------------------------------------------------------------
+  // Drawing primitives
+  // ---------------------------------------------------------------------
+  function roundRectPath(x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  // Objects and sense icons are painted in "unit space": they fit inside a circle
+  // of radius 1 around the origin. Line widths use the same units.
+  const LW = 0.06;
+  function ell(x, y, rx, ry, rot = 0) { ctx.beginPath(); ctx.ellipse(x, y, rx, ry, rot, 0, TAU); }
+  function circ(x, y, r) { ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); }
+
+  // Fill the current path and give it a soft darker outline. fill must be a hex colour.
+  function fillOut(fill, lw = LW) {
+    ctx.fillStyle = fill;
+    ctx.fill();
+    ctx.lineWidth = lw;
+    ctx.strokeStyle = shade(fill, -0.3);
+    ctx.stroke();
+  }
+
+  // Stroke the current path as a thick outlined line (stems, drumsticks).
+  function strokeOut(col, w) {
+    ctx.lineWidth = w + LW * 1.6;
+    ctx.strokeStyle = shade(col, -0.3);
+    ctx.stroke();
+    ctx.lineWidth = w;
+    ctx.strokeStyle = col;
+    ctx.stroke();
+  }
+
+  // Several circles as one puffy shape: stroke all, then fill, so only the outer edge is outlined.
+  function puffs(list, fill, lw = LW) {
+    ctx.beginPath();
+    for (const [x, y, r] of list) { ctx.moveTo(x + r, y); ctx.arc(x, y, r, 0, TAU); }
+    ctx.lineWidth = lw * 2;
+    ctx.strokeStyle = shade(fill, -0.25);
+    ctx.stroke();
+    ctx.fillStyle = fill;
+    ctx.fill();
+  }
+
+  function eyeDot(x, y, r) {
+    circ(x, y, r);
+    ctx.fillStyle = COLORS.ink;
+    ctx.fill();
+    circ(x - r * 0.3, y - r * 0.35, r * 0.36);
+    ctx.fillStyle = '#fff';
+    ctx.fill();
+  }
+
+  function cheek(x, y, r) {
+    ctx.globalAlpha = 0.4;
+    ell(x, y, r, r * 0.62);
+    ctx.fillStyle = COLORS.cheek;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  function starPath(x, y, R, inner = 0.5) {
+    ctx.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const rad = i % 2 === 0 ? R : R * inner;
+      const a = -Math.PI / 2 + i * Math.PI / 5;
+      if (i === 0) ctx.moveTo(x + rad * Math.cos(a), y + rad * Math.sin(a));
+      else ctx.lineTo(x + rad * Math.cos(a), y + rad * Math.sin(a));
+    }
+    ctx.closePath();
+  }
+
+  // A four-pointed twinkle.
+  function sparklePath(x, y, s) {
+    ctx.beginPath();
+    ctx.moveTo(x, y - s);
+    ctx.quadraticCurveTo(x, y, x + s, y);
+    ctx.quadraticCurveTo(x, y, x, y + s);
+    ctx.quadraticCurveTo(x, y, x - s, y);
+    ctx.quadraticCurveTo(x, y, x, y - s);
+    ctx.closePath();
+  }
+
+  function heartPath(x, y, s) {
+    ctx.beginPath();
+    ctx.moveTo(x, y + s * 0.4);
+    ctx.bezierCurveTo(x - s * 1.1, y - s * 0.3, x - s * 0.5, y - s * 1.0, x, y - s * 0.45);
+    ctx.bezierCurveTo(x + s * 0.5, y - s * 1.0, x + s * 1.1, y - s * 0.3, x, y + s * 0.4);
+    ctx.closePath();
+  }
+
+  // Envelope that rises and falls over an effect: 0 -> 1 -> 0. k is null when idle.
+  const bump = k => (k === null ? 0 : Math.sin(Math.PI * k));
+
+  // ---------------------------------------------------------------------
+  // Objects (unit space; k = progress of the sensory moment 0..1, or null)
+  // ---------------------------------------------------------------------
+  function drawRainbow(k) {
+    const bands = ['#E58F86', '#F2A65A', '#F6C85F', '#9CCB9A', '#8FB8DE', '#B8A9D9'];
+    const cy = 0.3;
+    for (let i = 0; i < bands.length; i++) {
+      ctx.beginPath();
+      ctx.arc(0, cy, 0.87 - i * 0.1, Math.PI, TAU);
+      ctx.lineWidth = 0.105;
+      ctx.strokeStyle = bands[i];
+      ctx.stroke();
+    }
+    ctx.lineWidth = LW * 0.6;
+    ctx.strokeStyle = 'rgba(74, 64, 54, 0.3)';
+    ctx.beginPath(); ctx.arc(0, cy, 0.92, Math.PI, TAU); ctx.stroke();
+    ctx.beginPath(); ctx.arc(0, cy, 0.32, Math.PI, TAU); ctx.stroke();
+
+    // Shimmer: a soft light sweeps along the bands while twinkles pop.
+    if (k !== null) {
+      const a = Math.PI + k * Math.PI;
+      ctx.globalAlpha = 0.55 * (1 - k);
+      ctx.beginPath();
+      ctx.arc(0, cy, 0.62, a - 0.22, a + 0.22);
+      ctx.lineWidth = 0.6;
+      ctx.strokeStyle = '#FFFFFF';
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = '#FFFFFF';
+      [[-0.55, -0.35, 0], [0.1, -0.68, 0.25], [0.6, -0.3, 0.5]].forEach(([x, y, d]) => {
+        const s = 0.16 * Math.max(0, Math.sin(Math.PI * clamp((k - d) / 0.5, 0, 1)));
+        if (s > 0.005) { sparklePath(x, y, s); ctx.fill(); }
+      });
+    }
+    puffs([[-0.78, cy + 0.06, 0.15], [-0.6, cy, 0.17], [-0.45, cy + 0.08, 0.13]], COLORS.white);
+    puffs([[0.45, cy + 0.08, 0.13], [0.6, cy, 0.17], [0.78, cy + 0.06, 0.15]], COLORS.white);
+  }
+
+  function drawStars(k) {
+    const sky = '#5E6C9C', moon = '#F6D55C';
+    circ(0, 0, 0.86);
+    fillOut(sky, LW * 1.2);
+    circ(0, 0, 0.78);
+    ctx.lineWidth = LW * 0.8;
+    ctx.strokeStyle = shade(sky, 0.15);
+    ctx.stroke();
+    circ(-0.28, -0.12, 0.32);                                  // crescent moon
+    ctx.fillStyle = moon;
+    ctx.fill();
+    circ(-0.15, -0.22, 0.27);
+    ctx.fillStyle = sky;
+    ctx.fill();
+    const list = [[0.34, -0.38, 0.13], [0.42, 0.24, 0.1], [-0.1, 0.46, 0.11], [0.06, -0.6, 0.07], [-0.5, 0.32, 0.07]];
+    list.forEach(([x, y, r], i) => {
+      const tw = k === null ? 1 : 1 + 0.6 * Math.max(0, Math.sin(k * TAU * 2 + i * 1.3)) * (1 - k);
+      starPath(x, y, r * tw);
+      ctx.fillStyle = COLORS.star;
+      ctx.fill();
+    });
+  }
+
+  function drawBell(k) {
+    const gold = '#F6C85F', rim = '#E8B04A', ribbon = '#E58F86';
+    const swing = k === null ? 0 : Math.sin(k * TAU * 3) * 0.45 * (1 - k) * MOTION;
+    ctx.save();
+    ctx.translate(0, -0.72);
+    ctx.rotate(swing);
+    ctx.translate(0, 0.72);
+    circ(-swing * 0.5, 0.66, 0.13);                            // clapper
+    fillOut('#C99A3E');
+    ctx.beginPath();                                           // body
+    ctx.moveTo(-0.2, -0.62);
+    ctx.bezierCurveTo(-0.5, -0.6, -0.48, 0.0, -0.58, 0.3);
+    ctx.quadraticCurveTo(-0.66, 0.48, -0.78, 0.54);
+    ctx.lineTo(0.78, 0.54);
+    ctx.quadraticCurveTo(0.66, 0.48, 0.58, 0.3);
+    ctx.bezierCurveTo(0.48, 0.0, 0.5, -0.6, 0.2, -0.62);
+    ctx.closePath();
+    fillOut(gold);
+    ctx.beginPath();
+    roundRectPath(-0.84, 0.46, 1.68, 0.15, 0.075);
+    fillOut(rim);
+    ctx.globalAlpha = 0.6;                                     // shine
+    ctx.beginPath();
+    ctx.moveTo(-0.24, -0.45);
+    ctx.quadraticCurveTo(-0.36, 0.0, -0.44, 0.32);
+    ctx.lineWidth = 0.08;
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = '#FFFFFF';
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    ell(-0.2, -0.76, 0.17, 0.1, 0.35); fillOut(ribbon);       // bow
+    ell(0.2, -0.76, 0.17, 0.1, -0.35); fillOut(ribbon);
+    circ(0, -0.74, 0.08); fillOut(ribbon);
+    ctx.restore();
+  }
+
+  function drawDrum(k) {
+    const body = '#E58F86', rim = '#F6C85F', head = '#FBF3E4', stick = '#A0785A';
+    const b = k === null ? 0 : Math.abs(Math.sin(k * TAU * 2)) * (1 - k) * MOTION;
+    ctx.save();
+    ctx.translate(0, 0.62);
+    ctx.scale(1 + 0.08 * b, 1 - 0.12 * b);
+    ctx.translate(0, -0.62);
+    ctx.beginPath();                                           // shell
+    ctx.moveTo(-0.72, -0.18);
+    ctx.lineTo(-0.72, 0.42);
+    ctx.ellipse(0, 0.42, 0.72, 0.2, 0, Math.PI, 0, true);
+    ctx.lineTo(0.72, -0.18);
+    ctx.closePath();
+    fillOut(body);
+    ctx.save();
+    ctx.clip();
+    ctx.beginPath();                                           // zig-zag cords
+    for (let i = 0; i <= 6; i++) {
+      const x = -0.72 + i * 0.24;
+      const y = i % 2 === 0 ? -0.05 : 0.5;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.lineWidth = 0.05;
+    ctx.strokeStyle = COLORS.white;
+    ctx.stroke();
+    ctx.restore();
+    ctx.beginPath();                                           // bottom rim
+    ctx.ellipse(0, 0.42, 0.72, 0.2, 0, 0, Math.PI);
+    ctx.lineWidth = 0.1;
+    ctx.strokeStyle = rim;
+    ctx.stroke();
+    ell(0, -0.18, 0.72, 0.2);                                  // drum head
+    fillOut(head);
+    ell(0, -0.18, 0.72, 0.2);
+    ctx.lineWidth = 0.09;
+    ctx.strokeStyle = rim;
+    ctx.stroke();
+    ctx.restore();
+    // Sticks hop up as the drum booms.
+    const lift = b * 0.2;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(-0.62, -0.78 - lift); ctx.lineTo(0.1, -0.24 - lift * 0.3);
+    strokeOut(stick, 0.07);
+    ctx.beginPath();
+    ctx.moveTo(0.62, -0.78 - lift); ctx.lineTo(-0.1, -0.24 - lift * 0.3);
+    strokeOut(stick, 0.07);
+    circ(-0.64, -0.8 - lift, 0.09); fillOut(rim);
+    circ(0.64, -0.8 - lift, 0.09); fillOut(rim);
+  }
+
+  function drawFlower(k) {
+    const petal = '#E8B4C8', centre = '#F6C85F', stem = '#8DBF7F', leaf = '#9CCB9A';
+    const sway = k === null ? 0 : Math.sin(k * TAU * 2) * 0.18 * (1 - k) * MOTION;
+    ctx.save();
+    ctx.translate(0, 0.9);
+    ctx.rotate(sway);
+    ctx.translate(0, -0.9);
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(0, 0.9);
+    ctx.quadraticCurveTo(0.1, 0.3, 0, -0.2);
+    strokeOut(stem, 0.09);
+    ell(0.22, 0.45, 0.2, 0.09, -0.5); fillOut(leaf);
+    ell(-0.2, 0.62, 0.18, 0.08, 0.5); fillOut(leaf);
+    const list = [];
+    for (let i = 0; i < 6; i++) {
+      const a = -Math.PI / 2 + i * TAU / 6;
+      list.push([Math.cos(a) * 0.3, -0.38 + Math.sin(a) * 0.3, 0.21]);
+    }
+    puffs(list, petal);
+    circ(0, -0.38, 0.18); fillOut(centre);
+    ctx.fillStyle = shade(centre, -0.2);
+    [[-0.06, -0.42], [0.06, -0.4], [0, -0.32]].forEach(([x, y]) => { circ(x, y, 0.025); ctx.fill(); });
+    ctx.restore();
+  }
+
+  function drawPie(k) {
+    const crust = '#E8B77A', lattice = '#D39B5C', dish = '#8FB8DE', steam = '#B9AFA3';
+    // Warm steam always rises: it is what we smell. During the sensory moment it swirls higher.
+    const e = bump(k);
+    ctx.lineCap = 'round';
+    ctx.lineWidth = 0.07;
+    ctx.strokeStyle = steam;
+    for (let i = 0; i < 3; i++) {
+      const x0 = -0.3 + i * 0.3;
+      const ph = (k === null ? 0 : k * TAU * 2) + i;
+      const top = -0.8 - 0.14 * e;
+      ctx.globalAlpha = 0.85;
+      ctx.beginPath();
+      ctx.moveTo(x0, -0.32);
+      ctx.bezierCurveTo(x0 + 0.12 * Math.cos(ph), -0.45, x0 - 0.12 * Math.cos(ph), -0.6, x0 + 0.04 * Math.sin(ph), top);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+    ctx.beginPath();                                           // dish
+    ctx.moveTo(-0.88, 0.22); ctx.lineTo(0.88, 0.22); ctx.lineTo(0.7, 0.62); ctx.lineTo(-0.7, 0.62);
+    ctx.closePath();
+    fillOut(dish);
+    ctx.beginPath();                                           // domed crust
+    ctx.moveTo(-0.86, 0.24);
+    ctx.quadraticCurveTo(0, -0.72, 0.86, 0.24);
+    ctx.closePath();
+    fillOut(crust);
+    ctx.save();
+    ctx.clip();
+    ctx.strokeStyle = lattice;
+    ctx.lineWidth = 0.05;
+    for (let i = -4; i <= 4; i++) {
+      ctx.beginPath(); ctx.moveTo(i * 0.22 - 0.4, -0.5); ctx.lineTo(i * 0.22 + 0.3, 0.3); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(i * 0.22 + 0.4, -0.5); ctx.lineTo(i * 0.22 - 0.3, 0.3); ctx.stroke();
+    }
+    ctx.restore();
+    const edge = [];                                           // crimped edge
+    for (let i = 0; i < 9; i++) edge.push([-0.8 + i * 0.2, 0.24, 0.09]);
+    puffs(edge, '#F0C58A', LW * 0.8);
+  }
+
+  function drawIceCream(k) {
+    const cone = '#E8B77A', vanilla = '#FBEFD9', berry = '#F2BFC8', cherry = '#E07A7A';
+    const hop = k === null ? 0 : -Math.abs(Math.sin(k * TAU * 1.5)) * 0.1 * (1 - k) * MOTION;
+    ctx.save();
+    ctx.translate(0, hop);
+    ctx.beginPath();                                           // cone
+    ctx.moveTo(-0.4, -0.02); ctx.lineTo(0.4, -0.02); ctx.lineTo(0, 0.94);
+    ctx.closePath();
+    fillOut(cone);
+    ctx.save();
+    ctx.clip();
+    ctx.strokeStyle = shade(cone, -0.15);
+    ctx.lineWidth = 0.04;
+    for (let i = -3; i <= 3; i++) {
+      ctx.beginPath(); ctx.moveTo(i * 0.18 - 0.5, -0.1); ctx.lineTo(i * 0.18 + 0.5, 1.0); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(i * 0.18 + 0.5, -0.1); ctx.lineTo(i * 0.18 - 0.5, 1.0); ctx.stroke();
+    }
+    ctx.restore();
+    ell(0, -0.12, 0.46, 0.27); fillOut(vanilla);              // vanilla scoop with drips
+    ell(-0.22, 0.12, 0.07, 0.11); ctx.fillStyle = vanilla; ctx.fill();
+    ell(0.18, 0.15, 0.06, 0.13); ctx.fill();
+    circ(0, -0.47, 0.31); fillOut(berry);                     // strawberry scoop
+    const sprinkles = [['#8FB8DE', -0.14, -0.55, 0.6], ['#9CCB9A', 0.12, -0.62, -0.5], ['#F6C85F', 0.16, -0.4, 0.3], ['#B8A9D9', -0.08, -0.36, -0.9]];
+    ctx.lineCap = 'round';
+    ctx.lineWidth = 0.045;
+    sprinkles.forEach(([c, x, y, a]) => {
+      ctx.beginPath();
+      ctx.moveTo(x - Math.cos(a) * 0.05, y - Math.sin(a) * 0.05);
+      ctx.lineTo(x + Math.cos(a) * 0.05, y + Math.sin(a) * 0.05);
+      ctx.strokeStyle = c;
+      ctx.stroke();
+    });
+    ctx.beginPath();                                           // cherry
+    ctx.moveTo(0.06, -0.82); ctx.quadraticCurveTo(0.1, -0.96, 0.22, -0.98);
+    ctx.lineWidth = 0.035; ctx.strokeStyle = '#7FA86E'; ctx.stroke();
+    circ(0.04, -0.78, 0.1); fillOut(cherry);
+    ctx.restore();
+  }
+
+  function drawLemon(k) {
+    const peel = '#F6D55C', flesh = '#FBEA9A', leaf = '#9CCB9A';
+    const hop = k === null ? 0 : -Math.abs(Math.sin(k * TAU * 1.5)) * 0.1 * (1 - k) * MOTION;
+    ctx.save();
+    ctx.translate(0, hop);
+    ell(0.18, -0.58, 0.2, 0.09, -0.6); fillOut(leaf);         // leaf
+    ctx.save();                                                // whole lemon, pointy ends
+    ctx.translate(-0.18, -0.12);
+    ctx.rotate(-0.35);
+    ctx.beginPath();
+    ctx.moveTo(-0.72, 0);
+    ctx.quadraticCurveTo(-0.62, -0.46, 0, -0.46);
+    ctx.quadraticCurveTo(0.62, -0.46, 0.72, 0);
+    ctx.quadraticCurveTo(0.62, 0.46, 0, 0.46);
+    ctx.quadraticCurveTo(-0.62, 0.46, -0.72, 0);
+    ctx.closePath();
+    fillOut(peel);
+    ctx.globalAlpha = 0.5;
+    ell(-0.2, -0.22, 0.2, 0.07, -0.1);
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.restore();
+    circ(0.42, 0.38, 0.4); fillOut(peel);                     // slice
+    circ(0.42, 0.38, 0.31); ctx.fillStyle = flesh; ctx.fill();
+    ctx.strokeStyle = COLORS.white;
+    ctx.lineWidth = 0.035;
+    for (let i = 0; i < 8; i++) {
+      const a = i * TAU / 8;
+      ctx.beginPath();
+      ctx.moveTo(0.42 + Math.cos(a) * 0.04, 0.38 + Math.sin(a) * 0.04);
+      ctx.lineTo(0.42 + Math.cos(a) * 0.29, 0.38 + Math.sin(a) * 0.29);
+      ctx.stroke();
+    }
+    circ(0.42, 0.38, 0.05); ctx.fillStyle = COLORS.white; ctx.fill();
+    ctx.restore();
+  }
+
+  function drawTeddy(k) {
+    const fur = '#C89F7A', light = '#EBD3B8', bow = '#8FB8DE';
+    const sq = bump(k) * MOTION;
+    ctx.save();
+    ctx.translate(0, 0.86);
+    ctx.scale(1 + 0.1 * sq, 1 - 0.1 * sq);                    // a soft squeeze
+    ctx.translate(0, -0.86);
+    circ(-0.38, -0.66, 0.16); fillOut(fur);                    // ears
+    circ(0.38, -0.66, 0.16); fillOut(fur);
+    ctx.fillStyle = light;
+    circ(-0.38, -0.66, 0.08); ctx.fill();
+    circ(0.38, -0.66, 0.08); ctx.fill();
+    ell(-0.32, 0.68, 0.2, 0.18); fillOut(fur);                 // feet
+    ell(0.32, 0.68, 0.2, 0.18); fillOut(fur);
+    ctx.fillStyle = light;
+    ell(-0.32, 0.7, 0.1, 0.09); ctx.fill();
+    ell(0.32, 0.7, 0.1, 0.09); ctx.fill();
+    ell(0, 0.3, 0.45, 0.42); fillOut(fur);                     // body
+    ell(0, 0.36, 0.26, 0.25); ctx.fillStyle = light; ctx.fill();
+    ell(-0.5, 0.2, 0.14, 0.24, 0.5); fillOut(fur);             // arms
+    ell(0.5, 0.2, 0.14, 0.24, -0.5); fillOut(fur);
+    circ(0, -0.36, 0.38); fillOut(fur);                        // head
+    ell(0, -0.22, 0.17, 0.13); ctx.fillStyle = light; ctx.fill();
+    ell(0, -0.27, 0.07, 0.05); ctx.fillStyle = COLORS.ink; ctx.fill();
+    ctx.lineWidth = LW * 0.7;
+    ctx.strokeStyle = COLORS.ink;
+    for (const side of [-1, 1]) {
+      ctx.beginPath();
+      ctx.arc(side * 0.045, -0.2, 0.045, 0.1 * Math.PI, 0.9 * Math.PI);
+      ctx.stroke();
+    }
+    eyeDot(-0.15, -0.43, 0.05);
+    eyeDot(0.15, -0.43, 0.05);
+    cheek(-0.24, -0.26, 0.06);
+    cheek(0.24, -0.26, 0.06);
+    ctx.beginPath();                                           // bow tie
+    ctx.moveTo(0, 0.04); ctx.lineTo(-0.2, -0.06); ctx.lineTo(-0.2, 0.14); ctx.closePath();
+    ctx.moveTo(0, 0.04); ctx.lineTo(0.2, -0.06); ctx.lineTo(0.2, 0.14); ctx.closePath();
+    fillOut(bow);
+    circ(0, 0.04, 0.05); fillOut(bow);
+    ctx.restore();
+  }
+
+  function drawBlanket(k) {
+    const lower = '#A8D5D1', upper = '#BFE2DE', heart = '#F2BFC8';
+    const sq = bump(k) * MOTION;
+    ctx.save();
+    ctx.translate(0, 0.6);
+    ctx.scale(1 + 0.08 * sq, 1 - 0.12 * sq);                  // squish, like pressing a pillow
+    ctx.translate(0, -0.6);
+    const layer = (y, h, col, inset) => {
+      ctx.beginPath();
+      roundRectPath(-0.86 + inset, y, 1.72 - inset * 2, h, 0.2);
+      fillOut(col);
+      ctx.save();
+      ctx.clip();
+      ctx.fillStyle = COLORS.white;
+      ctx.globalAlpha = 0.7;
+      for (let i = 0; i < 6; i++) { circ(-0.65 + inset + i * 0.27, y + h * (i % 2 ? 0.35 : 0.68), 0.045); ctx.fill(); }
+      ctx.restore();
+      ctx.beginPath();                                         // stitched edge
+      roundRectPath(-0.78 + inset, y + 0.07, 1.56 - inset * 2, h - 0.14, 0.14);
+      ctx.setLineDash([0.07, 0.06]);
+      ctx.lineWidth = 0.03;
+      ctx.strokeStyle = COLORS.white;
+      ctx.stroke();
+      ctx.setLineDash([]);
+    };
+    layer(0.12, 0.5, lower, 0);
+    layer(-0.36, 0.5, upper, 0.06);
+    ell(0.74, -0.11, 0.12, 0.26); fillOut(upper);              // rolled fold
+    ell(0.74, -0.11, 0.05, 0.14); ctx.fillStyle = shade(upper, -0.08); ctx.fill();
+    heartPath(-0.2, -0.1, 0.16);                               // stitched heart patch
+    fillOut(heart);
+    ctx.restore();
+  }
+
+  const PAINTERS = {
+    rainbow: drawRainbow, stars: drawStars, bell: drawBell, drum: drawDrum, flower: drawFlower,
+    pie: drawPie, icecream: drawIceCream, lemon: drawLemon, teddy: drawTeddy, blanket: drawBlanket,
+  };
+
+  // Draw an object centred at (x, y) with radius r. A lifted object gets a soft ground shadow.
+  function drawThing(kind, x, y, r, k, lifted) {
+    if (lifted) {
+      ctx.save();
+      ctx.globalAlpha = 0.16;
+      ctx.fillStyle = COLORS.ink;
+      ctx.beginPath();
+      ctx.ellipse(x, y + r * 1.15, r * 0.75, r * 0.16, 0, 0, TAU);
+      ctx.fill();
+      ctx.restore();
+    }
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(r, r);
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'butt';
+    PAINTERS[kind](k);
+    ctx.restore();
+  }
+
+  function fxProgress(t0, t) {
+    const k = (t - t0) / CONFIG.FX_MS;
+    return k >= 0 && k < 1 ? k : null;
+  }
+
+  function drawObject(o, t, scaleK) {
+    if (o.state === 'placed') {
+      drawThing(o.kind, o.x, o.y, L.pr, fxProgress(o.landT0, t), false);
+      return;
+    }
+    const lifted = o.state === 'drag';
+    const r = L.s * o.scale * scaleK * (lifted ? 1.12 : 1);
+    drawThing(o.kind, o.x, o.y, r, null, lifted);
+  }
+
+  // ---------------------------------------------------------------------
+  // Sense icons (unit space; q = progress of the sensory moment, or null)
+  // ---------------------------------------------------------------------
+  function drawEyeIcon(q) {
+    // A quick blink at the start of the moment, then the eye opens wide.
+    let lid = 0;
+    if (q !== null) lid = q < 0.12 ? q / 0.12 : q < 0.24 ? 1 - (q - 0.12) / 0.12 : 0;
+    const almond = () => {
+      ctx.beginPath();
+      ctx.moveTo(-0.95, 0);
+      ctx.quadraticCurveTo(0, -0.95, 0.95, 0);
+      ctx.quadraticCurveTo(0, 0.95, -0.95, 0);
+      ctx.closePath();
+    };
+    almond();
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fill();
+    ctx.save();
+    almond();
+    ctx.clip();
+    circ(0, 0, 0.4);
+    fillOut('#7FB0D9', LW * 1.2);
+    circ(0, 0, 0.2);
+    ctx.fillStyle = COLORS.ink;
+    ctx.fill();
+    ctx.fillStyle = '#FFFFFF';
+    circ(-0.12, -0.12, 0.08); ctx.fill();
+    circ(0.1, 0.1, 0.04); ctx.fill();
+    if (lid > 0) {
+      ctx.fillStyle = COLORS.skin;
+      ctx.fillRect(-1, -1, 2, 0.5 + lid);
+    }
+    ctx.restore();
+    almond();
+    ctx.lineWidth = LW * 1.3;
+    ctx.strokeStyle = COLORS.ink;
+    ctx.stroke();
+    ctx.lineCap = 'round';                                     // lashes
+    ctx.beginPath();
+    [[-0.38, -0.4, -0.3], [0, -0.475, 0], [0.38, -0.4, 0.3]].forEach(([x, y, dx]) => {
+      ctx.moveTo(x, y);
+      ctx.lineTo(x + dx * 0.18, y - 0.18);
+    });
+    ctx.stroke();
+  }
+
+  function drawEarIcon() {
+    ctx.beginPath();
+    ctx.moveTo(-0.3, 0.6);
+    ctx.bezierCurveTo(-0.7, 0.2, -0.7, -0.9, 0.05, -0.9);
+    ctx.bezierCurveTo(0.72, -0.9, 0.76, -0.2, 0.45, 0.15);
+    ctx.bezierCurveTo(0.25, 0.38, 0.32, 0.74, 0.02, 0.9);
+    ctx.bezierCurveTo(-0.2, 1.0, -0.26, 0.76, -0.3, 0.6);
+    ctx.closePath();
+    fillOut(COLORS.skin, LW * 1.2);
+    ctx.lineCap = 'round';
+    ctx.beginPath();                                           // inner fold
+    ctx.moveTo(-0.22, 0.12);
+    ctx.bezierCurveTo(-0.36, -0.58, 0.44, -0.66, 0.36, -0.12);
+    ctx.quadraticCurveTo(0.3, 0.12, 0.1, 0.22);
+    ctx.lineWidth = LW * 1.4;
+    ctx.strokeStyle = shade(COLORS.skin, -0.3);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(-0.04, -0.12);
+    ctx.quadraticCurveTo(0.1, -0.32, 0.18, -0.1);
+    ctx.stroke();
+  }
+
+  function drawNoseIcon() {
+    ctx.beginPath();
+    ctx.moveTo(-0.12, -0.85);
+    ctx.bezierCurveTo(-0.2, -0.3, -0.78, 0.1, -0.62, 0.46);
+    ctx.bezierCurveTo(-0.52, 0.76, -0.2, 0.7, 0, 0.72);
+    ctx.bezierCurveTo(0.2, 0.7, 0.52, 0.76, 0.62, 0.46);
+    ctx.bezierCurveTo(0.78, 0.1, 0.2, -0.3, 0.12, -0.85);
+    ctx.closePath();
+    fillOut(COLORS.skin, LW * 1.2);
+    ctx.fillStyle = shade(COLORS.skin, -0.4);                  // nostrils
+    ell(-0.22, 0.5, 0.11, 0.065, 0.2); ctx.fill();
+    ell(0.22, 0.5, 0.11, 0.065, -0.2); ctx.fill();
+    ctx.globalAlpha = 0.5;                                     // highlight
+    ell(0.12, 0.12, 0.08, 0.2, -0.3);
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawMouthIcon(q) {
+    const lick = q === null ? 0 : Math.sin(Math.PI * clamp(q / 0.85, 0, 1));
+    const sway = q === null ? 0 : Math.sin(q * TAU * 3) * 0.22 * lick * MOTION;
+    const shape = () => {
+      ctx.beginPath();
+      ctx.moveTo(-0.85, -0.3);
+      ctx.quadraticCurveTo(0, -0.1, 0.85, -0.3);
+      ctx.quadraticCurveTo(0.75, 0.7, 0, 0.7);
+      ctx.quadraticCurveTo(-0.75, 0.7, -0.85, -0.3);
+      ctx.closePath();
+    };
+    shape();
+    ctx.fillStyle = '#9C5A5A';
+    ctx.fill();
+    ctx.save();
+    shape();
+    ctx.clip();
+    ctx.fillStyle = '#FFFFFF';                                 // teeth
+    ctx.fillRect(-0.9, -0.4, 1.8, 0.34);
+    ell(sway * 0.5, 0.48, 0.42, 0.26);                         // tongue inside
+    ctx.fillStyle = COLORS.tongue;
+    ctx.fill();
+    ctx.restore();
+    shape();
+    ctx.lineWidth = 0.12;
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = '#E58F86';
+    ctx.stroke();
+    if (lick > 0.01) {                                         // tongue pokes out and licks
+      const ty = 0.62 + 0.26 * lick;
+      ell(sway, ty, 0.28, 0.1 + 0.15 * lick);
+      fillOut(COLORS.tongue);
+      ctx.beginPath();
+      ctx.moveTo(sway, ty - 0.06);
+      ctx.lineTo(sway, ty + 0.08 * lick);
+      ctx.lineWidth = LW * 0.7;
+      ctx.strokeStyle = shade(COLORS.tongue, -0.25);
+      ctx.stroke();
+    }
+  }
+
+  function drawHandIcon() {
+    const skin = COLORS.skin;
+    [[-0.42, -0.62], [-0.15, -0.84], [0.13, -0.8], [0.4, -0.56]].forEach(([x, top]) => {
+      ctx.beginPath();
+      roundRectPath(x - 0.12, top, 0.24, 0.8, 0.12);
+      fillOut(skin, LW * 1.2);
+    });
+    ctx.save();                                                // thumb
+    ctx.translate(-0.46, 0.32);
+    ctx.rotate(-0.95);
+    ctx.beginPath();
+    roundRectPath(-0.12, -0.56, 0.24, 0.62, 0.12);
+    fillOut(skin, LW * 1.2);
+    ctx.restore();
+    ctx.beginPath();                                           // palm
+    roundRectPath(-0.56, -0.16, 1.1, 1.0, 0.4);
+    fillOut(skin, LW * 1.2);
+    ctx.lineCap = 'round';                                     // palm crease
+    ctx.beginPath();
+    ctx.moveTo(-0.28, 0.22);
+    ctx.quadraticCurveTo(0.05, 0.36, 0.3, 0.14);
+    ctx.lineWidth = LW * 0.8;
+    ctx.strokeStyle = shade(skin, -0.2);
+    ctx.stroke();
+  }
+
+  const ICONS = { eye: drawEyeIcon, ear: drawEarIcon, nose: drawNoseIcon, mouth: drawMouthIcon, hand: drawHandIcon };
+
+  // Draw a sense icon with its reaction transform (ear wiggles, nose sniffs, hand pats).
+  function drawSenseIcon(sense, g, q) {
+    ctx.save();
+    ctx.translate(g.x, g.y);
+    const e = bump(q) * MOTION;
+    if (sense === 'ear' && q !== null) ctx.rotate(Math.sin(q * TAU * 3) * 0.08 * e);
+    if (sense === 'nose' && q !== null) { const k = 1 + 0.08 * Math.abs(Math.sin(q * TAU * 3)) * e; ctx.scale(k, k); }
+    if (sense === 'hand' && q !== null) {
+      ctx.translate(0, g.r * 0.8);
+      ctx.rotate(Math.sin(q * TAU * 3) * 0.14 * e);
+      ctx.translate(0, -g.r * 0.8);
+    }
+    ctx.scale(g.r, g.r);
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'butt';
+    ICONS[sense](q);
+    ctx.restore();
+  }
+
+  // The sense's side of the moment, drawn over the card: sound waves, scent, twinkles, hearts.
+  function drawSenseFx(st, g, q) {
+    const col = shade(SENSES[st.sense].color, -0.3);
+    const e = bump(q);
+    ctx.save();
+    ctx.lineCap = 'round';
+    if (st.sense === 'eye') {
+      // Twinkles pop around the open eye.
+      ctx.fillStyle = COLORS.star;
+      [[-1.15, -0.55], [1.15, -0.55], [-1.05, 0.65], [1.05, 0.65]].forEach(([fx, fy], i) => {
+        const s = Math.max(0, Math.sin(Math.PI * clamp((q - 0.22 - i * 0.08) / 0.5, 0, 1))) * g.r * 0.28;
+        if (s > 0.5) { sparklePath(g.x + fx * g.r, g.y + fy * g.r, s); ctx.fill(); }
+      });
+    } else if (st.sense === 'ear') {
+      // Sound waves roll in toward the ear, from both sides.
+      ctx.strokeStyle = col;
+      ctx.lineWidth = Math.max(2, g.r * 0.09);
+      for (let i = 0; i < 3; i++) {
+        const f = (q * 2.5 + i / 3) % 1;
+        const rr = g.r * (1.45 - f * 0.55);
+        ctx.globalAlpha = Math.min(1, f * 2) * (1 - q);
+        ctx.beginPath(); ctx.arc(g.x, g.y, rr, Math.PI - 0.5, Math.PI + 0.5); ctx.stroke();
+        ctx.beginPath(); ctx.arc(g.x, g.y, rr, -0.5, 0.5); ctx.stroke();
+      }
+    } else if (st.sense === 'nose') {
+      // Wavy scent lines drift up from the object to the nose.
+      const p = slotPos(st, st.fxSlot);
+      const x0 = p.x, y0 = p.y - L.pr * 0.9, x1 = g.x, y1 = g.y + g.r * 0.8;
+      ctx.strokeStyle = col;
+      ctx.lineWidth = Math.max(1.5, g.r * 0.07);
+      ctx.globalAlpha = e;
+      for (let j = -1; j <= 1; j += 2) {
+        ctx.beginPath();
+        const steps = 14;
+        const reach = clamp(q * 1.6, 0, 1);
+        for (let s = 0; s <= steps * reach; s++) {
+          const u = s / steps;
+          const wob = Math.sin(u * TAU * 1.5 + q * TAU * 2 + j) * g.r * 0.16 * (1 - u * 0.5);
+          const x = lerp(x0, x1, u) + j * g.r * 0.14 * (1 - u) + wob;
+          const y = lerp(y0, y1, u);
+          if (s === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+      }
+    } else if (st.sense === 'mouth') {
+      // Two little "yum" twinkles beside the mouth.
+      ctx.fillStyle = COLORS.star;
+      [[-1.1, -0.2], [1.1, -0.2]].forEach(([fx, fy]) => {
+        const s = e * g.r * 0.22;
+        if (s > 0.5) { sparklePath(g.x + fx * g.r, g.y + fy * g.r - e * g.r * 0.2, s); ctx.fill(); }
+      });
+    } else if (st.sense === 'hand') {
+      // Soft hearts float up from the hand.
+      ctx.fillStyle = '#F2BFC8';
+      ctx.strokeStyle = shade('#F2BFC8', -0.25);
+      ctx.lineWidth = Math.max(1, g.r * 0.04);
+      [[-0.9, 0], [0.95, 0.15]].forEach(([fx, d], i) => {
+        const k = clamp((q - d) / 0.8, 0, 1);
+        if (k <= 0 || k >= 1) return;
+        ctx.globalAlpha = Math.sin(Math.PI * k);
+        heartPath(g.x + fx * g.r, g.y - g.r * (0.2 + k * 0.9), g.r * (0.18 + 0.06 * i));
+        ctx.fill();
+        ctx.stroke();
+      });
+    }
+    ctx.restore();
+  }
+
+  // A station: soft card, the big sense icon, two seats, then the objects resting there.
+  function drawStation(st, t, hovered, glow, drawContents) {
+    const col = SENSES[st.sense].color;
+    const cx = st.x + st.w / 2;
+    const base = st.y + st.h;
+    const rad = Math.min(st.w, st.h) * 0.16;
+
+    let sx = 1, sy = 1;
+    const bp = (t - st.bounceT0) / CONFIG.BOUNCE_MS;
+    if (bp >= 0 && bp < 1) {
+      const k = Math.sin(Math.PI * bp) * (reduceMotion ? 0.5 : 1);
+      sx += 0.05 * k;
+      sy -= 0.07 * k;
+    }
+    if (hovered) { sx *= 1.04; sy *= 1.04; }
+
+    ctx.save();
+    ctx.translate(cx, base);
+    ctx.scale(sx, sy);
+    ctx.translate(-cx, -base);
+
+    // Scaffolding hint: a soft glow around the right station.
+    if (glow > 0) {
+      const g = L.s * (0.25 + 0.25 * glow);
+      ctx.globalAlpha = 0.25 + 0.4 * glow;
+      ctx.fillStyle = shade(col, 0.2);
+      ctx.beginPath();
+      roundRectPath(st.x - g, st.y - g, st.w + g * 2, st.h + g * 2, rad + g);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    ctx.beginPath();
+    roundRectPath(st.x, st.y, st.w, st.h, rad);
+    ctx.fillStyle = shade(col, 0.6);
+    ctx.fill();
+    ctx.lineWidth = Math.max(2.5, Math.min(st.w, st.h) * 0.025);
+    ctx.strokeStyle = shade(col, -0.1);
+    ctx.stroke();
+
+    // Seats: soft dents that show how many things belong here.
+    ctx.fillStyle = shade(col, 0.35);
+    for (let i = 0; i < st.capacity; i++) {
+      const p = slotPos(st, i);
+      ctx.beginPath();
+      ctx.ellipse(p.x, p.y + L.pr * 0.15, L.pr * 1.15, L.pr * 1.05, 0, 0, TAU);
+      ctx.fill();
+    }
+
+    const g = iconGeom(st);
+    ctx.globalAlpha = 0.75;                                    // badge behind the icon
+    ctx.fillStyle = COLORS.white;
+    ctx.beginPath();
+    ctx.arc(g.x, g.y, g.r * 1.18, 0, TAU);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    const q = fxProgress(st.fxT0, t);
+    drawSenseIcon(st.sense, g, q);
+
+    drawContents();
+    if (q !== null) drawSenseFx(st, g, q);
+    ctx.restore();
+  }
+
+  function drawStar(cx, cy, R, fill, face) {
+    ctx.save();
+    ctx.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const rad = i % 2 === 0 ? R : R * 0.5;
+      const a = -Math.PI / 2 + i * Math.PI / 5;
+      const x = cx + rad * Math.cos(a), y = cy + rad * Math.sin(a);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    ctx.lineJoin = 'round';
+    if (fill) {
+      ctx.fillStyle = fill;
+      ctx.fill();
+      ctx.strokeStyle = fill;            // same-colour stroke rounds the tips
+      ctx.lineWidth = Math.max(2, R * 0.16);
+      ctx.stroke();
+    } else {
+      ctx.strokeStyle = 'rgba(74, 64, 54, 0.25)';
+      ctx.lineWidth = Math.max(2, R * 0.14);
+      ctx.stroke();
+    }
+
+    if (face) {
+      ctx.fillStyle = COLORS.ink;
+      ctx.beginPath(); ctx.arc(cx - R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.arc(cx + R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.strokeStyle = COLORS.ink;
+      ctx.lineWidth = Math.max(2, R * 0.05);
+      ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.arc(cx, cy + R * 0.06, R * 0.17, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+      ctx.globalAlpha = 0.35;
+      ctx.fillStyle = COLORS.cheek;
+      ctx.beginPath(); ctx.ellipse(cx - R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(cx + R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // Same ring of sparkles from every station, every time (no random rewards).
+  function spawnParticles(st, t) {
+    const cx = st.x + st.w / 2, cy = st.y;
+    const col = SENSES[st.sense].color;
+    for (let i = 0; i < 10; i++) {
+      const a = -Math.PI / 2 + (i - 4.5) * 0.3;
+      state.particles.push({ x0: cx, y0: cy, dx: Math.cos(a), dy: Math.sin(a), dist: st.w * 0.6, t0: t, life: 900, color: i % 2 ? COLORS.star : col });
+    }
+  }
+
+  function drawParticles(t) {
+    state.particles = state.particles.filter(p => t - p.t0 < p.life);
+    for (const p of state.particles) {
+      const k = (t - p.t0) / p.life;
+      const e = easeOutCubic(k);
+      ctx.globalAlpha = 1 - k;
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x0 + p.dx * p.dist * e, p.y0 + p.dy * p.dist * e, L.s * 0.13 * (1 - k * 0.5), 0, TAU);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------------------------------------------------------------------
+  // Screens
+  // ---------------------------------------------------------------------
+  function starGeom() {
+    return { cx: W / 2, cy: H * 0.42, R: Math.min(W, H) * 0.2 };
+  }
+
+  // Start and between-round screen: one big pulsing star to tap, plus 5 slots
+  // that fill up so the child can see the end coming.
+  function drawStarScreen(t) {
+    const { cx, cy, R } = starGeom();
+    const amp = reduceMotion ? 0.03 : 0.07;
+    const k = 1 + amp * (0.5 - 0.5 * Math.cos(TAU * t / 1400));
+    drawStar(cx, cy, R * k, COLORS.star, true);
+
+    const sr = R * 0.16, gap = sr * 2.8, y = cy + R * 1.35;
+    for (let i = 0; i < CONFIG.ROUNDS; i++) {
+      drawStar(cx + (i - (CONFIG.ROUNDS - 1) / 2) * gap, y, sr, i < state.round ? COLORS.star : null, false);
+    }
+  }
+
+  function fitFont(text, weight, size, maxW) {
+    ctx.font = `${weight} ${size}px ${FONT}`;
+    while (size > 12 && ctx.measureText(text).width > maxW) {
+      size -= 1;
+      ctx.font = `${weight} ${size}px ${FONT}`;
+    }
+    return size;
+  }
+
+  // Static end screen. No buttons: the session is over.
+  function drawEnd() {
+    const gh = H * 0.14;
+    ctx.fillStyle = COLORS.grass;
+    ctx.beginPath();
+    ctx.moveTo(0, H - gh);
+    ctx.quadraticCurveTo(W / 2, H - gh * 1.5, W, H - gh);
+    ctx.lineTo(W, H);
+    ctx.lineTo(0, H);
+    ctx.closePath();
+    ctx.fill();
+
+    const R = Math.min(W, H) * 0.2;
+    const cy = H * 0.36;
+    drawStar(W / 2, cy, R, COLORS.star, true);
+
+    const big = clamp(Math.min(W, H) * 0.1, 26, 68);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = COLORS.ink;
+    const top = cy + R * 1.25;
+    fitFont('Great Job!', 800, big, W * 0.9);
+    ctx.fillText('Great Job!', W / 2, top + big * 0.5);
+    fitFont('Time to play outside!', 700, Math.round(big * 0.62), W * 0.9);
+    ctx.fillText('Time to play outside!', W / 2, top + big * 1.55);
+  }
+
+  // Which object to pulse and which station (if any) to glow right now.
+  function guidance(t) {
+    const out = { target: null, pulse: 1, hintStation: null, glow: 0 };
+    if (state.phase !== 'play') return out;
+    const amp = reduceMotion ? 0.05 : 0.12;
+
+    if (state.drag) {
+      const o = state.drag.obj;
+      if (o.errors >= 2) { out.hintStation = stationFor(o.sense); out.glow = 0.5 + 0.5 * Math.sin(TAU * t / 1300); }
+      return out;
+    }
+
+    const idle = t - state.lastInteraction;
+    if (idle <= CONFIG.IDLE_PULSE_MS) return out;
+    out.target = state.objects.find(o => o.state === 'idle') || null;
+    if (!out.target) return out;
+    const wave = 0.5 - 0.5 * Math.cos(TAU * (idle - CONFIG.IDLE_PULSE_MS) / 1300);
+    out.pulse = 1 + amp * wave;
+
+    // Scaffolding: glow the right station after repeated slips, or in the very
+    // first round if the child has not found the mechanic yet.
+    const tutorial = state.round === 0 && state.placedThisRound === 0 && idle > CONFIG.TUTORIAL_HINT_MS;
+    if (out.target.errors >= 2 || tutorial) { out.hintStation = stationFor(out.target.sense); out.glow = wave; }
+    return out;
+  }
+
+  function drawPlay(t) {
+    const g = guidance(t);
+    const hover = state.drag ? findDropStation(state.drag.obj) : null;
+
+    for (const st of state.stations) {
+      drawStation(st, t, st === hover, st === g.hintStation ? g.glow : 0, () => {
+        for (const o of state.objects) if (o.station === st && o.state === 'placed') drawObject(o, t, 1);
+      });
+    }
+    for (const o of state.objects) {
+      if (o.state === 'idle' || o.state === 'return' || o.state === 'toStation') {
+        drawObject(o, t, o === g.target ? g.pulse : 1);
+      }
+    }
+    if (state.drag) drawObject(state.drag.obj, t, 1);
+    drawParticles(t);
+  }
+
+  // ---------------------------------------------------------------------
+  // Main loop
+  // ---------------------------------------------------------------------
+  function update(t) {
+    for (const o of state.objects) {
+      const a = o.anim;
+      if (!a) continue;
+      const p = clamp((t - a.t0) / a.dur, 0, 1);
+      const e = a.ease(p);
+      o.x = lerp(a.fx, a.tx, e);
+      o.y = lerp(a.fy, a.ty, e);
+      o.scale = lerp(a.fs, a.ts, e);
+      o.animP = p;
+      if (p >= 1) {
+        o.anim = null;
+        if (o.state === 'return') o.state = 'idle';
+        else if (o.state === 'toStation') landInStation(o, t);
+      }
+    }
+
+    if (state.phase === 'play' && state.completeAt && t >= state.completeAt) {
+      state.completeAt = 0;
+      completeRound();
+    }
+
+    if (state.phase === 'celebrate' && t - state.celebrateStart >= CONFIG.CELEBRATE_MS) {
+      if (state.round >= CONFIG.ROUNDS) enterEnd();
+      else state.phase = 'between';
+    }
+  }
+
+  function render(t) {
+    ctx.fillStyle = COLORS.bg;
+    ctx.fillRect(0, 0, W, H);
+    if (state.phase === 'start' || state.phase === 'between') drawStarScreen(t);
+    else if (state.phase === 'play' || state.phase === 'celebrate') drawPlay(t);
+    else if (state.phase === 'end') drawEnd();
+  }
+
+  let rafId = 0;
+  function frame(t) {
+    update(t);
+    render(t);
+    // The end screen is static: stop the loop entirely.
+    if (state.phase !== 'end') rafId = requestAnimationFrame(frame);
+  }
+
+  function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    DPR = Math.min(window.devicePixelRatio || 1, 2.5);
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    computeLayout();
+    if (state.phase === 'end') render(now());
+  }
+
+  window.addEventListener('resize', resize);
+  window.addEventListener('orientationchange', resize);
+
+  resize();
+  log('Game loaded', { roundsPerSession: CONFIG.ROUNDS, gamesCompletedBefore: progress.gamesCompleted });
+  rafId = requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

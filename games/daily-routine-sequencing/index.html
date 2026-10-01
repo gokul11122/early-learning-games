@@ -1,0 +1,2249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Daily Routine</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
+  body {
+    background: #F6F1E7;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  canvas { display: block; width: 100%; height: 100%; }
+
+  #home {
+    position: fixed; top: max(10px, env(safe-area-inset-top)); right: max(10px, env(safe-area-inset-right));
+    width: 52px; height: 52px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+    background: rgba(255, 253, 248, 0.85); box-shadow: 0 2px 8px rgba(74, 64, 54, 0.15);
+    -webkit-tap-highlight-color: transparent; z-index: 5;
+  }
+  #home:active { transform: scale(0.94); }
+
+  /* Hidden parent view: press and hold the top-left corner for 3 seconds. */
+  #parent {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: rgba(74, 64, 54, 0.55); padding: 16px; box-sizing: border-box; z-index: 10;
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #4A4036;
+  }
+  #parent[hidden] { display: none; }
+  #parent .card { background: #FFFDF8; border-radius: 16px; padding: 20px 22px; max-width: 380px; width: 100%; box-shadow: 0 10px 30px rgba(0,0,0,0.18); }
+  #parent h2 { margin: 0 0 10px; font-size: 18px; }
+  #parent table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+  #parent th, #parent td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #EDE5D6; }
+  #parent .hint { margin: 12px 0 0; font-size: 12px; opacity: 0.7; }
+</style>
+</head>
+<body>
+<canvas id="game" aria-label="Daily routine sequencing game"></canvas>
+<a id="home" href="../../index.html" aria-label="Home">
+  <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><path d="M4 11.5 12 5l8 6.5V19a1 1 0 0 1-1 1h-4.5v-5h-5v5H5a1 1 0 0 1-1-1z" fill="none" stroke="#4A4036" stroke-width="2" stroke-linejoin="round"/></svg>
+</a>
+
+<div id="parent" hidden>
+  <div class="card">
+    <h2>Progress on this device</h2>
+    <div id="parentBody"></div>
+    <p class="hint">Stored only on this device. Tap anywhere to close.</p>
+  </div>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  /* =====================================================================
+   * DAILY ROUTINE SEQUENCING
+   * ELOF domain: Approaches to Learning (sequencing, working memory)
+   *              + Social/Emotional life skills (familiar daily routines).
+   *
+   * Design rules this file follows (from the brief):
+   *  - Coherence: only the numbered slots, their arrows and the picture
+   *    cards are on screen. No score, no menus, no text during play.
+   *  - Control of error: a card only fits the slot for its step, and only
+   *    when that slot is the next empty one. Anything else glides home.
+   *  - Slots are marked with dice dots as well as numerals, so a child who
+   *    cannot read numbers yet can still count "one, two, three".
+   *  - Forgiving hitboxes: drop zones reach well past the visible slot.
+   *  - Visual prompts: the next empty slot pulses gently when the child is
+   *    idle; after two slips the right card glows.
+   *  - When the story is complete it "plays": each card lights up in turn
+   *    while it is narrated ("First we wake up, then...").
+   *  - Self-paced: no timers anywhere the child can see or feel.
+   *  - Natural stopping point: 5 rounds, then a static "play outside" screen
+   *    with no "play again" button.
+   * ===================================================================== */
+
+  // ---------------------------------------------------------------------
+  // Configuration
+  // ---------------------------------------------------------------------
+  const CONFIG = {
+    ROUNDS: 5,                     // hard session limit (natural stopping point)
+    STORAGE_KEY: 'daily-routine-sequencing.v1',
+    IDLE_PULSE_MS: 1500,           // idle time before the next empty slot pulses
+    TUTORIAL_HINT_MS: 5000,        // first round: idle time before the right card glows too
+    RETURN_MS: 380,                // rejected card: glide-home duration
+    TO_SLOT_MS: 260,               // accepted card: slide-into-slot duration
+    BOUNCE_MS: 320,                // slot squash when a card lands
+    COMPLETE_DELAY_MS: 450,        // pause after the last card lands, before the story plays
+    PLAY_LEAD_MS: 250,             // small breath before the first card lights up
+    STEP_PLAY_MS: 2000,            // story playback: how long each card stays lit while narrated
+    FINALE_MS: 1700,               // after the story: sparkles and praise, then the star screen
+    FAST_MS_PER_CARD: 7000,        // "quick" threshold for difficulty step-up
+    PARENT_HOLD_MS: 3000,          // hold time for the hidden parent view
+    PARENT_CORNER_PX: 80,
+    HOME_RESERVE_PX: 72,           // top-right corner kept clear for the home button
+    TAP_SLOP_PX: 12,               // movement below this is a tap, not a drop
+    MAX_CARD_PX: 250,
+  };
+
+  const COLORS = {
+    bg: '#F6F1E7',
+    ink: '#4A4036',
+    card: '#FFFDF8',
+    slot: '#ECE3D2',
+    slotHover: '#F4EDE0',
+    star: '#F6C85F',
+    grass: '#B9D7A8',
+    cheek: '#F2A88A',
+    // The child (the same character on every card).
+    skin: '#F3C7A1',
+    hair: '#7A5240',
+    mouth: '#B85C55',
+    shirt: '#8FB8DE',
+    pants: '#A3896C',
+    shoe: '#8A6A55',
+    pj: '#C3B4E2',
+    slipper: '#E8B4C8',
+    scarf: '#E08A7E',
+    // Props.
+    white: '#FFFDF8',
+    wood: '#D2A679',
+    woodDark: '#B88B5E',
+    blanket: '#9CCB9A',
+    soil: '#C49A72',
+    leaf: '#8CC084',
+    stem: '#7DB37B',
+    water: '#9CCDE6',
+    sky: '#E3F1F8',
+    night: '#3F4C74',
+    crust: '#D9A066',
+    crumb: '#F7E3B5',
+    butter: '#F9E28F',
+    jam: '#E0707A',
+    metal: '#D3DADF',
+    snow: '#FFFFFF',
+    snowLine: '#B9CCDD',
+  };
+
+  const FONT = 'ui-rounded, "Arial Rounded MT Bold", "Nunito", system-ui, -apple-system, sans-serif';
+
+  // Each routine is one round. 'pool' decides which difficulty tier offers it.
+  // action: spoken when the card is picked up. phrase: used in the story narration.
+  const ROUTINES = [
+    { id: 'morning', name: 'Morning', pool: 'familiar', tint: '#F6C85F', steps: [
+      { scene: 'wake',    action: 'Wake up',              phrase: 'we wake up' },
+      { scene: 'teeth',   action: 'Brush teeth',          phrase: 'we brush our teeth' },
+      { scene: 'dress',   action: 'Get dressed',          phrase: 'we get dressed' },
+    ] },
+    { id: 'meal', name: 'Mealtime', pool: 'familiar', tint: '#F2A88A', steps: [
+      { scene: 'wash',    action: 'Wash hands',           phrase: 'we wash our hands' },
+      { scene: 'eat',     action: 'Eat',                  phrase: 'we eat' },
+      { scene: 'clear',   action: 'Clear the plate',      phrase: 'we clear the plate' },
+    ] },
+    { id: 'bedtime', name: 'Bedtime', pool: 'familiar', tint: '#B8A9D9', steps: [
+      { scene: 'bath',    action: 'Take a bath',          phrase: 'we take a bath' },
+      { scene: 'pajamas', action: 'Pajamas on',           phrase: 'we put on our pajamas' },
+      { scene: 'sleep',   action: 'Go to sleep',          phrase: 'we go to sleep' },
+    ] },
+    { id: 'garden', name: 'Garden', pool: 'new', tint: '#9CCB9A', steps: [
+      { scene: 'plant',   action: 'Plant a seed',         phrase: 'we plant a seed' },
+      { scene: 'water',   action: 'Water it',             phrase: 'we water it' },
+      { scene: 'flower',  action: 'The flower grows',     phrase: 'the flower grows' },
+    ] },
+    { id: 'birthday', name: 'Birthday cake', pool: 'new', tint: '#E8B4C8', steps: [
+      { scene: 'candles', action: 'Light the candles',    phrase: 'we light the candles' },
+      { scene: 'blow',    action: 'Blow out the candles', phrase: 'we blow them out' },
+      { scene: 'slice',   action: 'Eat the cake',         phrase: 'we eat the cake' },
+    ] },
+    { id: 'sandwich', name: 'Sandwich', pool: 'long', tint: '#E8C391', steps: [
+      { scene: 'bread',   action: 'Get the bread',        phrase: 'we get the bread' },
+      { scene: 'butter',  action: 'Spread the butter',    phrase: 'we spread the butter' },
+      { scene: 'jam',     action: 'Add the jam',          phrase: 'we add the jam' },
+      { scene: 'munch',   action: 'Eat the sandwich',     phrase: 'we eat our sandwich' },
+    ] },
+    { id: 'snowman', name: 'Snowman', pool: 'long', tint: '#A8D5E8', steps: [
+      { scene: 'roll',    action: 'Roll a snowball',      phrase: 'we roll a big snowball' },
+      { scene: 'stack',   action: 'Add the head',         phrase: 'we add the head' },
+      { scene: 'face',    action: 'Give it a face',       phrase: 'we give it a face' },
+      { scene: 'hello',   action: 'Say hello',            phrase: 'we say hello' },
+    ] },
+  ];
+
+  // Difficulty ladder for dynamic difficulty adjustment (scaffolding).
+  const TIERS = [
+    { pool: 'familiar', prePlaced: 1 }, // familiar routine, first card already in place, 2 to place
+    { pool: 'familiar', prePlaced: 0 }, // familiar routine, all 3 to place
+    { pool: 'new',      prePlaced: 0 }, // less familiar routine, 3 to place
+    { pool: 'long',     prePlaced: 0 }, // 4-step routine, 4 to place
+  ];
+
+  // Dice-style pips: the subitizing pattern for 1-4.
+  const PIPS = [null, [[0, 0]], [[-1, -1], [1, 1]], [[-1, -1], [0, 0], [1, 1]], [[-1, -1], [1, -1], [-1, 1], [1, 1]]];
+
+  const TAU = Math.PI * 2;
+  const LW = 1.8;                  // outline width inside the 100x100 scene space
+  const reduceMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+
+  // ---------------------------------------------------------------------
+  // Small helpers
+  // ---------------------------------------------------------------------
+  const now = () => performance.now();
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const easeOutCubic = t => 1 - Math.pow(1 - t, 3);
+  const easeInOutQuad = t => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
+  const log = (...args) => console.log('[Routine]', ...args);
+
+  function shuffle(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }
+
+  // Mix a hex colour toward black (amt < 0) or white (amt > 0).
+  const shadeCache = new Map();
+  function shade(hex, amt) {
+    const key = hex + amt;
+    if (shadeCache.has(key)) return shadeCache.get(key);
+    const n = parseInt(hex.slice(1), 16);
+    const target = amt < 0 ? 0 : 255;
+    const p = Math.abs(amt);
+    const c = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map(v => Math.round(lerp(v, target, p)));
+    const out = `rgb(${c[0]},${c[1]},${c[2]})`;
+    shadeCache.set(key, out);
+    return out;
+  }
+
+  // ---------------------------------------------------------------------
+  // Canvas setup
+  // ---------------------------------------------------------------------
+  const canvas = document.getElementById('game');
+  const mainCtx = canvas.getContext('2d');
+  let ctx = mainCtx;               // swapped briefly while card scenes render into their cache
+  let W = 0, H = 0, DPR = 1;
+
+  // Layout values recomputed on every resize.
+  // c: slot size, cs: card size, mode: 'rows' (slots above tray) or 'cols' (slots left of tray).
+  const L = { m: 16, c: 120, cs: 108, mode: 'rows' };
+
+  // ---------------------------------------------------------------------
+  // Game state
+  // ---------------------------------------------------------------------
+  const state = {
+    phase: 'start',          // 'start' | 'play' | 'celebrate' | 'between' | 'end'
+    round: 0,                // rounds completed this session
+    tier: 0,                 // index into TIERS
+    routine: null,
+    usedRoutines: [],        // never repeat a routine within a session
+    slots: [],
+    cards: [],
+    nextSlot: 0,             // index of the next empty slot: the only one that accepts a card
+    drag: null,              // { obj, dx, dy, sx, sy, moved }
+    lastInteraction: 0,
+    roundStart: 0,
+    roundErrors: 0,          // slips this round (card dropped on an empty slot it does not fit)
+    placedThisRound: 0,
+    completeAt: 0,           // time to fire completeRound()
+    celebrateStart: 0,
+    playStart: 0,            // story playback start time
+    playIndex: -1,           // card currently lit during playback
+    finaleDone: false,
+    particles: [],
+  };
+
+  // ---------------------------------------------------------------------
+  // Local progress tracking (localStorage, never leaves the device)
+  // ---------------------------------------------------------------------
+  function freshProgress() {
+    return { version: 1, gamesCompleted: 0, roundsCompleted: 0, cardsPlaced: 0, slips: 0, lastPlayed: null, sessions: [] };
+  }
+
+  function loadProgress() {
+    try {
+      const raw = window.localStorage.getItem(CONFIG.STORAGE_KEY);
+      if (raw) {
+        const data = JSON.parse(raw);
+        if (data && data.version === 1 && Array.isArray(data.sessions)) return data;
+      }
+    } catch (e) {
+      console.warn('[Routine] Progress could not be loaded (storage unavailable):', e && e.message);
+    }
+    return freshProgress();
+  }
+
+  function saveProgress() {
+    try {
+      window.localStorage.setItem(CONFIG.STORAGE_KEY, JSON.stringify(progress));
+      log('Progress saved', { gamesCompleted: progress.gamesCompleted, roundsCompleted: progress.roundsCompleted });
+    } catch (e) {
+      console.warn('[Routine] Progress could not be saved (storage unavailable):', e && e.message);
+    }
+  }
+
+  const progress = loadProgress();
+  let session = null; // created on the first round of this app launch
+
+  function ensureSession() {
+    if (session) return;
+    session = { startedAt: new Date().toISOString(), finished: false, rounds: [] };
+    progress.sessions.push(session);
+    if (progress.sessions.length > 30) progress.sessions.splice(0, progress.sessions.length - 30);
+  }
+
+  // ---------------------------------------------------------------------
+  // Audio: Web Audio tones + optional spoken words
+  // ---------------------------------------------------------------------
+  let actx = null;
+
+  // Browsers only allow audio after a user gesture, so this runs on every pointer down.
+  function unlockAudio() {
+    if (!actx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) { try { actx = new AC(); } catch (e) { actx = null; } }
+    }
+    if (actx && actx.state === 'suspended') actx.resume();
+  }
+
+  function tone(freq, delay, dur, vol = 0.16, type = 'sine') {
+    if (!actx) return;
+    const t = actx.currentTime + delay;
+    const osc = actx.createOscillator();
+    const gain = actx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(vol, t + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    osc.connect(gain).connect(actx.destination);
+    osc.start(t);
+    osc.stop(t + dur + 0.05);
+  }
+
+  // Each slot always plays the same note, rising step by step: the order can be heard.
+  const SLOT_NOTE = [523.25, 587.33, 659.25, 783.99];
+  const playPickup = () => tone(440, 0, 0.08, 0.05, 'triangle');
+  const playChime = i => { const f = SLOT_NOTE[i]; tone(f, 0, 0.35); tone(f * 1.5, 0.07, 0.4, 0.1); };
+  const playStepNote = i => tone(SLOT_NOTE[i], 0, 0.5, 0.11);
+  const playRoundDone = () => [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => tone(f, i * 0.12, 0.5, 0.12));
+
+  // Spoken words via the Web Speech API. Android WebView usually lacks it,
+  // so this quietly does nothing there and the tones carry the feedback.
+  // queue = true lets the story narration play phrase after phrase without cutting itself off.
+  function say(text, queue) {
+    try {
+      if (!('speechSynthesis' in window)) return;
+      if (!queue) window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'en-US';
+      u.rate = 0.85;
+      u.pitch = 1.15;
+      window.speechSynthesis.speak(u);
+    } catch (e) { /* speech is optional */ }
+  }
+
+  const narration = i => (i === 0 ? 'First ' : 'Then ') + state.routine.steps[i].phrase + '.';
+
+  // ---------------------------------------------------------------------
+  // Rounds and difficulty
+  // ---------------------------------------------------------------------
+  // Prefer the tier's pool; if this session already used all of it, fall back to
+  // an unused routine of the same length, then to any unused routine.
+  function chooseRoutine(tier) {
+    const unused = ROUTINES.filter(r => !state.usedRoutines.includes(r.id));
+    const wantLen = tier.pool === 'long' ? 4 : 3;
+    let pool = unused.filter(r => r.pool === tier.pool);
+    if (!pool.length) pool = unused.filter(r => r.steps.length === wantLen);
+    if (!pool.length) pool = unused;
+    if (!pool.length) pool = ROUTINES.slice();
+    return pool[Math.floor(Math.random() * pool.length)];
+  }
+
+  function startRound() {
+    ensureSession();
+    const tier = TIERS[state.tier];
+    const routine = chooseRoutine(tier);
+    state.routine = routine;
+    state.usedRoutines.push(routine.id);
+
+    const k = routine.steps.length;
+    const pre = Math.min(tier.prePlaced, k - 1);
+    state.slots = routine.steps.map((_, i) => ({ index: i, filled: i < pre, errors: 0, bounceT0: -1e9, x: 0, y: 0 }));
+
+    const cards = routine.steps.map((st, i) => ({
+      step: i,
+      scene: st.scene,
+      action: st.action,
+      pre: i < pre,
+      jx: Math.random() * 2 - 1,   // fixed jitter so homes stay put across resizes
+      jy: Math.random() * 2 - 1,
+      jr: (Math.random() * 2 - 1) * 0.06,
+      x: 0, y: 0, homeX: 0, homeY: 0, homeSlot: -1, rot: 0,
+      state: i < pre ? 'placed' : 'idle',   // 'idle' | 'drag' | 'return' | 'toSlot' | 'placed'
+      anim: null, animP: 0, errors: 0, playT0: -1e9,
+    }));
+
+    // Shuffle the tray, never leaving it already in the right order.
+    const tray = cards.filter(c => !c.pre);
+    if (tray.length > 1) {
+      do { shuffle(tray); } while (tray.every((c, i) => i === 0 || tray[i - 1].step < c.step));
+    }
+    tray.forEach((c, i) => { c.homeSlot = i; c.rot = c.jr; });
+
+    state.cards = cards;
+    state.nextSlot = pre;
+    state.roundErrors = 0;
+    state.placedThisRound = 0;
+    state.completeAt = 0;
+    state.particles = [];
+    state.drag = null;
+    state.playIndex = -1;
+    state.finaleDone = false;
+    computeLayout();
+
+    state.phase = 'play';
+    state.roundStart = now();
+    state.lastInteraction = now();
+    if (state.round === 0) say('What happens first? Put the pictures in order.');
+    log(`Round ${state.round + 1}/${CONFIG.ROUNDS} started at level ${state.tier + 1}: ${routine.id}, ${k} steps, ${pre} pre-placed`);
+  }
+
+  function completeRound() {
+    const t = now();
+    const placeable = state.cards.filter(c => !c.pre);
+    const n = placeable.length;
+    const withErrors = placeable.filter(c => c.errors > 0).length;
+    const ms = t - state.roundStart;
+    const record = {
+      level: state.tier + 1,
+      routine: state.routine.id,
+      cards: n,
+      firstTry: n - withErrors,
+      slips: state.roundErrors,
+      seconds: Math.round(ms / 100) / 10,
+    };
+
+    session.rounds.push(record);
+    progress.roundsCompleted++;
+    progress.cardsPlaced += n;
+    progress.slips += state.roundErrors;
+    progress.lastPlayed = new Date().toISOString();
+    state.round++;
+    log('Level completed', record);
+
+    if (state.round >= CONFIG.ROUNDS) {
+      session.finished = true;
+      progress.gamesCompleted++;
+    }
+    saveProgress();
+    adjustDifficulty(record, ms);
+
+    // The story plays first; sparkles and praise follow in finale().
+    state.phase = 'celebrate';
+    state.celebrateStart = t;
+    state.playStart = t + CONFIG.PLAY_LEAD_MS;
+    state.playIndex = -1;
+    state.finaleDone = false;
+  }
+
+  // Story playback: card i lights up, its note plays and its phrase is spoken, all on the same frame.
+  function playStep(i, t) {
+    const card = state.cards.find(c => c.step === i);
+    if (card) card.playT0 = t;
+    state.slots[i].bounceT0 = t;
+    playStepNote(i);
+    say(narration(i), i > 0);
+    log(`Story step ${i + 1}: ${state.routine.steps[i].action}`);
+  }
+
+  // Same sparkles and the same chord every time (no random rewards).
+  function finale(t) {
+    playRoundDone();
+    state.slots.forEach(s => spawnParticles(s, t));
+    if (state.round < CONFIG.ROUNDS) {
+      // Praise the effort and the process, not the child's "smartness" (growth mindset).
+      say(state.roundErrors > 0 ? 'You kept trying, and you put it in order!' : 'You put every picture in order!', true);
+    }
+  }
+
+  // Simple DDA: quick and clean -> one step harder; a real struggle -> one step easier.
+  function adjustDifficulty(record, ms) {
+    const fast = ms / Math.max(1, record.cards) <= CONFIG.FAST_MS_PER_CARD;
+    const before = state.tier;
+    if (record.firstTry === record.cards && fast) {
+      state.tier = Math.min(TIERS.length - 1, state.tier + 1);
+    } else if (record.slips >= Math.max(3, record.cards)) {
+      state.tier = Math.max(0, state.tier - 1);
+    }
+    if (state.tier !== before) log(`Difficulty ${state.tier > before ? 'up' : 'down'}: level ${before + 1} -> ${state.tier + 1}`);
+  }
+
+  function enterEnd() {
+    state.phase = 'end';
+    say('Great job! Time to play outside!');
+    log('Session finished: end screen shown, no replay offered');
+  }
+
+  // ---------------------------------------------------------------------
+  // Layout
+  // ---------------------------------------------------------------------
+  const ARROW_GAP = 0.36;          // space between slots, in slot sizes (holds the arrow)
+  const TRAY_GAP = 0.55;           // space between the slot line and the card tray
+  const BADGE_ROOM = 0.12;         // dot badges poke out past the slot's top-left corner
+
+  // Two arrangements are tried: slots in a row above the tray (landscape-ish) or in a
+  // column beside it (tall phones). Each is tried with the home-button corner reserved
+  // either as a top band or as side bands. Rows win unless columns give clearly bigger cards.
+  function computeLayout() {
+    const minDim = Math.min(W, H);
+    const m = clamp(minDim * 0.04, 12, 32);
+    const k = state.slots.length || 3;
+    const R = CONFIG.HOME_RESERVE_PX;
+    const areas = [
+      { x: m, y: R, w: W - 2 * m, h: H - R - m },
+      { x: R, y: m, w: W - 2 * R, h: H - 2 * m },
+    ];
+    const long = k + (k - 1) * ARROW_GAP + BADGE_ROOM;
+    const short = 2 + TRAY_GAP + BADGE_ROOM;
+    let rows = { c: 0, a: areas[0] }, cols = { c: 0, a: areas[0] };
+    for (const a of areas) {
+      if (a.w <= 0 || a.h <= 0) continue;
+      const cr = Math.min(a.w / long, a.h / short);
+      const cc = Math.min(a.h / long, a.w / short);
+      if (cr > rows.c) rows = { c: cr, a };
+      if (cc > cols.c) cols = { c: cc, a };
+    }
+    rows.c = Math.min(rows.c, CONFIG.MAX_CARD_PX);
+    cols.c = Math.min(cols.c, CONFIG.MAX_CARD_PX);
+    const mode = cols.c > rows.c * 1.15 ? 'cols' : 'rows';
+    const pick = mode === 'cols' ? cols : rows;
+    const c = Math.max(30, pick.c);
+    const a = pick.a;
+
+    if (Math.abs(c - L.c) > 0.5) sceneCache.clear();
+    L.m = m; L.c = c; L.cs = c * 0.9; L.mode = mode;
+
+    const step = c * (1 + ARROW_GAP);
+    const lineLen = k * c + (k - 1) * c * ARROW_GAP;
+    const tray = state.cards.filter(cd => cd.homeSlot >= 0);
+    const n = Math.max(1, tray.length);
+
+    if (mode === 'rows') {
+      const left = a.x + (a.w - c * long) / 2 + c * BADGE_ROOM;
+      const top = a.y + (a.h - c * short) / 2 + c * BADGE_ROOM;
+      state.slots.forEach((s, i) => { s.x = left + i * step; s.y = top; });
+      const midX = left + lineLen / 2;
+      const trayY = top + c * (1 + TRAY_GAP) + c / 2;
+      tray.forEach(cd => {
+        cd.homeX = midX + (cd.homeSlot - (n - 1) / 2) * step + cd.jx * c * 0.04;
+        cd.homeY = trayY + cd.jy * c * 0.05;
+      });
+    } else {
+      const left = a.x + (a.w - c * short) / 2 + c * BADGE_ROOM;
+      const top = a.y + (a.h - c * long) / 2 + c * BADGE_ROOM;
+      state.slots.forEach((s, i) => { s.x = left; s.y = top + i * step; });
+      const midY = top + lineLen / 2;
+      const trayX = left + c * (1 + TRAY_GAP) + c / 2;
+      tray.forEach(cd => {
+        cd.homeX = trayX + cd.jx * c * 0.05;
+        cd.homeY = midY + (cd.homeSlot - (n - 1) / 2) * step + cd.jy * c * 0.04;
+      });
+    }
+    relayoutCards();
+  }
+
+  const slotCenter = s => ({ x: s.x + L.c / 2, y: s.y + L.c / 2 });
+
+  // Keep every card where it belongs after a resize or rotation.
+  function relayoutCards() {
+    for (const cd of state.cards) {
+      if (cd.state === 'idle') {
+        cd.x = cd.homeX; cd.y = cd.homeY;
+      } else if (cd.state === 'return' && cd.anim) {
+        cd.anim.tx = cd.homeX; cd.anim.ty = cd.homeY;
+      } else if (cd.state === 'toSlot' && cd.anim) {
+        const p = slotCenter(state.slots[cd.step]);
+        cd.anim.tx = p.x; cd.anim.ty = p.y;
+      } else if (cd.state === 'placed') {
+        const p = slotCenter(state.slots[cd.step]);
+        cd.x = p.x; cd.y = p.y; cd.rot = 0;
+      } else if (cd.state === 'drag') {
+        cd.x = clamp(cd.x, 0, W); cd.y = clamp(cd.y, 0, H);
+      }
+    }
+  }
+
+  // Generous drop zone: the slot plus wide margins. Nearest slot wins on overlap.
+  function inSlotZone(cd, s) {
+    const pad = L.c * 0.45;
+    return cd.x >= s.x - pad && cd.x <= s.x + L.c + pad && cd.y >= s.y - pad && cd.y <= s.y + L.c + pad;
+  }
+
+  function findDropSlot(cd) {
+    let best = null, bestD = Infinity;
+    for (const s of state.slots) {
+      if (!inSlotZone(cd, s)) continue;
+      const p = slotCenter(s);
+      const d = Math.hypot(cd.x - p.x, cd.y - p.y);
+      if (d < bestD) { best = s; bestD = d; }
+    }
+    return best;
+  }
+
+  const correctCard = () => state.cards.find(cd => cd.step === state.nextSlot) || null;
+
+  // ---------------------------------------------------------------------
+  // Drag and drop
+  // ---------------------------------------------------------------------
+  // Forgiving pick: the nearest tray card whose padded box holds the touch point.
+  function pickCard(p, states) {
+    let best = null, bestD = Infinity;
+    const half = L.cs / 2 + L.c * 0.15;
+    for (const cd of state.cards) {
+      if (!states.includes(cd.state)) continue;
+      if (Math.abs(p.x - cd.x) > half || Math.abs(p.y - cd.y) > half) continue;
+      const d = Math.hypot(p.x - cd.x, p.y - cd.y);
+      if (d < bestD) { best = cd; bestD = d; }
+    }
+    return best;
+  }
+
+  function beginDrag(cd, p) {
+    cd.state = 'drag';
+    cd.anim = null;
+    cd.rot = 0;
+    state.drag = { obj: cd, dx: cd.x - p.x, dy: cd.y - p.y, sx: p.x, sy: p.y, moved: 0 };
+    // Draw the held card on top of the others.
+    state.cards.splice(state.cards.indexOf(cd), 1);
+    state.cards.push(cd);
+    playPickup();
+    say(cd.action);
+    log('Picked up', cd.action);
+  }
+
+  function dropCard() {
+    const cd = state.drag.obj;
+    const wasTap = state.drag.moved < CONFIG.TAP_SLOP_PX;
+    state.drag = null;
+    if (wasTap) { sendHome(cd); return; }
+
+    const next = state.slots[state.nextSlot];
+    // The right card anywhere in the next slot's zone is accepted, even if it is
+    // nearer a neighbouring slot: forgiving for small hands.
+    if (next && cd.step === next.index && inSlotZone(cd, next)) {
+      acceptCard(cd, next);
+      return;
+    }
+    const slot = findDropSlot(cd);
+    if (slot && !slot.filled) {
+      cd.errors++;
+      state.roundErrors++;
+      if (next) next.errors++;
+      log(`Item rejected: "${cd.action}" (step ${cd.step + 1}) dropped on slot ${slot.index + 1}, next empty slot is ${state.nextSlot + 1}`);
+    }
+    sendHome(cd);
+  }
+
+  function acceptCard(cd, slot) {
+    const target = slotCenter(slot);
+    slot.filled = true;
+    state.nextSlot++;
+    cd.state = 'toSlot';
+    cd.anim = { fx: cd.x, fy: cd.y, tx: target.x, ty: target.y, fr: cd.rot, tr: 0, t0: now(), dur: CONFIG.TO_SLOT_MS, ease: easeInOutQuad };
+    cd.animP = 0;
+  }
+
+  // Montessori control of error: the card simply glides back to where it started.
+  function sendHome(cd) {
+    cd.state = 'return';
+    cd.anim = { fx: cd.x, fy: cd.y, tx: cd.homeX, ty: cd.homeY, fr: cd.rot, tr: cd.jr, t0: now(), dur: CONFIG.RETURN_MS, ease: easeOutCubic };
+    cd.animP = 0;
+  }
+
+  // Called when a card finishes sliding into its slot.
+  // Sound, slot bounce and the card settling all happen on the same frame (temporal contiguity).
+  function landInSlot(cd, t) {
+    cd.state = 'placed';
+    state.slots[cd.step].bounceT0 = t;
+    playChime(cd.step);
+    state.placedThisRound++;
+    log(`Item successfully placed: "${cd.action}" -> slot ${cd.step + 1}`);
+    if (state.cards.every(x => x.state === 'placed')) state.completeAt = t + CONFIG.COMPLETE_DELAY_MS;
+  }
+
+  // ---------------------------------------------------------------------
+  // Input: touch + mouse
+  // ---------------------------------------------------------------------
+  let activeTouch = null;
+  let mouseDown = false;
+  let parentTimer = null;
+
+  function toCanvas(clientX, clientY) {
+    const r = canvas.getBoundingClientRect();
+    return { x: clientX - r.left, y: clientY - r.top };
+  }
+
+  function findTouch(list, id) {
+    for (let i = 0; i < list.length; i++) if (list[i].identifier === id) return list[i];
+    return null;
+  }
+
+  function cancelParentHold() {
+    if (parentTimer) { clearTimeout(parentTimer); parentTimer = null; }
+  }
+
+  function onDown(p) {
+    unlockAudio();
+    state.lastInteraction = now();
+
+    if (state.phase === 'start' || state.phase === 'between') {
+      const g = starGeom();
+      if (Math.hypot(p.x - g.cx, p.y - g.cy) <= g.R * 1.8) { startRound(); return; }
+    } else if (state.phase === 'play') {
+      const cd = pickCard(p, ['idle', 'return']);
+      if (cd) { beginDrag(cd, p); return; }
+      // Tapping a card already in place just says what it shows.
+      const placed = pickCard(p, ['placed']);
+      if (placed) { say(placed.action); return; }
+    }
+
+    // Hidden parent view: hold the top-left corner still for 3 seconds.
+    if (p.x < CONFIG.PARENT_CORNER_PX && p.y < CONFIG.PARENT_CORNER_PX) {
+      cancelParentHold();
+      parentTimer = setTimeout(openParent, CONFIG.PARENT_HOLD_MS);
+    }
+  }
+
+  function onMove(p) {
+    if (parentTimer && (p.x >= CONFIG.PARENT_CORNER_PX || p.y >= CONFIG.PARENT_CORNER_PX)) cancelParentHold();
+    if (!state.drag) return;
+    state.lastInteraction = now();
+    const d = state.drag;
+    d.moved = Math.max(d.moved, Math.hypot(p.x - d.sx, p.y - d.sy));
+    d.obj.x = clamp(p.x + d.dx, 0, W);
+    d.obj.y = clamp(p.y + d.dy, 0, H);
+  }
+
+  function onUp() {
+    cancelParentHold();
+    if (state.drag) dropCard();
+  }
+
+  canvas.addEventListener('touchstart', e => {
+    e.preventDefault();
+    if (activeTouch !== null) return;          // one finger at a time
+    const t = e.changedTouches[0];
+    activeTouch = t.identifier;
+    onDown(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  canvas.addEventListener('touchmove', e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (t) onMove(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  const endTouch = e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (!t) return;
+    activeTouch = null;
+    onUp();
+  };
+  canvas.addEventListener('touchend', endTouch, { passive: false });
+  canvas.addEventListener('touchcancel', endTouch, { passive: false });
+
+  canvas.addEventListener('mousedown', e => { mouseDown = true; onDown(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mousemove', e => { if (mouseDown) onMove(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mouseup', () => {
+    if (!mouseDown) return;
+    mouseDown = false;
+    onUp();
+  });
+
+  // ---------------------------------------------------------------------
+  // Parent view (hidden, local data only)
+  // ---------------------------------------------------------------------
+  const parentEl = document.getElementById('parent');
+  const parentBody = document.getElementById('parentBody');
+
+  function el(tag, text) {
+    const node = document.createElement(tag);
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function openParent() {
+    parentTimer = null;
+    const rounds = progress.sessions.reduce((a, s) => a.concat(s.rounds), []);
+    const cards = rounds.reduce((a, r) => a + r.cards, 0);
+    const firstTry = rounds.reduce((a, r) => a + r.firstTry, 0);
+    const byRoutine = {};
+    rounds.forEach(r => { byRoutine[r.routine] = (byRoutine[r.routine] || 0) + 1; });
+    const practised = ROUTINES.filter(r => byRoutine[r.id]).map(r => `${r.name} ${byRoutine[r.id]}x`).join(', ');
+
+    parentBody.textContent = '';
+    parentBody.appendChild(el('div', `Full games finished: ${progress.gamesCompleted}`));
+    parentBody.appendChild(el('div', `Routines put in order: ${progress.roundsCompleted}`));
+    parentBody.appendChild(el('div', `Cards placed: ${progress.cardsPlaced}`));
+    parentBody.appendChild(el('div', `Placed on the first try: ${cards ? Math.round(100 * firstTry / cards) : 0}%`));
+    if (practised) parentBody.appendChild(el('div', `Practised: ${practised}`));
+
+    const recent = progress.sessions.slice(-6).reverse();
+    if (recent.length) {
+      const table = el('table');
+      const head = el('tr');
+      ['When', 'Rounds', 'Top level', 'Slips'].forEach(h => head.appendChild(el('th', h)));
+      table.appendChild(head);
+      recent.forEach(s => {
+        const tr = el('tr');
+        const when = new Date(s.startedAt);
+        tr.appendChild(el('td', when.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' ' +
+          when.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })));
+        tr.appendChild(el('td', `${s.rounds.length}/${CONFIG.ROUNDS}`));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => Math.max(a, r.level), 0) || '-')));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => a + r.slips, 0))));
+        table.appendChild(tr);
+      });
+      parentBody.appendChild(table);
+    }
+    parentEl.hidden = false;
+    log('Parent view opened', progress);
+  }
+
+  parentEl.addEventListener('click', () => { parentEl.hidden = true; });
+
+  // Read-only debug hooks for the Android/desktop console.
+  window.RoutineSeq = {
+    progress: () => JSON.parse(JSON.stringify(progress)),
+    state: () => {
+      const right = state.phase === 'play' ? correctCard() : null;
+      return {
+        phase: state.phase,
+        round: state.round,
+        level: state.tier + 1,
+        routine: state.routine ? state.routine.id : null,
+        nextSlot: state.nextSlot,
+        slots: state.slots.map(s => ({ index: s.index, filled: s.filled, x: s.x + L.c / 2, y: s.y + L.c / 2 })),
+        cards: state.cards.map(cd => ({ step: cd.step, action: cd.action, state: cd.state, x: cd.x, y: cd.y })),
+        correctCard: right && right.state !== 'placed' && right.state !== 'toSlot' ? { step: right.step, x: right.x, y: right.y } : null,
+      };
+    },
+  };
+
+  // ---------------------------------------------------------------------
+  // Drawing primitives
+  // ---------------------------------------------------------------------
+  function roundRectPath(x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  const rrect = (x, y, w, h, r) => { ctx.beginPath(); roundRectPath(x, y, w, h, r); };
+  const circle = (x, y, r) => { ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); };
+  const ellipse = (x, y, rx, ry, rot = 0) => { ctx.beginPath(); ctx.ellipse(x, y, rx, ry, rot, 0, TAU); };
+
+  // Fill the current path and give it a soft outline in a darker shade of the same colour.
+  function paint(fill, lw = LW, stroke) {
+    ctx.fillStyle = fill;
+    ctx.fill();
+    if (lw > 0) {
+      ctx.lineWidth = lw;
+      ctx.strokeStyle = stroke || shade(fill, -0.3);
+      ctx.stroke();
+    }
+  }
+
+  function line(x1, y1, x2, y2, color, lw) {
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = lw;
+    ctx.lineCap = 'round';
+    ctx.stroke();
+  }
+
+  // ---------------------------------------------------------------------
+  // The child: one character drawn the same way on every card
+  // Coordinates are in the 100x100 scene space; s is the head radius.
+  // ---------------------------------------------------------------------
+  function hand(x, y, s) { circle(x, y, 0.3 * s); paint(COLORS.skin, 0.08 * s); }
+
+  function arm(x, y, s, side, hx, hy, color) {
+    const sx = x + side * 0.6 * s, sy = y + 1.15 * s;
+    const mx = (sx + hx) / 2 + side * 0.3 * s, my = (sy + hy) / 2 + 0.15 * s;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(sx, sy);
+    ctx.quadraticCurveTo(mx, my, hx, hy);
+    ctx.strokeStyle = shade(color, -0.3);
+    ctx.lineWidth = 0.46 * s + LW * 1.4;
+    ctx.stroke();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 0.46 * s;
+    ctx.stroke();
+    hand(hx, hy, s);
+  }
+
+  // o: { x, y, s, body: 'head'|'bust'|'full', outfit: 'day'|'pj'|'skin', torso, hands, eyes, mouth, scarf }
+  // hands are [dx, dy] offsets from the head centre in head radii (null hides that arm).
+  function drawChild(o) {
+    const { x, y, s } = o;
+    const body = o.body || 'bust';
+    const outfit = o.outfit || 'day';
+    const top = outfit === 'pj' ? COLORS.pj : outfit === 'skin' ? COLORS.skin : COLORS.shirt;
+    const legs = outfit === 'pj' ? COLORS.pj : COLORS.pants;
+    const shoe = outfit === 'pj' ? COLORS.slipper : COLORS.shoe;
+    const face = 0.08 * s;
+
+    // Hair behind the head.
+    circle(x, y - 0.08 * s, 1.07 * s);
+    ctx.fillStyle = COLORS.hair;
+    ctx.fill();
+
+    if (body !== 'head') {
+      if (body === 'full') {
+        for (const side of [-1, 1]) {
+          rrect(x + side * 0.37 * s - 0.27 * s, y + 2.0 * s, 0.54 * s, 1.2 * s, 0.22 * s);
+          paint(legs);
+          ellipse(x + side * 0.44 * s, y + 3.22 * s, 0.38 * s, 0.2 * s);
+          paint(shoe);
+        }
+      }
+      const torsoH = (body === 'full' ? 1.45 : (o.torso || 3.2)) * s;
+      rrect(x - 0.8 * s, y + 0.8 * s, 1.6 * s, torsoH, 0.5 * s);
+      paint(top);
+      if (outfit === 'pj') {
+        // Soft stripes on the pajama top.
+        ctx.save();
+        rrect(x - 0.8 * s, y + 0.8 * s, 1.6 * s, torsoH, 0.5 * s);
+        ctx.clip();
+        ctx.globalAlpha = 0.45;
+        for (let v = y + 1.2 * s; v < y + 0.8 * s + torsoH; v += 0.5 * s) line(x - s, v, x + s, v, COLORS.white, 0.16 * s);
+        ctx.restore();
+      } else if (outfit === 'day') {
+        // A little collar so the shirt reads as clothes.
+        ctx.beginPath();
+        ctx.moveTo(x - 0.32 * s, y + 0.86 * s);
+        ctx.lineTo(x, y + 1.18 * s);
+        ctx.lineTo(x + 0.32 * s, y + 0.86 * s);
+        ctx.strokeStyle = shade(top, -0.3);
+        ctx.lineWidth = 0.09 * s;
+        ctx.stroke();
+      }
+      if (o.scarf) {
+        rrect(x - 0.78 * s, y + 0.74 * s, 1.56 * s, 0.38 * s, 0.19 * s);
+        paint(COLORS.scarf, 0.08 * s);
+        rrect(x + 0.18 * s, y + 0.9 * s, 0.34 * s, 0.95 * s, 0.14 * s);
+        paint(COLORS.scarf, 0.08 * s);
+      }
+      const hands = o.hands || [[-1.0, 2.1], [1.0, 2.1]];
+      hands.forEach((h, i) => { if (h) arm(x, y, s, i ? 1 : -1, x + h[0] * s, y + h[1] * s, top); });
+    }
+
+    // Ears and head.
+    for (const side of [-1, 1]) { circle(x + side * 0.97 * s, y + 0.12 * s, 0.2 * s); paint(COLORS.skin, face); }
+    circle(x, y, s);
+    paint(COLORS.skin, face * 1.2);
+
+    // Cheeks (puffed up when blowing).
+    const ck = o.mouth === 'puff' ? 1.6 : 1;
+    ctx.globalAlpha = 0.5;
+    ctx.fillStyle = COLORS.cheek;
+    ellipse(x - 0.56 * s, y + 0.36 * s, 0.17 * s * ck, 0.11 * s * ck); ctx.fill();
+    ellipse(x + 0.56 * s, y + 0.36 * s, 0.17 * s * ck, 0.11 * s * ck); ctx.fill();
+    ctx.globalAlpha = 1;
+
+    // Eyes.
+    ctx.fillStyle = COLORS.ink;
+    ctx.strokeStyle = COLORS.ink;
+    ctx.lineCap = 'round';
+    ctx.lineWidth = Math.max(0.8, 0.1 * s);
+    for (const side of [-1, 1]) {
+      const ex = x + side * 0.36 * s, ey = y + 0.06 * s;
+      if (o.eyes === 'closed') {
+        ctx.beginPath(); ctx.arc(ex, ey - 0.04 * s, 0.15 * s, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+      } else if (o.eyes === 'happy') {
+        ctx.beginPath(); ctx.arc(ex, ey + 0.1 * s, 0.15 * s, 1.15 * Math.PI, 1.85 * Math.PI); ctx.stroke();
+      } else {
+        circle(ex, ey, 0.12 * s); ctx.fillStyle = COLORS.ink; ctx.fill();
+        circle(ex + 0.04 * s, ey - 0.04 * s, 0.04 * s); ctx.fillStyle = '#FFFFFF'; ctx.fill();
+      }
+    }
+
+    // Mouth.
+    const my = y + 0.42 * s;
+    switch (o.mouth) {
+      case 'open': ellipse(x, my + 0.04 * s, 0.16 * s, 0.19 * s); paint(COLORS.mouth, face); break;
+      case 'o':    ellipse(x, my, 0.11 * s, 0.13 * s); paint(COLORS.mouth, face); break;
+      case 'puff': circle(x, my, 0.08 * s); paint(COLORS.mouth, face); break;
+      case 'flat': line(x - 0.14 * s, my, x + 0.14 * s, my, COLORS.ink, 0.09 * s); break;
+      case 'grin':
+        ctx.beginPath();
+        ctx.moveTo(x - 0.3 * s, my - 0.06 * s);
+        ctx.quadraticCurveTo(x, my + 0.5 * s, x + 0.3 * s, my - 0.06 * s);
+        ctx.closePath();
+        paint(COLORS.mouth, face);
+        break;
+      default:
+        ctx.beginPath();
+        ctx.arc(x, my - 0.16 * s, 0.25 * s, 0.22 * Math.PI, 0.78 * Math.PI);
+        ctx.strokeStyle = COLORS.ink;
+        ctx.lineWidth = 0.09 * s;
+        ctx.stroke();
+    }
+
+    // Fringe and the little tuft on top.
+    ctx.beginPath();
+    ctx.moveTo(x - 1.0 * s, y - 0.05 * s);
+    ctx.arc(x, y - 0.06 * s, 1.05 * s, Math.PI * 1.03, Math.PI * 1.97);
+    ctx.quadraticCurveTo(x + 0.75 * s, y - 0.6 * s, x + 0.2 * s, y - 0.5 * s);
+    ctx.quadraticCurveTo(x - 0.25 * s, y - 0.72 * s, x - 0.55 * s, y - 0.42 * s);
+    ctx.quadraticCurveTo(x - 0.85 * s, y - 0.3 * s, x - 1.0 * s, y - 0.05 * s);
+    ctx.closePath();
+    paint(COLORS.hair, face);
+    ctx.beginPath();
+    ctx.moveTo(x - 0.05 * s, y - 1.05 * s);
+    ctx.quadraticCurveTo(x + 0.1 * s, y - 1.45 * s, x + 0.42 * s, y - 1.3 * s);
+    ctx.strokeStyle = COLORS.hair;
+    ctx.lineWidth = 0.16 * s;
+    ctx.lineCap = 'round';
+    ctx.stroke();
+  }
+
+  // ---------------------------------------------------------------------
+  // Scene props (100x100 scene space)
+  // ---------------------------------------------------------------------
+  function fillBg(color) { ctx.fillStyle = color; ctx.fillRect(0, 0, 100, 100); }
+
+  function floorBand(y, color) { ctx.fillStyle = color; ctx.fillRect(0, y, 100, 100 - y); }
+
+  function tiles(bg, color) {
+    fillBg(bg);
+    ctx.beginPath();
+    for (let v = 12.5; v < 100; v += 12.5) { ctx.moveTo(v, 0); ctx.lineTo(v, 100); ctx.moveTo(0, v); ctx.lineTo(100, v); }
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 0.8;
+    ctx.stroke();
+  }
+
+  function windowPane(x, y, w, h, sky, inner) {
+    rrect(x - 2.5, y - 2.5, w + 5, h + 5, 4);
+    paint(COLORS.white);
+    ctx.save();
+    rrect(x, y, w, h, 2.5);
+    ctx.fillStyle = sky;
+    ctx.fill();
+    ctx.clip();
+    inner();
+    ctx.restore();
+    ctx.beginPath();
+    ctx.moveTo(x + w / 2, y); ctx.lineTo(x + w / 2, y + h);
+    ctx.moveTo(x, y + h / 2); ctx.lineTo(x + w, y + h / 2);
+    ctx.strokeStyle = COLORS.white;
+    ctx.lineWidth = 2.2;
+    ctx.stroke();
+  }
+
+  function sun(x, y, r, ph) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(ph * 0.5);
+    for (let i = 0; i < 8; i++) {
+      const a = i * TAU / 8;
+      line(Math.cos(a) * r * 1.3, Math.sin(a) * r * 1.3, Math.cos(a) * r * 1.65, Math.sin(a) * r * 1.65, COLORS.star, r * 0.22);
+    }
+    ctx.restore();
+    circle(x, y, r);
+    paint(COLORS.star, LW, shade(COLORS.star, -0.18));
+  }
+
+  function moon(x, y, r, sky) {
+    circle(x, y, r);
+    ctx.fillStyle = '#F8EAAE';
+    ctx.fill();
+    circle(x + r * 0.5, y - r * 0.25, r * 0.85);
+    ctx.fillStyle = sky;
+    ctx.fill();
+  }
+
+  function twinkle(x, y, r) {
+    ctx.beginPath();
+    for (let i = 0; i < 8; i++) {
+      const rad = i % 2 === 0 ? r : r * 0.35;
+      const a = -Math.PI / 2 + i * Math.PI / 4;
+      if (i === 0) ctx.moveTo(x + rad * Math.cos(a), y + rad * Math.sin(a));
+      else ctx.lineTo(x + rad * Math.cos(a), y + rad * Math.sin(a));
+    }
+    ctx.closePath();
+    ctx.fillStyle = COLORS.star;
+    ctx.fill();
+  }
+
+  function cloud(x, y, s) {
+    ctx.fillStyle = '#FFFFFF';
+    circle(x, y, s); ctx.fill();
+    circle(x - s * 1.1, y + s * 0.3, s * 0.7); ctx.fill();
+    circle(x + s * 1.1, y + s * 0.3, s * 0.75); ctx.fill();
+    rrect(x - s * 1.8, y + s * 0.1, s * 3.6, s * 0.9, s * 0.45); ctx.fill();
+  }
+
+  function ground(y) {
+    floorBand(y, COLORS.soil);
+    ctx.beginPath();
+    ctx.moveTo(0, y + 4);
+    ctx.lineTo(0, y);
+    for (let x = 0; x < 100; x += 10) ctx.quadraticCurveTo(x + 5, y - 4, x + 10, y);
+    ctx.lineTo(100, y + 4);
+    ctx.closePath();
+    ctx.fillStyle = COLORS.grass;
+    ctx.fill();
+  }
+
+  function table(y) {
+    rrect(-4, y - 2, 108, 7, 2);
+    paint(COLORS.wood);
+    ctx.fillStyle = COLORS.woodDark;
+    ctx.fillRect(0, y + 5, 100, 100 - y);
+  }
+
+  function bed(y) {
+    rrect(4, y, 92, 8, 3); paint(COLORS.wood);
+    rrect(8, y + 6, 6, 10, 2); paint(COLORS.woodDark);
+    rrect(86, y + 6, 6, 10, 2); paint(COLORS.woodDark);
+  }
+
+  // A drifting "z": the universal picture of sleep.
+  function zee(x, y, r, alpha) {
+    ctx.globalAlpha = alpha;
+    ctx.beginPath();
+    ctx.moveTo(x - r, y - r); ctx.lineTo(x + r, y - r); ctx.lineTo(x - r, y + r); ctx.lineTo(x + r, y + r);
+    ctx.strokeStyle = COLORS.white;
+    ctx.lineWidth = r * 0.45;
+    ctx.lineJoin = 'round';
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  function teddy(x, y, sway) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(sway);
+    const fur = '#C99A6E';
+    ellipse(0, 5, 5.5, 6.5); paint(fur);
+    ellipse(0, 6, 3, 3.6); paint('#E8C9A4', 0.8);
+    circle(-3.5, -7.5, 1.9); paint(fur);
+    circle(3.5, -7.5, 1.9); paint(fur);
+    circle(0, -4, 4.8); paint(fur);
+    ellipse(0, -2.6, 2.1, 1.5); paint('#E8C9A4', 0.8);
+    ctx.fillStyle = COLORS.ink;
+    circle(-1.7, -5, 0.6); ctx.fill();
+    circle(1.7, -5, 0.6); ctx.fill();
+    circle(0, -3, 0.6); ctx.fill();
+    ctx.restore();
+  }
+
+  function cake(cx, base, lit, ph) {
+    ellipse(cx, base, 26, 3.5); paint(COLORS.white);
+    rrect(cx - 19, base - 20, 38, 19, 4); paint('#F7DDB0');
+    line(cx - 17, base - 9, cx + 17, base - 9, COLORS.jam, 1.6);
+    rrect(cx - 19.5, base - 21.5, 39, 7, 3.5); paint('#EFB3C6');
+    for (const [dx, r] of [[-12, 2.3], [0, 2.7], [11, 2.1]]) { circle(cx + dx, base - 14.5, r); paint('#EFB3C6', 0); }
+    const colors = ['#8FB8DE', '#9CCB9A', '#F4D35E'];
+    [-10, 0, 10].forEach((dx, i) => {
+      const x = cx + dx;
+      rrect(x - 1.7, base - 31, 3.4, 10, 1.2); paint(colors[i], 1.2);
+      line(x, base - 31, x, base - 33, COLORS.ink, 0.8);
+      if (lit) {
+        const f = 1 + Math.sin(ph * 12 + i * 2) * 0.12;
+        ctx.beginPath();
+        ctx.moveTo(x, base - 33 - 6 * f);
+        ctx.quadraticCurveTo(x + 3 * f, base - 34, x, base - 32.2);
+        ctx.quadraticCurveTo(x - 3 * f, base - 34, x, base - 33 - 6 * f);
+        paint(COLORS.star, 0.8, '#E8A24A');
+      } else {
+        // Curls of smoke from the blown-out wicks.
+        const k = ph * 4;
+        ctx.globalAlpha = 0.6;
+        ctx.beginPath();
+        ctx.moveTo(x, base - 34);
+        ctx.bezierCurveTo(x + 3, base - 37 - Math.sin(k) * 0.6, x - 3, base - 40, x + 1, base - 44);
+        ctx.strokeStyle = '#A99FA8';
+        ctx.lineWidth = 1.3;
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
+    });
+  }
+
+  function bunting() {
+    ctx.beginPath();
+    ctx.moveTo(18, 6);
+    ctx.quadraticCurveTo(60, 16, 104, 6);
+    ctx.strokeStyle = shade('#D2A679', -0.1);
+    ctx.lineWidth = 0.9;
+    ctx.stroke();
+    const flags = ['#8FB8DE', '#F4D35E', '#9CCB9A', '#F2A88A', '#B8A9D9'];
+    for (let i = 0; i < 5; i++) {
+      const u = (i + 0.5) / 5;
+      const x = lerp(18, 104, u);
+      const y = 6 + 20 * u * (1 - u);
+      ctx.beginPath();
+      ctx.moveTo(x - 4, y); ctx.lineTo(x + 4, y); ctx.lineTo(x, y + 7);
+      ctx.closePath();
+      paint(flags[i], 0.8);
+    }
+  }
+
+  // A slice of bread seen face-on, with optional butter, jam and a bite taken out.
+  function breadPath(cx, cy, w) {
+    ctx.beginPath();
+    ctx.moveTo(cx - 0.38 * w, cy + 0.36 * w);
+    ctx.lineTo(cx - 0.38 * w, cy - 0.08 * w);
+    ctx.bezierCurveTo(cx - 0.62 * w, cy - 0.2 * w, cx - 0.5 * w, cy - 0.58 * w, cx, cy - 0.5 * w);
+    ctx.bezierCurveTo(cx + 0.5 * w, cy - 0.58 * w, cx + 0.62 * w, cy - 0.2 * w, cx + 0.38 * w, cy - 0.08 * w);
+    ctx.lineTo(cx + 0.38 * w, cy + 0.36 * w);
+    ctx.quadraticCurveTo(cx + 0.38 * w, cy + 0.46 * w, cx + 0.28 * w, cy + 0.46 * w);
+    ctx.lineTo(cx - 0.28 * w, cy + 0.46 * w);
+    ctx.quadraticCurveTo(cx - 0.38 * w, cy + 0.46 * w, cx - 0.38 * w, cy + 0.36 * w);
+    ctx.closePath();
+  }
+
+  function bread(cx, cy, w, o = {}) {
+    ctx.save();
+    if (o.bite) {
+      ctx.beginPath();
+      ctx.rect(cx - w, cy - w, w * 2, w * 2);
+      ctx.arc(o.bite[0], o.bite[1], o.bite[2], 0, TAU);
+      ctx.clip('evenodd');
+    }
+    if (o.sandwich) {
+      // Bottom slice and a wavy edge of jam peeking out under the top one.
+      breadPath(cx + 1, cy + 3, w); paint(COLORS.crust);
+      ctx.beginPath();
+      ctx.moveTo(cx - 0.4 * w, cy + 0.42 * w);
+      for (let i = 0; i <= 8; i++) ctx.lineTo(cx - 0.4 * w + i * 0.1 * w, cy + 0.42 * w + (i % 2 ? 2.4 : 0.6));
+      ctx.lineTo(cx + 0.4 * w, cy + 0.3 * w);
+      ctx.lineTo(cx - 0.4 * w, cy + 0.3 * w);
+      ctx.closePath();
+      paint(COLORS.jam, 0.8);
+    }
+    breadPath(cx, cy, w); paint(COLORS.crust);
+    breadPath(cx, cy + 0.03 * w, w * 0.8); paint(COLORS.crumb, 0.6);
+    if (o.butter || o.jam) {
+      ctx.save();
+      breadPath(cx, cy + 0.03 * w, w * 0.8);
+      ctx.clip();
+      if (o.butter) {
+        const b = o.butter;
+        ellipse(cx - 0.35 * w * (1 - b), cy + 0.02 * w, 0.34 * w * b + 1.5, 0.32 * w);
+        paint(COLORS.butter, 0.6);
+      }
+      if (o.jam) {
+        const j = o.jam;
+        ellipse(cx - 0.32 * w * (1 - j), cy + 0.04 * w, 0.3 * w * j + 1.2, 0.27 * w);
+        paint(COLORS.jam, 0.6);
+        ellipse(cx - 0.1 * w, cy - 0.06 * w, 0.08 * w * j + 0.4, 0.04 * w); ctx.fillStyle = 'rgba(255,255,255,0.5)'; ctx.fill();
+      }
+      ctx.restore();
+    }
+    ctx.restore();
+  }
+
+  function knife(x, y, angle, jam) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(angle);
+    rrect(-10, -1.6, 11, 3.2, 1.6); paint(COLORS.metal, 1.1);
+    if (jam) { rrect(-10, -1.6, 4.5, 3.2, 1.6); paint(COLORS.jam, 0); }
+    rrect(1, -2, 9, 4, 2); paint(COLORS.woodDark, 1.1);
+    ctx.restore();
+  }
+
+  // Kitchen wall behind the child; kitchen.counter() (below the scenes) goes in front.
+  function kitchen() {
+    tiles('#FFF1D8', '#F2DFBD');
+  }
+
+  function snowy(groundY) {
+    fillBg('#DDEBF6');
+    ctx.fillStyle = '#FFFFFF';
+    for (const [x, y, r] of [[22, 12, 1.4], [46, 7, 1.1], [70, 16, 1.5], [90, 8, 1.2], [56, 28, 1.0], [36, 30, 1.2], [86, 34, 1.3], [10, 40, 1.1]]) {
+      circle(x, y, r); ctx.fill();
+    }
+    ctx.beginPath();
+    ctx.moveTo(0, 100);
+    ctx.lineTo(0, groundY + 2);
+    ctx.quadraticCurveTo(25, groundY - 4, 50, groundY);
+    ctx.quadraticCurveTo(75, groundY + 4, 100, groundY - 2);
+    ctx.lineTo(100, 100);
+    ctx.closePath();
+    paint(COLORS.snow, 1.2, COLORS.snowLine);
+  }
+
+  function snowball(x, y, r) {
+    circle(x, y, r);
+    paint(COLORS.snow, LW, COLORS.snowLine);
+    ctx.save();
+    circle(x, y, r);
+    ctx.clip();
+    circle(x - r * 0.25, y - r * 0.3, r * 1.02);
+    ctx.rect(x - r * 2, y - r * 2, r * 4, r * 4);
+    ctx.fillStyle = 'rgba(185, 204, 221, 0.35)';
+    ctx.fill('evenodd');
+    ctx.restore();
+  }
+
+  function snowman(o) {
+    snowball(64, 56, 13);
+    if (!o.head) return;
+    snowball(64, 37, 9.5);
+    if (!o.face) return;
+    ctx.fillStyle = COLORS.ink;
+    circle(60.5, 34.5, 1.1); ctx.fill();
+    circle(67.5, 34.5, 1.1); ctx.fill();
+    for (let i = 0; i < 5; i++) { circle(60 + i * 2, 41.5 + Math.sin(i / 4 * Math.PI) * 1.4, 0.6); ctx.fill(); }
+    circle(64, 51, 1.1); ctx.fill();
+    circle(64, 57, 1.1); ctx.fill();
+    rrect(54, 27.5, 20, 2.8, 1.2); paint('#5E5148');
+    rrect(57.5, 18, 13, 10.5, 1.5); paint('#5E5148');
+    rrect(57.5, 24.5, 13, 2.2, 0); paint(COLORS.scarf, 0);
+    if (o.nose) {
+      ctx.beginPath();
+      ctx.moveTo(64, 36.4); ctx.lineTo(72, 38.2); ctx.lineTo(64, 39.6);
+      ctx.closePath();
+      paint('#F2A06A', 1);
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // The scenes. Each draws one card's picture in a 100x100 box.
+  // ph is seconds since the card lit up during story playback (0 = still picture).
+  // ---------------------------------------------------------------------
+  const SCENES = {
+    // Morning ----------------------------------------------------------
+    wake(ph) {
+      fillBg('#FFF3D9');
+      floorBand(80, '#F1DDBA');
+      windowPane(10, 10, 32, 28, '#CFE6F5', () => sun(26, 34, 9, ph));
+      rrect(74, 30, 20, 52, 6); paint(COLORS.wood);
+      ellipse(77, 52, 13, 7); paint(COLORS.white);
+      const st = Math.sin(ph * 5) * 0.12;
+      drawChild({ x: 55, y: 42, s: 11, outfit: 'pj', eyes: 'happy', mouth: 'o', torso: 2.4,
+        hands: [[-1.4, -0.9 + st], [1.4, -0.9 - st]] });
+      ctx.beginPath();
+      ctx.moveTo(10, 66);
+      ctx.quadraticCurveTo(30, 58, 52, 62);
+      ctx.quadraticCurveTo(76, 58, 94, 64);
+      ctx.lineTo(94, 80); ctx.lineTo(10, 80);
+      ctx.closePath();
+      paint(COLORS.blanket);
+      line(20, 70, 44, 68, shade(COLORS.blanket, -0.15), 1.2);
+      bed(76);
+    },
+
+    teeth(ph) {
+      tiles('#E4F0F4', '#D2E4EA');
+      rrect(56, 8, 34, 30, 8); paint(COLORS.white);
+      rrect(59.5, 11.5, 27, 23, 6); paint('#CFE6F5', 1.2);
+      line(65, 28, 71, 17, 'rgba(255,255,255,0.85)', 2);
+      line(71, 30, 76, 21, 'rgba(255,255,255,0.85)', 1.4);
+      const b = Math.sin(ph * 14) * 1.2;
+      drawChild({ x: 34, y: 40, s: 12, outfit: 'pj', eyes: 'open', mouth: 'flat',
+        hands: [[-1.0, 2.2], [1.0, 0.54 + b / 12]] });
+      rrect(36, 44.5 + b, 18, 3, 1.5); paint('#9CCB9A', 1.2);
+      rrect(32.5, 42 + b, 6.5, 4, 1.2); paint(COLORS.white, 1);
+      for (const [x, y, r] of [[30, 47.5, 1.9], [33.5, 49.5, 1.4], [28, 44.5, 1.3]]) { circle(x, y + b, r); paint('#FFFFFF', 0.7, '#C9D8E0'); }
+      hand(46, 46.5 + b, 12);
+      rrect(48, 64, 52, 10, 4); paint(COLORS.white);
+      rrect(52, 74, 46, 30, 3); paint('#D7E6EC');
+      rrect(82, 55, 4, 10, 1.5); paint(COLORS.metal, 1.2);
+      rrect(75, 55, 11, 3.5, 1.5); paint(COLORS.metal, 1.2);
+    },
+
+    dress(ph) {
+      fillBg('#FCEBDC');
+      floorBand(70, '#EED8C0');
+      rrect(6, 14, 32, 62, 4); paint(COLORS.wood);
+      rrect(10, 18, 24, 54, 3); paint('#9A7458');
+      line(12, 25, 32, 25, '#E8D8C8', 1.5);
+      ctx.beginPath(); ctx.moveTo(22, 25); ctx.lineTo(15, 31); ctx.lineTo(29, 31); ctx.closePath();
+      ctx.strokeStyle = '#E8D8C8'; ctx.lineWidth = 1.2; ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(15, 31); ctx.lineTo(11.5, 37); ctx.lineTo(15, 39); ctx.lineTo(16, 48); ctx.lineTo(28, 48);
+      ctx.lineTo(29, 39); ctx.lineTo(32.5, 37); ctx.lineTo(29, 31); ctx.closePath();
+      paint('#F2A88A', 1.2);
+      ctx.globalAlpha = 0.25; ellipse(66, 71, 15, 2.6); ctx.fillStyle = COLORS.ink; ctx.fill(); ctx.globalAlpha = 1;
+      const tug = Math.sin(ph * 6) * 0.08;
+      drawChild({ x: 66, y: 26, s: 13, body: 'full', outfit: 'day', eyes: 'happy', mouth: 'grin',
+        hands: [[-0.95, 1.95 + tug], [0.95, 1.95 - tug]] });
+      twinkle(46, 42, 4); twinkle(88, 30, 3); twinkle(87, 56, 2.5);
+    },
+
+    // Mealtime ---------------------------------------------------------
+    wash(ph) {
+      tiles('#E3F0EE', '#D0E4E1');
+      drawChild({ x: 50, y: 26, s: 11, outfit: 'day', eyes: 'open', mouth: 'smile', torso: 3.4,
+        hands: [[-0.15, 3.2], [0.75, 3.2]] });
+      rrect(14, 62, 72, 12, 5); paint(COLORS.white);
+      rrect(20, 74, 60, 30, 3); paint('#CFE3DF');
+      ctx.beginPath();
+      ctx.moveTo(80, 64); ctx.lineTo(80, 46);
+      ctx.quadraticCurveTo(80, 40, 73, 40);
+      ctx.lineTo(56, 40);
+      ctx.strokeStyle = shade(COLORS.metal, -0.3); ctx.lineWidth = 5.4; ctx.lineCap = 'round'; ctx.stroke();
+      ctx.strokeStyle = COLORS.metal; ctx.lineWidth = 3.6; ctx.stroke();
+      rrect(53, 39, 5, 6, 1.5); paint(COLORS.metal, 1.2);
+      ctx.globalAlpha = 0.75;
+      rrect(53.8, 45, 3.4, 15, 1.7); ctx.fillStyle = COLORS.water; ctx.fill();
+      ctx.globalAlpha = 1;
+      hand(48.4, 61.2, 11);
+      hand(58.3, 61.2, 11);
+      for (let i = 0; i < 5; i++) {
+        const k = (i / 5 + ph * 0.5) % 1;
+        const bx = 44 + i * 4.5 + Math.sin(i * 2 + ph * 3) * 1.2;
+        circle(bx, 60 - k * 8, 1.2 + (i % 3) * 0.5);
+        paint('#FFFFFF', 0.6, '#A9CBD6');
+      }
+    },
+
+    eat(ph) {
+      fillBg('#FCEFD9');
+      ctx.fillStyle = '#F5E2C2';
+      for (let y = 8; y < 64; y += 14) for (let x = (y / 14) % 2 ? 14 : 7; x < 100; x += 14) { circle(x, y, 1.3); ctx.fill(); }
+      const lift = Math.sin(ph * 5) * 1.5;
+      drawChild({ x: 50, y: 32, s: 13, outfit: 'day', eyes: 'happy', mouth: 'open', torso: 3,
+        hands: [[-1.1, 2.6], [0.85, 1.25 + lift / 13]] });
+      line(61, 48 + lift, 54.5, 40.5 + lift, '#B9C2C8', 2.4);
+      ellipse(53.5, 39.5 + lift, 3.2, 2.2, -0.6); paint(COLORS.metal, 1);
+      hand(61, 48.25 + lift, 13);
+      table(66);
+      hand(36, 64.5, 13);
+      ctx.beginPath(); ctx.moveTo(34, 62); ctx.quadraticCurveTo(50, 82, 66, 62); ctx.closePath();
+      paint('#8FB8DE');
+      ellipse(50, 62, 16, 3.2); paint('#F4D35E', 1.2);
+      ctx.globalAlpha = 0.7;
+      for (let i = 0; i < 3; i++) {
+        const x = 44 + i * 6, w = Math.sin(ph * 3 + i) * 1.2;
+        ctx.beginPath();
+        ctx.moveTo(x, 58);
+        ctx.bezierCurveTo(x + 3 + w, 55, x - 3 - w, 52, x, 49);
+        ctx.strokeStyle = '#FFFFFF'; ctx.lineWidth = 1.5; ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+    },
+
+    clear() {
+      fillBg('#FCEFD9');
+      floorBand(70, '#EBD6BC');
+      rrect(70, 46, 40, 34, 2); paint(COLORS.wood);
+      rrect(67, 42, 40, 6, 2); paint('#C9D3D8');
+      ellipse(85, 44.6, 9, 1.6); ctx.fillStyle = '#9FB0B8'; ctx.fill();
+      rrect(92, 32, 3, 11, 1.2); paint(COLORS.metal, 1);
+      rrect(86, 32, 9, 3, 1.2); paint(COLORS.metal, 1);
+      line(80, 58, 80, 70, shade(COLORS.wood, -0.2), 1);
+      ctx.globalAlpha = 0.25; ellipse(38, 70, 14, 2.4); ctx.fillStyle = COLORS.ink; ctx.fill(); ctx.globalAlpha = 1;
+      drawChild({ x: 38, y: 26, s: 12.5, body: 'full', outfit: 'day', eyes: 'open', mouth: 'smile',
+        hands: [[-0.1, 1.95], [1.85, 1.95]] });
+      ellipse(50, 50.5, 14, 4.2); paint(COLORS.white);
+      ellipse(50, 50, 9, 2.3); ctx.strokeStyle = '#E6DCCB'; ctx.lineWidth = 0.9; ctx.stroke();
+      ctx.fillStyle = '#D9B98A';
+      circle(46, 49.5, 0.7); ctx.fill(); circle(52, 50.6, 0.6); ctx.fill(); circle(49, 51.2, 0.5); ctx.fill();
+      hand(36.75, 50.4, 12.5);
+      hand(61.1, 50.4, 12.5);
+      ctx.globalAlpha = 0.4;
+      for (const y of [40, 48, 56]) line(12, y, 18, y, COLORS.ink, 1.3);
+      ctx.globalAlpha = 1;
+    },
+
+    // Bedtime ----------------------------------------------------------
+    bath(ph) {
+      tiles('#DCE7F3', '#C9D8EA');
+      drawChild({ x: 46, y: 38, s: 12, outfit: 'skin', eyes: 'happy', mouth: 'grin', torso: 2,
+        hands: [[-1.45, 0.7], [1.5, 0.5]] });
+      rrect(6, 56, 88, 28, 12); paint(COLORS.white);
+      ellipse(18, 86, 5, 3); paint(COLORS.metal, 1.2);
+      ellipse(82, 86, 5, 3); paint(COLORS.metal, 1.2);
+      for (let i = 0; i < 9; i++) { circle(12 + i * 9.5, 57 + (i % 2) * 1.5, 6 - (i % 3)); paint('#FFFFFF', 1, '#C3D4E4'); }
+      const bob = Math.sin(ph * 4) * 0.8;
+      ellipse(76, 52 + bob, 7, 4.5); paint('#F4D35E');
+      circle(80, 46 + bob, 3.6); paint('#F4D35E');
+      ellipse(83.8, 46.6 + bob, 2, 1.1); paint('#F2A88A', 0.8);
+      circle(80.8, 45.2 + bob, 0.6); ctx.fillStyle = COLORS.ink; ctx.fill();
+      for (const [x, y, r] of [[22, 30, 2.6], [66, 22, 2], [84, 32, 1.6], [30, 18, 1.4]]) {
+        circle(x, y - (ph * 3) % 6, r);
+        ctx.strokeStyle = '#A9C6DE'; ctx.lineWidth = 0.9; ctx.stroke();
+      }
+    },
+
+    pajamas(ph) {
+      fillBg('#E6DFF2');
+      floorBand(70, '#D7CDE8');
+      ellipse(54, 72, 30, 4.5); paint('#C9BBE4', 1);
+      windowPane(9, 12, 24, 22, COLORS.night, () => {
+        moon(17, 19, 5, COLORS.night);
+        twinkle(27, 16, 1.6); twinkle(25, 28, 1.2);
+      });
+      drawChild({ x: 54, y: 24, s: 13, body: 'full', outfit: 'pj', eyes: 'open', mouth: 'o',
+        hands: [[-1.0, 2.0], [1.05, 1.75]] });
+      teddy(70, 47, Math.sin(ph * 4) * 0.06);
+      hand(67.65, 46.75, 13);
+    },
+
+    sleep(ph) {
+      fillBg('#BFC8E4');
+      floorBand(84, '#AEB7D8');
+      windowPane(9, 10, 28, 24, COLORS.night, () => {
+        moon(18, 19, 6, COLORS.night);
+        twinkle(30, 15, 1.6); twinkle(31, 28, 1.2); twinkle(13, 30, 1);
+      });
+      rrect(4, 40, 14, 44, 5); paint(COLORS.wood);
+      ellipse(29, 56, 13, 6.5); paint(COLORS.white);
+      drawChild({ x: 31, y: 50, s: 10, body: 'head', eyes: 'closed', mouth: 'smile' });
+      ctx.beginPath();
+      ctx.moveTo(16, 62);
+      ctx.quadraticCurveTo(40, 56, 60, 60);
+      ctx.quadraticCurveTo(82, 56, 98, 62);
+      ctx.lineTo(98, 80); ctx.lineTo(16, 80);
+      ctx.closePath();
+      paint('#8FB8DE');
+      ctx.fillStyle = 'rgba(255,253,248,0.55)';
+      for (const [x, y] of [[30, 68], [46, 72], [62, 67], [78, 72], [90, 66]]) { circle(x, y, 1.4); ctx.fill(); }
+      bed(76);
+      for (let i = 0; i < 3; i++) {
+        const k = (i / 3 + ph * 0.35) % 1;
+        zee(46 + k * 22, 44 - k * 24, 2 + k * 2.5, ph ? 1 - k * 0.6 : 0.85);
+      }
+    },
+
+    // Garden -----------------------------------------------------------
+    plant(ph) {
+      fillBg(COLORS.sky);
+      cloud(78, 16, 5);
+      drawChild({ x: 34, y: 30, s: 12, outfit: 'day', eyes: 'open', mouth: 'smile', torso: 3,
+        hands: [[-0.95, 2.0], [2.45, 2.5]] });
+      ground(64);
+      rrect(17, 47, 11, 14, 1.5); paint('#F2A88A', 1.2);
+      circle(22.5, 52, 2.2); paint('#F6C85F', 0.8);
+      hand(22.6, 54, 12);
+      ellipse(67, 71, 8, 2.6); ctx.fillStyle = '#8A6448'; ctx.fill();
+      ellipse(80, 69, 7, 3.5); paint('#B98B64', 1.2);
+      const fall = (ph * 0.8) % 1;
+      ellipse(66, 65.5 + fall * 4, 1.5, 2.1); paint('#8A6448', 0.8);
+      hand(63.4, 60, 12);
+    },
+
+    water(ph) {
+      fillBg(COLORS.sky);
+      cloud(84, 14, 4.5);
+      drawChild({ x: 28, y: 30, s: 12, outfit: 'day', eyes: 'open', mouth: 'smile', torso: 3,
+        hands: [[-1.0, 2.2], [1.79, 0.75]] });
+      ctx.beginPath(); ctx.arc(49.5, 44, 5.5, Math.PI, TAU);
+      ctx.strokeStyle = shade('#9CCB9A', -0.3); ctx.lineWidth = 3.4; ctx.stroke();
+      ctx.strokeStyle = '#9CCB9A'; ctx.lineWidth = 2; ctx.stroke();
+      rrect(42, 44, 15, 12, 3); paint('#9CCB9A');
+      ctx.beginPath(); ctx.moveTo(56, 49); ctx.lineTo(67, 41.5); ctx.lineTo(68.5, 44); ctx.lineTo(57, 53); ctx.closePath();
+      paint('#9CCB9A', 1.2);
+      ellipse(68.6, 42.6, 2, 3.2, -0.8); paint('#9CCB9A', 1.2);
+      hand(49.5, 39, 12);
+      ground(64);
+      line(70, 64, 70, 57, COLORS.stem, 1.6);
+      ellipse(67, 56.5, 3.2, 1.6, -0.5); paint(COLORS.leaf, 0.8);
+      ellipse(73, 55.5, 3.2, 1.6, 0.5); paint(COLORS.leaf, 0.8);
+      for (let i = 0; i < 4; i++) {
+        const k = (i / 4 + ph * 1.1) % 1;
+        const x = 69 + (i % 2) * 2 - 0.5, y = 46 + k * 9;
+        ctx.beginPath(); ctx.moveTo(x, y - 1.6); ctx.quadraticCurveTo(x + 1.2, y + 0.4, x, y + 0.9); ctx.quadraticCurveTo(x - 1.2, y + 0.4, x, y - 1.6);
+        paint('#8FC6E8', 0.5);
+      }
+    },
+
+    flower(ph) {
+      fillBg(COLORS.sky);
+      sun(88, 12, 5.5, ph);
+      drawChild({ x: 28, y: 32, s: 12, outfit: 'day', eyes: 'happy', mouth: 'grin', torso: 3,
+        hands: [[-1.35, -0.1], [1.35, -0.1]] });
+      ground(66);
+      ctx.save();
+      ctx.translate(66, 66);
+      ctx.rotate(Math.sin(ph * 3) * 0.08);
+      ctx.beginPath(); ctx.moveTo(0, 0); ctx.quadraticCurveTo(-4, -20, 0, -38);
+      ctx.strokeStyle = COLORS.stem; ctx.lineWidth = 3; ctx.stroke();
+      ellipse(-6, -13, 6, 2.6, -0.5); paint(COLORS.leaf, 1.2);
+      ellipse(6, -22, 6, 2.6, 0.5); paint(COLORS.leaf, 1.2);
+      for (let i = 0; i < 6; i++) {
+        const a = i * TAU / 6;
+        ellipse(Math.cos(a) * 7, -40 + Math.sin(a) * 7, 5.5, 4, a); paint('#F2A88A', 1.2);
+      }
+      circle(0, -40, 5); paint(COLORS.star, 1.2);
+      ctx.restore();
+    },
+
+    // Birthday cake ----------------------------------------------------
+    candles(ph) {
+      fillBg('#FBE3EA');
+      bunting();
+      drawChild({ x: 50, y: 24, s: 10, outfit: 'day', eyes: 'open', mouth: 'grin', torso: 5,
+        hands: [[-1.4, 0.3], [1.4, 0.3]] });
+      table(74);
+      cake(50, 74, true, ph);
+    },
+
+    blow(ph) {
+      fillBg('#FBE3EA');
+      bunting();
+      drawChild({ x: 50, y: 24, s: 10, outfit: 'day', eyes: 'closed', mouth: 'puff', torso: 5,
+        hands: [[-1.1, 2.6], [1.1, 2.6]] });
+      table(74);
+      cake(50, 74, false, ph);
+      ctx.globalAlpha = 0.9;
+      const w = Math.sin(ph * 8) * 0.8;
+      for (const dx of [-6, 0, 6]) {
+        ctx.beginPath();
+        ctx.moveTo(50 + dx * 0.4, 31);
+        ctx.quadraticCurveTo(50 + dx + w, 33.5, 50 + dx * 1.2, 36);
+        ctx.strokeStyle = '#FFFFFF'; ctx.lineWidth = 1.5; ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+    },
+
+    slice(ph) {
+      fillBg('#FBE3EA');
+      bunting();
+      const chew = Math.sin(ph * 6) * 0.8;
+      drawChild({ x: 50, y: 24, s: 10, outfit: 'day', eyes: 'happy', mouth: 'open', torso: 5,
+        hands: [[-1.1, 2.6], [1.0, 1.4 + chew / 10]] });
+      line(60, 38 + chew, 54, 31 + chew, '#B9C2C8', 1.6);
+      rrect(51.5, 27.5 + chew, 4.5, 4, 1); paint('#F7DDB0', 0.8);
+      rrect(51.5, 27 + chew, 4.5, 1.6, 0.8); paint('#EFB3C6', 0);
+      hand(60, 38 + chew, 10);
+      table(74);
+      ellipse(50, 74, 24, 3.4); paint(COLORS.white);
+      // A wedge of cake seen from the side: sponge, a jam layer, pink icing on top and at the back.
+      ctx.beginPath(); ctx.moveTo(34, 72); ctx.lineTo(66, 72); ctx.lineTo(66, 51); ctx.closePath();
+      paint('#F7DDB0');
+      ctx.save();
+      ctx.beginPath(); ctx.moveTo(34, 72); ctx.lineTo(66, 72); ctx.lineTo(66, 51); ctx.closePath(); ctx.clip();
+      ctx.fillStyle = COLORS.jam; ctx.fillRect(30, 63.5, 40, 2.4);
+      ctx.restore();
+      ctx.beginPath(); ctx.moveTo(34, 72); ctx.lineTo(66, 51); ctx.lineTo(66, 72);
+      ctx.strokeStyle = shade('#EFB3C6', -0.2); ctx.lineWidth = 4.4; ctx.lineJoin = 'round'; ctx.stroke();
+      ctx.strokeStyle = '#EFB3C6'; ctx.lineWidth = 3; ctx.stroke();
+      line(34, 72, 66, 72, shade('#F7DDB0', -0.3), 1.4);
+      circle(62, 50.5, 2.6); paint(COLORS.jam, 0.9);
+      line(62, 48, 63.5, 45.5, COLORS.stem, 0.9);
+      rrect(24, 70.5, 2.6, 6.5, 1); paint('#8FB8DE', 0.8);
+    },
+
+    // Sandwich (4 steps) -----------------------------------------------
+    bread() {
+      kitchen();
+      rrect(3, 40, 17, 15, 6); paint(COLORS.crust);
+      for (const x of [8, 12, 16]) line(x, 42, x - 1.5, 52, shade(COLORS.crust, -0.2), 0.9);
+      // The reaching arm is drawn after the counter so it rests on top of it.
+      drawChild({ x: 50, y: 28, s: 12, outfit: 'day', eyes: 'open', mouth: 'smile', torso: 3,
+        hands: [[-0.95, 2.6], null] });
+      kitchen.counter();
+      bread(40, 74, 20);
+      bread(64, 74, 20);
+      arm(50, 28, 12, 1, 68.6, 63.4, COLORS.shirt);
+    },
+
+    butter(ph) {
+      kitchen();
+      drawChild({ x: 50, y: 28, s: 12, outfit: 'day', eyes: 'open', mouth: 'smile', torso: 3,
+        hands: [[-0.95, 2.6], null] });
+      kitchen.counter();
+      rrect(4, 46, 14, 8, 2); paint(COLORS.white);
+      rrect(6, 42, 9, 6, 1.5); paint(COLORS.butter, 1.2);
+      const dx = Math.sin(ph * 5) * 2.5;
+      bread(40, 74, 20);
+      bread(64, 74, 20, { butter: 0.65 + dx * 0.04 });
+      knife(66 + dx, 70, -0.6, false);
+      arm(50, 28, 12, 1, 70.5 + dx, 66.9, COLORS.shirt);   // hand on the knife handle
+    },
+
+    jam(ph) {
+      kitchen();
+      drawChild({ x: 50, y: 28, s: 12, outfit: 'day', eyes: 'open', mouth: 'smile', torso: 3,
+        hands: [[-0.95, 2.6], null] });
+      kitchen.counter();
+      rrect(4, 38, 14, 17, 3); paint('#F6DCE0');
+      rrect(5.5, 42, 11, 11.5, 2.5); paint(COLORS.jam, 0);
+      rrect(3, 35, 16, 4.5, 1.5); paint('#8FB8DE', 1.2);
+      const dx = Math.sin(ph * 5) * 2.5;
+      bread(40, 74, 20);
+      bread(64, 74, 20, { butter: 1, jam: 0.65 + dx * 0.04 });
+      knife(66 + dx, 70, -0.6, true);
+      arm(50, 28, 12, 1, 70.5 + dx, 66.9, COLORS.shirt);
+    },
+
+    munch(ph) {
+      kitchen();
+      const chew = Math.sin(ph * 6) * 0.8;
+      drawChild({ x: 44, y: 30, s: 12, outfit: 'day', eyes: 'happy', mouth: 'open', torso: 3, hands: [null, null] });
+      kitchen.counter();
+      ctx.fillStyle = shade(COLORS.crumb, -0.1);
+      for (const [x, y] of [[36, 72], [44, 76], [58, 70], [66, 78], [52, 80]]) { circle(x, y, 0.9); ctx.fill(); }
+      // Arms behind the sandwich, hands in front of it: it reads as held.
+      arm(44, 30, 12, -1, 57, 52 + chew, COLORS.shirt);
+      arm(44, 30, 12, 1, 71, 52 + chew, COLORS.shirt);
+      bread(64, 43 + chew, 22, { sandwich: true, bite: [55.5, 34 + chew, 5.5] });
+      hand(57, 52 + chew, 12);
+      hand(71, 52 + chew, 12);
+    },
+
+    // Snowman (4 steps) ------------------------------------------------
+    roll(ph) {
+      snowy(66);
+      ellipse(42, 69, 14, 1.8); ctx.fillStyle = 'rgba(185, 204, 221, 0.4)'; ctx.fill();
+      drawChild({ x: 26, y: 30, s: 11, body: 'full', outfit: 'day', eyes: 'open', mouth: 'grin', scarf: true,
+        hands: [[2.45, 2.0], [2.45, 2.5]] });
+      snowball(66, 56, 13);
+      ctx.save();
+      ctx.translate(66, 56);
+      ctx.rotate(ph * 2);
+      ctx.globalAlpha = 0.5;
+      for (let i = 0; i < 3; i++) {
+        ctx.beginPath(); ctx.arc(0, 0, 7 + i * 1.6, i * 2, i * 2 + 1.1);
+        ctx.strokeStyle = COLORS.snowLine; ctx.lineWidth = 1; ctx.stroke();
+      }
+      ctx.restore();
+      hand(53, 52, 11);
+      hand(53, 57.5, 11);
+    },
+
+    stack() {
+      snowy(66);
+      snowman({ head: true });
+      drawChild({ x: 26, y: 30, s: 11, body: 'full', outfit: 'day', eyes: 'happy', mouth: 'grin', scarf: true,
+        hands: [[-1.3, 0.1], [1.35, 0.1]] });
+    },
+
+    face() {
+      snowy(66);
+      snowman({ head: true, face: true });
+      drawChild({ x: 26, y: 30, s: 11, body: 'full', outfit: 'day', eyes: 'open', mouth: 'smile', scarf: true,
+        hands: [[-1.0, 2.0], [2.18, 0.73]] });
+      ctx.beginPath(); ctx.moveTo(50, 36.6); ctx.lineTo(57.5, 38); ctx.lineTo(50, 39.4); ctx.closePath();
+      paint('#F2A06A', 1);
+      hand(50, 38, 11);
+    },
+
+    hello(ph) {
+      snowy(66);
+      const wave = Math.sin(ph * 6) * 0.25;
+      ctx.save();
+      ctx.translate(74, 50); ctx.rotate(-0.7 + wave);
+      line(0, 0, 13, 0, '#8A6448', 1.6); line(9, 0, 12, -3, '#8A6448', 1.2);
+      ctx.restore();
+      line(54, 50, 45, 45, '#8A6448', 1.6); line(48, 46.5, 46, 42.5, '#8A6448', 1.2);
+      snowman({ head: true, face: true, nose: true });
+      drawChild({ x: 26, y: 30, s: 11, body: 'full', outfit: 'day', eyes: 'happy', mouth: 'grin', scarf: true,
+        hands: [[-1.25, -0.75 + wave * 0.6], [1.0, 2.0]] });
+    },
+  };
+
+  // The counter top is drawn in front of the child in every sandwich scene.
+  kitchen.counter = function () {
+    rrect(-4, 54, 108, 4, 2); paint('#C9955F');
+    ctx.fillStyle = '#E9CFA4';
+    ctx.fillRect(0, 57, 100, 43);
+    rrect(18, 62, 68, 24, 5); paint('#F0D3A2');
+    circle(80, 67, 1.6); ctx.fillStyle = '#E9CFA4'; ctx.fill();
+  };
+
+  // ---------------------------------------------------------------------
+  // Cards, slots and arrows
+  // ---------------------------------------------------------------------
+  // Still card pictures are rendered once per size into a small canvas: cheap redraws on slow tablets.
+  const sceneCache = new Map();
+  function sceneImage(scene, iw) {
+    const px = Math.max(8, Math.round(iw * DPR));
+    const key = scene + '|' + px;
+    let img = sceneCache.get(key);
+    if (img) return img;
+    if (sceneCache.size > 80) sceneCache.clear();
+    img = document.createElement('canvas');
+    img.width = img.height = px;
+    const c2 = img.getContext('2d');
+    c2.scale(px / 100, px / 100);
+    c2.lineJoin = 'round';
+    c2.lineCap = 'round';
+    ctx = c2;
+    try { SCENES[scene](0); } finally { ctx = mainCtx; }
+    sceneCache.set(key, img);
+    return img;
+  }
+
+  // opts: { k: scale, rot, lifted, glow, dim, ph }
+  function drawCard(cd, x, y, opts) {
+    const k = opts.k || 1;
+    const s = L.cs * k;
+    const tint = state.routine ? state.routine.tint : COLORS.star;
+    ctx.save();
+    ctx.translate(x, y);
+    if (opts.rot) ctx.rotate(opts.rot);
+
+    // Scaffolding hint / story highlight: a soft golden halo.
+    if (opts.glow > 0) {
+      const g = s * (0.05 + 0.07 * opts.glow);
+      ctx.globalAlpha = 0.3 + 0.45 * opts.glow;
+      ctx.fillStyle = COLORS.star;
+      ctx.beginPath();
+      roundRectPath(-s / 2 - g, -s / 2 - g, s + 2 * g, s + 2 * g, s * 0.12 + g);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    if (opts.lifted) {
+      ctx.shadowColor = 'rgba(60, 45, 30, 0.25)';
+      ctx.shadowBlur = s * 0.14;
+      ctx.shadowOffsetY = s * 0.07;
+    } else {
+      ctx.fillStyle = 'rgba(74, 64, 54, 0.12)';
+      ctx.beginPath();
+      roundRectPath(-s / 2, -s / 2 + s * 0.035, s, s, s * 0.12);
+      ctx.fill();
+    }
+    ctx.beginPath();
+    roundRectPath(-s / 2, -s / 2, s, s, s * 0.12);
+    ctx.fillStyle = COLORS.card;
+    ctx.fill();
+    ctx.shadowColor = 'transparent';
+    ctx.lineWidth = Math.max(2, s * 0.025);
+    ctx.strokeStyle = shade(tint, -0.12);
+    ctx.stroke();
+
+    // The picture, clipped to a rounded window inside the card.
+    const pad = s * 0.07, iw = s - 2 * pad;
+    ctx.save();
+    ctx.beginPath();
+    roundRectPath(-s / 2 + pad, -s / 2 + pad, iw, iw, s * 0.07);
+    ctx.clip();
+    if (opts.ph > 0) {
+      ctx.translate(-s / 2 + pad, -s / 2 + pad);
+      ctx.scale(iw / 100, iw / 100);
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
+      SCENES[cd.scene](opts.ph);
+    } else {
+      const baseIw = L.cs * 0.86;
+      ctx.drawImage(sceneImage(cd.scene, baseIw), -s / 2 + pad, -s / 2 + pad, iw, iw);
+    }
+    ctx.restore();
+
+    if (opts.dim > 0) {
+      ctx.globalAlpha = opts.dim;
+      ctx.fillStyle = COLORS.bg;
+      ctx.beginPath();
+      roundRectPath(-s / 2, -s / 2, s, s, s * 0.12);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+    ctx.restore();
+  }
+
+  function drawSlot(s, t, pulse, hovered, glow) {
+    const c = L.c;
+    const cx = s.x + c / 2, cy = s.y + c / 2;
+    let k = pulse;
+    const bp = (t - s.bounceT0) / CONFIG.BOUNCE_MS;
+    if (bp >= 0 && bp < 1) k *= 1 + 0.05 * Math.sin(Math.PI * bp);
+    if (hovered) k *= 1.04;
+
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.scale(k, k);
+    if (glow > 0) {
+      const g = c * (0.05 + 0.07 * glow);
+      ctx.globalAlpha = 0.25 + 0.4 * glow;
+      ctx.fillStyle = COLORS.star;
+      ctx.beginPath();
+      roundRectPath(-c / 2 - g, -c / 2 - g, c + 2 * g, c + 2 * g, c * 0.14 + g);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+    ctx.beginPath();
+    roundRectPath(-c / 2, -c / 2, c, c, c * 0.14);
+    ctx.fillStyle = hovered ? COLORS.slotHover : COLORS.slot;
+    ctx.fill();
+    if (!s.filled) {
+      ctx.setLineDash([c * 0.06, c * 0.05]);
+      ctx.lineWidth = Math.max(2, c * 0.022);
+      ctx.strokeStyle = pulse > 1 || hovered ? 'rgba(74, 64, 54, 0.5)' : 'rgba(74, 64, 54, 0.28)';
+      ctx.stroke();
+      ctx.setLineDash([]);
+      // The numeral is part of the learning content; the dots badge carries it too.
+      ctx.fillStyle = 'rgba(74, 64, 54, 0.16)';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.font = `800 ${Math.round(c * 0.46)}px ${FONT}`;
+      ctx.fillText(String(s.index + 1), 0, c * 0.03);
+    }
+    ctx.restore();
+  }
+
+  // A round badge on the slot's corner with dice dots: one, two, three, four.
+  function drawBadge(s, lit) {
+    const c = L.c;
+    const r = c * 0.15;
+    const x = s.x + c * 0.06, y = s.y + c * 0.06;
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, TAU);
+    ctx.fillStyle = lit ? COLORS.star : COLORS.card;
+    ctx.fill();
+    ctx.lineWidth = Math.max(1.5, r * 0.12);
+    ctx.strokeStyle = 'rgba(74, 64, 54, 0.3)';
+    ctx.stroke();
+    ctx.fillStyle = COLORS.ink;
+    for (const [px, py] of PIPS[s.index + 1]) {
+      ctx.beginPath();
+      ctx.arc(x + px * r * 0.42, y + py * r * 0.42, r * 0.17, 0, TAU);
+      ctx.fill();
+    }
+  }
+
+  // Soft arrows from each slot to the next; the one leading into the lit card glows during the story.
+  function drawArrows(playing) {
+    const c = L.c, gap = c * ARROW_GAP;
+    for (let i = 0; i < state.slots.length - 1; i++) {
+      const a = state.slots[i], b = state.slots[i + 1];
+      let x1, y1, x2, y2;
+      if (L.mode === 'rows') {
+        x1 = a.x + c + gap * 0.2; x2 = b.x - gap * 0.2; y1 = y2 = a.y + c / 2;
+      } else {
+        y1 = a.y + c + gap * 0.2; y2 = b.y - gap * 0.2; x1 = x2 = a.x + c / 2;
+      }
+      const lit = playing === i + 1;
+      const color = lit ? COLORS.star : 'rgba(74, 64, 54, 0.25)';
+      const lw = Math.max(3, c * 0.045);
+      const hs = Math.max(5, c * 0.075);
+      const ang = Math.atan2(y2 - y1, x2 - x1);
+      line(x1, y1, x2, y2, color, lw);
+      ctx.beginPath();
+      ctx.moveTo(x2 - hs * Math.cos(ang - 0.6), y2 - hs * Math.sin(ang - 0.6));
+      ctx.lineTo(x2, y2);
+      ctx.lineTo(x2 - hs * Math.cos(ang + 0.6), y2 - hs * Math.sin(ang + 0.6));
+      ctx.strokeStyle = color;
+      ctx.lineWidth = lw;
+      ctx.lineJoin = 'round';
+      ctx.stroke();
+    }
+  }
+
+  function drawStar(cx, cy, R, fill, face) {
+    ctx.save();
+    ctx.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const rad = i % 2 === 0 ? R : R * 0.5;
+      const a = -Math.PI / 2 + i * Math.PI / 5;
+      const x = cx + rad * Math.cos(a), y = cy + rad * Math.sin(a);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    ctx.lineJoin = 'round';
+    if (fill) {
+      ctx.fillStyle = fill;
+      ctx.fill();
+      ctx.strokeStyle = fill;            // same-colour stroke rounds the tips
+      ctx.lineWidth = Math.max(2, R * 0.16);
+      ctx.stroke();
+    } else {
+      ctx.strokeStyle = 'rgba(74, 64, 54, 0.25)';
+      ctx.lineWidth = Math.max(2, R * 0.14);
+      ctx.stroke();
+    }
+
+    if (face) {
+      ctx.fillStyle = COLORS.ink;
+      ctx.beginPath(); ctx.arc(cx - R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.arc(cx + R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.strokeStyle = COLORS.ink;
+      ctx.lineWidth = Math.max(2, R * 0.05);
+      ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.arc(cx, cy + R * 0.06, R * 0.17, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+      ctx.globalAlpha = 0.35;
+      ctx.fillStyle = COLORS.cheek;
+      ctx.beginPath(); ctx.ellipse(cx - R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(cx + R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // Same ring of sparkles from every slot, every time (no random rewards).
+  function spawnParticles(s, t) {
+    const cx = s.x + L.c / 2, cy = s.y + L.c / 2;
+    for (let i = 0; i < 10; i++) {
+      const a = i * TAU / 10;
+      state.particles.push({ x0: cx, y0: cy, dx: Math.cos(a), dy: Math.sin(a), dist: L.c * 0.75, t0: t, life: 900, color: i % 2 ? COLORS.star : shade(state.routine.tint, 0.1) });
+    }
+  }
+
+  function drawParticles(t) {
+    state.particles = state.particles.filter(p => t - p.t0 < p.life);
+    for (const p of state.particles) {
+      const k = (t - p.t0) / p.life;
+      const e = easeOutCubic(k);
+      ctx.globalAlpha = 1 - k;
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x0 + p.dx * p.dist * e, p.y0 + p.dy * p.dist * e, L.c * 0.045 * (1 - k * 0.5), 0, TAU);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------------------------------------------------------------------
+  // Screens
+  // ---------------------------------------------------------------------
+  function starGeom() {
+    return { cx: W / 2, cy: H * 0.42, R: Math.min(W, H) * 0.2 };
+  }
+
+  // Start and between-round screen: one big pulsing star to tap, plus 5 slots
+  // that fill up so the child can see the end coming.
+  function drawStarScreen(t) {
+    const { cx, cy, R } = starGeom();
+    const amp = reduceMotion ? 0.03 : 0.07;
+    const k = 1 + amp * (0.5 - 0.5 * Math.cos(TAU * t / 1400));
+    drawStar(cx, cy, R * k, COLORS.star, true);
+
+    const sr = R * 0.16, gap = sr * 2.8, y = cy + R * 1.35;
+    for (let i = 0; i < CONFIG.ROUNDS; i++) {
+      drawStar(cx + (i - (CONFIG.ROUNDS - 1) / 2) * gap, y, sr, i < state.round ? COLORS.star : null, false);
+    }
+  }
+
+  function fitFont(text, weight, size, maxW) {
+    ctx.font = `${weight} ${size}px ${FONT}`;
+    while (size > 12 && ctx.measureText(text).width > maxW) {
+      size -= 1;
+      ctx.font = `${weight} ${size}px ${FONT}`;
+    }
+    return size;
+  }
+
+  // Static end screen. No buttons: the session is over.
+  function drawEnd() {
+    const gh = H * 0.14;
+    ctx.fillStyle = COLORS.grass;
+    ctx.beginPath();
+    ctx.moveTo(0, H - gh);
+    ctx.quadraticCurveTo(W / 2, H - gh * 1.5, W, H - gh);
+    ctx.lineTo(W, H);
+    ctx.lineTo(0, H);
+    ctx.closePath();
+    ctx.fill();
+
+    const R = Math.min(W, H) * 0.2;
+    const cy = H * 0.36;
+    drawStar(W / 2, cy, R, COLORS.star, true);
+
+    const big = clamp(Math.min(W, H) * 0.1, 26, 68);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = COLORS.ink;
+    const top = cy + R * 1.25;
+    fitFont('Great Job!', 800, big, W * 0.9);
+    ctx.fillText('Great Job!', W / 2, top + big * 0.5);
+    fitFont('Time to play outside!', 700, Math.round(big * 0.62), W * 0.9);
+    ctx.fillText('Time to play outside!', W / 2, top + big * 1.55);
+  }
+
+  // Which slot to pulse and what (if anything) to glow right now.
+  // The idle pulse only says "this space is next"; it never names the answer.
+  // The answer (the right card) glows only after 2 slips, or as the first-round tutorial.
+  function guidance(t) {
+    const out = { slot: null, pulse: 1, hintCard: null, hintSlot: null, glow: 0, nudge: 0 };
+    if (state.phase !== 'play' || state.nextSlot >= state.slots.length) return out;
+    const amp = reduceMotion ? 0.03 : 0.06;
+    const next = state.slots[state.nextSlot];
+    const right = correctCard();
+
+    if (state.drag) {
+      const o = state.drag.obj;
+      if (next.errors >= 2 || o.errors >= 2) {
+        out.glow = 0.5 + 0.5 * Math.sin(TAU * t / 1300);
+        if (o === right) out.hintSlot = next;
+        else if (right && (right.state === 'idle' || right.state === 'return')) out.hintCard = right;
+      }
+      return out;
+    }
+
+    const idle = t - state.lastInteraction;
+    if (idle <= CONFIG.IDLE_PULSE_MS) return out;
+    const wave = 0.5 - 0.5 * Math.cos(TAU * (idle - CONFIG.IDLE_PULSE_MS) / 1300);
+    out.slot = next;
+    out.pulse = 1 + amp * wave;
+
+    const tutorial = state.round === 0 && state.placedThisRound === 0 && idle > CONFIG.TUTORIAL_HINT_MS;
+    if ((next.errors >= 2 || tutorial) && right && right.state === 'idle') {
+      out.hintCard = right;
+      out.hintSlot = next;
+      out.glow = wave;
+      // In the tutorial the card also leans toward its slot to show the drag.
+      if (tutorial && !reduceMotion) out.nudge = wave;
+    }
+    return out;
+  }
+
+  function drawPlay(t) {
+    const g = guidance(t);
+    const celebrating = state.phase === 'celebrate';
+    const playing = celebrating && !state.finaleDone ? state.playIndex : -1;
+    const hover = state.drag ? findDropSlot(state.drag.obj) : null;
+
+    drawArrows(playing);
+    for (const s of state.slots) {
+      drawSlot(s, t, s === g.slot ? g.pulse : 1, s === hover && !s.filled, s === g.hintSlot ? g.glow : 0);
+    }
+
+    // Cards in their slots. During the story the lit card lifts; cards still to come wait dimmed.
+    for (const cd of state.cards) {
+      if (cd.state !== 'placed') continue;
+      const s = state.slots[cd.step];
+      const bp = (t - s.bounceT0) / CONFIG.BOUNCE_MS;
+      let k = bp >= 0 && bp < 1 ? 1 + 0.05 * Math.sin(Math.PI * bp) : 1;
+      let glow = 0, dim = 0, ph = 0;
+      if (playing >= 0) {
+        if (cd.step === playing) {
+          const e = easeOutCubic(clamp((t - cd.playT0) / 300, 0, 1));
+          k *= 1 + 0.07 * e;
+          glow = e;
+          ph = reduceMotion ? 0 : Math.max(0.001, (t - cd.playT0) / 1000);
+        } else if (cd.step > playing) {
+          dim = 0.45;
+        }
+      } else if (celebrating && state.playIndex < 0) {
+        dim = 0.45;   // brief breath before the first card lights up
+      }
+      drawCard(cd, cd.x, cd.y, { k, glow, dim, ph });
+    }
+
+    // Tray cards, then any card gliding into a slot.
+    for (const cd of state.cards) {
+      if (cd.state !== 'idle' && cd.state !== 'return') continue;
+      let x = cd.x, y = cd.y;
+      if (cd === g.hintCard && g.nudge > 0 && g.hintSlot) {
+        const p = slotCenter(g.hintSlot);
+        const d = Math.hypot(p.x - x, p.y - y) || 1;
+        x += (p.x - x) / d * L.c * 0.12 * g.nudge;
+        y += (p.y - y) / d * L.c * 0.12 * g.nudge;
+      }
+      drawCard(cd, x, y, { k: 1, rot: cd.rot, glow: cd === g.hintCard ? g.glow : 0 });
+    }
+    for (const cd of state.cards) {
+      if (cd.state === 'toSlot') drawCard(cd, cd.x, cd.y, { k: 1, rot: cd.rot });
+    }
+
+    for (const s of state.slots) drawBadge(s, playing === s.index);
+    if (state.drag) drawCard(state.drag.obj, state.drag.obj.x, state.drag.obj.y, { k: 1.06, lifted: true });
+    drawParticles(t);
+  }
+
+  // ---------------------------------------------------------------------
+  // Main loop
+  // ---------------------------------------------------------------------
+  function update(t) {
+    for (const cd of state.cards) {
+      const a = cd.anim;
+      if (!a) continue;
+      const p = clamp((t - a.t0) / a.dur, 0, 1);
+      const e = a.ease(p);
+      cd.x = lerp(a.fx, a.tx, e);
+      cd.y = lerp(a.fy, a.ty, e);
+      cd.rot = lerp(a.fr, a.tr, e);
+      cd.animP = p;
+      if (p >= 1) {
+        cd.anim = null;
+        if (cd.state === 'return') cd.state = 'idle';
+        else if (cd.state === 'toSlot') landInSlot(cd, t);
+      }
+    }
+
+    if (state.phase === 'play' && state.completeAt && t >= state.completeAt) {
+      state.completeAt = 0;
+      completeRound();
+    }
+
+    if (state.phase === 'celebrate') {
+      const n = state.slots.length;
+      const due = Math.min(n - 1, Math.floor((t - state.playStart) / CONFIG.STEP_PLAY_MS));
+      while (state.playIndex < due) {
+        state.playIndex++;
+        playStep(state.playIndex, t);
+      }
+      const finaleAt = state.playStart + n * CONFIG.STEP_PLAY_MS;
+      if (!state.finaleDone && t >= finaleAt) {
+        state.finaleDone = true;
+        finale(t);
+      }
+      if (t >= finaleAt + CONFIG.FINALE_MS) {
+        if (state.round >= CONFIG.ROUNDS) enterEnd();
+        else state.phase = 'between';
+      }
+    }
+  }
+
+  function render(t) {
+    ctx.fillStyle = COLORS.bg;
+    ctx.fillRect(0, 0, W, H);
+    if (state.phase === 'start' || state.phase === 'between') drawStarScreen(t);
+    else if (state.phase === 'play' || state.phase === 'celebrate') drawPlay(t);
+    else if (state.phase === 'end') drawEnd();
+  }
+
+  let rafId = 0;
+  function frame(t) {
+    update(t);
+    render(t);
+    // The end screen is static: stop the loop entirely.
+    if (state.phase !== 'end') rafId = requestAnimationFrame(frame);
+  }
+
+  function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+    if (dpr !== DPR) sceneCache.clear();
+    DPR = dpr;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    computeLayout();
+    if (state.phase === 'end') render(now());
+  }
+
+  window.addEventListener('resize', resize);
+  window.addEventListener('orientationchange', resize);
+
+  resize();
+  log('Game loaded', { roundsPerSession: CONFIG.ROUNDS, gamesCompletedBefore: progress.gamesCompleted });
+  rafId = requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

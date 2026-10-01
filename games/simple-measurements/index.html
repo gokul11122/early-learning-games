@@ -1,0 +1,1824 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Simple Measurements</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
+  body {
+    background: #F6F1E7;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  canvas { display: block; width: 100%; height: 100%; }
+
+  #home {
+    position: fixed; top: max(10px, env(safe-area-inset-top)); right: max(10px, env(safe-area-inset-right));
+    width: 52px; height: 52px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+    background: rgba(255, 253, 248, 0.85); box-shadow: 0 2px 8px rgba(74, 64, 54, 0.15);
+    -webkit-tap-highlight-color: transparent; z-index: 5;
+  }
+  #home:active { transform: scale(0.94); }
+
+  /* Hidden parent view: press and hold the top-left corner for 3 seconds. */
+  #parent {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: rgba(74, 64, 54, 0.55); padding: 16px; box-sizing: border-box; z-index: 10;
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #4A4036;
+  }
+  #parent[hidden] { display: none; }
+  #parent .card { background: #FFFDF8; border-radius: 16px; padding: 20px 22px; max-width: 380px; width: 100%; box-shadow: 0 10px 30px rgba(0,0,0,0.18); }
+  #parent h2 { margin: 0 0 10px; font-size: 18px; }
+  #parent table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+  #parent th, #parent td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #EDE5D6; }
+  #parent .hint { margin: 12px 0 0; font-size: 12px; opacity: 0.7; }
+</style>
+</head>
+<body>
+<canvas id="game" aria-label="Simple measurements game"></canvas>
+<a id="home" href="../../index.html" aria-label="Home">
+  <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><path d="M4 11.5 12 5l8 6.5V19a1 1 0 0 1-1 1h-4.5v-5h-5v5H5a1 1 0 0 1-1-1z" fill="none" stroke="#4A4036" stroke-width="2" stroke-linejoin="round"/></svg>
+</a>
+
+<div id="parent" hidden>
+  <div class="card">
+    <h2>Progress on this device</h2>
+    <div id="parentBody"></div>
+    <p class="hint">Stored only on this device. Tap anywhere to close.</p>
+  </div>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  /* =====================================================================
+   * SIMPLE MEASUREMENTS
+   * ELOF domain: Cognition (emergent mathematical thinking: measurement,
+   *              comparing length, height and weight).
+   *
+   * Two (later three) objects; the child taps the longer, taller or heavier
+   * one. Only "longer / taller / heavier" is ever asked, so the cue is never
+   * ambiguous. The question type is visible without speech:
+   *  - length: objects lie in lanes from a shared start line, ruler badge;
+   *  - height: objects stand on a shared ground line, up-arrow badge;
+   *  - weight: a balance scale visibly tips toward the heavier item.
+   *
+   * Design rules this file follows (from the brief):
+   *  - Coherence: only the badge and the objects. No score, no menus, no text.
+   *  - Control of error: a wrong tap gives that object a soft wobble, nothing else.
+   *  - Forgiving hitboxes: each object's whole lane / column / pan is tappable.
+   *  - Visual prompts: when idle, the badge breathes and the objects sway in turn.
+   *  - Self-paced: no timers anywhere the child can see or feel.
+   *  - Natural stopping point: 5 rounds of 3 questions, then a static
+   *    "play outside" screen with no "play again" button.
+   * ===================================================================== */
+
+  // ---------------------------------------------------------------------
+  // Configuration
+  // ---------------------------------------------------------------------
+  const CONFIG = {
+    ROUNDS: 5,                     // hard session limit (natural stopping point)
+    QUESTIONS_PER_ROUND: 3,
+    STORAGE_KEY: 'simple-measurements.v1',
+    IDLE_PULSE_MS: 1500,           // idle time before the badge pulses
+    TUTORIAL_HINT_MS: 5000,        // first round: idle time before the right object glows
+    HINT_AFTER_SLIPS: 2,           // wrong taps on one question before the right object glows
+    INTRO_MS: 380,                 // objects fade in
+    TILT_MS: 1100,                 // the balance scale tips over before taps count
+    WOBBLE_MS: 480,                // wrong-tap wobble
+    MEASURE_MS: 1000,              // ruler sweep / scale settle after a right tap
+    HOLD_MS: 800,                  // look at the result before the next question
+    OUTRO_MS: 260,                 // objects fade out
+    CELEBRATE_MS: 1600,            // round-complete celebration length
+    FAST_MS_PER_QUESTION: 7000,    // "quick" threshold for difficulty step-up (includes animations)
+    PARENT_HOLD_MS: 3000,          // hold time for the hidden parent view
+    PARENT_CORNER_PX: 80,
+    MAX_TILT: 0.2,                 // balance beam angle in radians
+  };
+
+  const COLORS = {
+    bg: '#F6F1E7',
+    ink: '#4A4036',
+    star: '#F6C85F',
+    grass: '#B9D7A8',
+    cheek: '#F2A88A',
+    lane: '#EFE7D9',
+    ruler: '#F4D35E',
+    wood: '#D9B98F',
+    pan: '#EADFCB',
+    // Each object in a question gets its own colour so they are easy to tell apart.
+    items: ['#F2A88A', '#8FB8DE', '#9CCB9A', '#B8A9D9', '#E8B4C8', '#F4D35E'],
+    trees: ['#8DC48A', '#A6CF8E', '#7DB89A'],
+    flowers: ['#F4C95D', '#F2A88A', '#E8A6C4'],
+    giraffe: '#F2C66D', giraffeSpot: '#C98B4F',
+    cat: '#F2B27A',
+    elephant: '#B9B6CC',
+    mouse: '#CFC5BC',
+    trunk: '#B08A68',
+  };
+
+  const FONT = 'ui-rounded, "Arial Rounded MT Bold", "Nunito", system-ui, -apple-system, sans-serif';
+
+  // Difficulty ladder for dynamic difficulty adjustment (scaffolding).
+  // `plan` is the mix of question types in one round (shuffled).
+  const TIERS = [
+    { plan: ['length', 'height', 'lengthOrHeight'], n: 2, ratio: [0.42, 0.52], aligned: true },  // big difference
+    { plan: ['length', 'height', 'lengthOrHeight'], n: 2, ratio: [0.7, 0.8], aligned: true },    // smaller difference
+    { plan: ['weight', 'weight', 'lengthOrHeight'], n: 2, ratio: [0.7, 0.8], aligned: true },    // weight on a balance scale
+    { plan: ['length', 'height', 'weight'], n: 3, ratio: [0.7, 0.8], aligned: false },           // three objects, lengths not lined up
+  ];
+
+  const LENGTH_KINDS = ['pencil', 'snake', 'train', 'scarf'];
+  const HEIGHT_KINDS = ['tree', 'flower', 'giraffe'];
+  // Weight pairs: [heavy, light]. In the tricky pair the heavy thing is the small
+  // one, so the child has to read the scale rather than the size.
+  const WEIGHT_PAIRS = [['elephant', 'mouse'], ['watermelon', 'grapes']];
+  const WEIGHT_TRICKY = ['rock', 'feather'];
+  const WEIGHT_SIZE = { elephant: 1.0, mouse: 0.44, watermelon: 0.86, grapes: 0.42, rock: 0.46, feather: 0.92 };
+
+  const TAU = Math.PI * 2;
+  const reduceMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+
+  // ---------------------------------------------------------------------
+  // Small helpers
+  // ---------------------------------------------------------------------
+  const now = () => performance.now();
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const rand = (a, b) => a + Math.random() * (b - a);
+  const pick = arr => arr[Math.floor(Math.random() * arr.length)];
+  const easeOutCubic = t => 1 - Math.pow(1 - t, 3);
+  const easeInOutQuad = t => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
+  const log = (...args) => console.log('[Measure]', ...args);
+
+  function shuffle(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }
+
+  // Mix a hex colour toward black (amt < 0) or white (amt > 0).
+  const shadeCache = new Map();
+  function shade(hex, amt) {
+    const key = hex + amt;
+    if (shadeCache.has(key)) return shadeCache.get(key);
+    const n = parseInt(hex.slice(1), 16);
+    const target = amt < 0 ? 0 : 255;
+    const p = Math.abs(amt);
+    const c = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map(v => Math.round(lerp(v, target, p)));
+    const out = `rgb(${c[0]},${c[1]},${c[2]})`;
+    shadeCache.set(key, out);
+    return out;
+  }
+
+  // ---------------------------------------------------------------------
+  // Canvas setup
+  // ---------------------------------------------------------------------
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  let W = 0, H = 0, DPR = 1;
+
+  // Layout values recomputed on every resize.
+  const L = {
+    m: 16, badge: { x: 0, y: 0, r: 30 },
+    stage: { x: 0, y: 0, w: 0, h: 0 },
+    // length
+    startX: 0, lmax: 0, th: 30, laneGap: 90,
+    // height
+    ground: 0, colW: 0, hmax: 0,
+    // weight
+    sc: { cx: 0, py: 0, bl: 100, sl: 50, pw: 80, foot: 0 },
+  };
+
+  // ---------------------------------------------------------------------
+  // Game state
+  // ---------------------------------------------------------------------
+  const state = {
+    phase: 'start',          // 'start' | 'play' | 'celebrate' | 'between' | 'end'
+    round: 0,                // rounds completed this session
+    tier: 0,                 // index into TIERS
+    questions: [],
+    qIdx: 0,
+    step: 'intro',           // 'intro' | 'ask' | 'measure' | 'outro'
+    stepAt: 0,               // when the current step ends
+    lastInteraction: 0,
+    roundStart: 0,
+    roundSlips: 0,
+    celebrateStart: 0,
+    badgeTapT0: -1e9,
+    particles: [],
+  };
+
+  const currentQ = () => state.questions[state.qIdx] || null;
+
+  // ---------------------------------------------------------------------
+  // Local progress tracking (localStorage, never leaves the device)
+  // ---------------------------------------------------------------------
+  function freshProgress() {
+    return { version: 1, gamesCompleted: 0, roundsCompleted: 0, questions: 0, slips: 0, byType: { length: 0, height: 0, weight: 0 }, lastPlayed: null, sessions: [] };
+  }
+
+  function loadProgress() {
+    try {
+      const raw = window.localStorage.getItem(CONFIG.STORAGE_KEY);
+      if (raw) {
+        const data = JSON.parse(raw);
+        if (data && data.version === 1 && Array.isArray(data.sessions)) return data;
+      }
+    } catch (e) {
+      console.warn('[Measure] Progress could not be loaded (storage unavailable):', e && e.message);
+    }
+    return freshProgress();
+  }
+
+  function saveProgress() {
+    try {
+      window.localStorage.setItem(CONFIG.STORAGE_KEY, JSON.stringify(progress));
+      log('Progress saved', { gamesCompleted: progress.gamesCompleted, roundsCompleted: progress.roundsCompleted });
+    } catch (e) {
+      console.warn('[Measure] Progress could not be saved (storage unavailable):', e && e.message);
+    }
+  }
+
+  const progress = loadProgress();
+  if (!progress.byType) progress.byType = { length: 0, height: 0, weight: 0 };
+  let session = null; // created on the first round of this app launch
+
+  function ensureSession() {
+    if (session) return;
+    session = { startedAt: new Date().toISOString(), finished: false, rounds: [] };
+    progress.sessions.push(session);
+    if (progress.sessions.length > 30) progress.sessions.splice(0, progress.sessions.length - 30);
+  }
+
+  // ---------------------------------------------------------------------
+  // Audio: Web Audio tones + optional spoken words
+  // ---------------------------------------------------------------------
+  let actx = null;
+
+  // Browsers only allow audio after a user gesture, so this runs on every pointer down.
+  function unlockAudio() {
+    if (!actx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) { try { actx = new AC(); } catch (e) { actx = null; } }
+    }
+    if (actx && actx.state === 'suspended') actx.resume();
+  }
+
+  function tone(freq, delay, dur, vol = 0.16, type = 'sine') {
+    if (!actx) return;
+    const t = actx.currentTime + delay;
+    const osc = actx.createOscillator();
+    const gain = actx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(vol, t + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    osc.connect(gain).connect(actx.destination);
+    osc.start(t);
+    osc.stop(t + dur + 0.05);
+  }
+
+  // Every question type always gets the same success jingle (predictable feedback).
+  // Length and height: rising "measuring" ticks that follow the ruler.
+  const MEASURE_NOTES = [523.25, 587.33, 659.25, 783.99, 1046.5];
+  const playMeasure = () => MEASURE_NOTES.forEach((f, i) => tone(f, i * 0.16, 0.28, i === 4 ? 0.14 : 0.09));
+  // Weight: a soft wooden "clunk" as the pan settles, then a two-note chime.
+  const playWeigh = () => { tone(196, 0, 0.3, 0.12, 'triangle'); tone(659.25, 0.18, 0.35); tone(987.77, 0.26, 0.4, 0.1); };
+  const playSoft = () => tone(220, 0, 0.18, 0.05, 'sine');          // wrong tap: quiet, never a buzzer
+  const playTilt = () => tone(330, 0, 0.5, 0.04, 'triangle');
+  const playPop = () => tone(698.46, 0, 0.08, 0.04, 'triangle');
+  const playRoundDone = () => [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => tone(f, i * 0.12, 0.5, 0.12));
+
+  // Spoken words via the Web Speech API. Android WebView usually lacks it,
+  // so this quietly does nothing there and the badges + tones carry the task.
+  function say(text) {
+    try {
+      if (!('speechSynthesis' in window)) return;
+      window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'en-US';
+      u.rate = 0.85;
+      u.pitch = 1.15;
+      window.speechSynthesis.speak(u);
+    } catch (e) { /* speech is optional */ }
+  }
+
+  const WORD = { length: 'longer', height: 'taller', weight: 'heavier' };
+  const askText = q => `Which one is ${WORD[q.type]}?`;
+
+  // ---------------------------------------------------------------------
+  // Rounds and difficulty
+  // ---------------------------------------------------------------------
+  function makeQuestion(type, tier) {
+    const n = type === 'weight' ? 2 : tier.n;
+    const colors = shuffle(COLORS.items.slice());
+    // Relative sizes, the first is always the right answer (the biggest).
+    const sizes = n === 3 ? [1, rand(0.78, 0.86), rand(0.58, 0.66)] : [1, rand(tier.ratio[0], tier.ratio[1])];
+    const q = { type, kind: '', aligned: tier.aligned, items: [], slips: 0, solvedT0: 0, introT0: 0, tilt: 0 };
+
+    if (type === 'length') {
+      q.kind = pick(LENGTH_KINDS);
+      q.items = sizes.map((s, i) => ({ kind: q.kind, size: s * (q.aligned ? 0.94 : 0.74), color: colors[i], correct: i === 0 }));
+    } else if (type === 'height') {
+      // The easiest step sometimes compares a giraffe with a cat: very different, very clear.
+      if (tier.ratio[1] < 0.6 && Math.random() < 0.35) {
+        q.kind = 'giraffe+cat';
+        q.items = [
+          { kind: 'giraffe', size: 1, color: COLORS.giraffe, correct: true },
+          { kind: 'cat', size: rand(0.36, 0.44), color: COLORS.cat, correct: false },
+        ];
+      } else {
+        q.kind = pick(HEIGHT_KINDS);
+        const pal = q.kind === 'tree' ? COLORS.trees : q.kind === 'flower' ? COLORS.flowers : null;
+        q.items = sizes.map((s, i) => ({ kind: q.kind, size: s, color: pal ? pal[i % pal.length] : COLORS.giraffe, correct: i === 0 }));
+      }
+    } else {
+      const pair = (!tier.aligned && Math.random() < 0.6) ? WEIGHT_TRICKY : pick(WEIGHT_PAIRS);
+      q.kind = pair.join('/');
+      q.items = [
+        { kind: pair[0], size: WEIGHT_SIZE[pair[0]], color: '', correct: true },
+        { kind: pair[1], size: WEIGHT_SIZE[pair[1]], color: '', correct: false },
+      ];
+    }
+
+    shuffle(q.items).forEach((it, i) => {
+      it.slot = i;
+      it.wobbleT0 = -1e9;
+      it.box = { x: 0, y: 0, w: 0, h: 0 };   // drawn bounds (for the glow)
+      it.hit = { x: 0, y: 0, w: 0, h: 0 };   // forgiving tap area
+    });
+
+    // Unaligned lengths: the longest starts near the left, the shorter ones are
+    // pushed right so their ends stick out past it (the end is not the answer).
+    if (type === 'length' && !q.aligned) {
+      for (const it of q.items) it.offset = it.correct ? rand(0, 0.25) : rand(0.65, 1);
+    } else {
+      for (const it of q.items) it.offset = 0;
+    }
+
+    // Heavy side goes down: positive angle tips the right end down.
+    if (type === 'weight') {
+      const heavy = q.items.find(it => it.correct);
+      q.tilt = (heavy.slot === 1 ? 1 : -1) * CONFIG.MAX_TILT;
+    }
+    return q;
+  }
+
+  function makePlan(tier) {
+    return shuffle(tier.plan.map(p => p === 'lengthOrHeight' ? pick(['length', 'height']) : p));
+  }
+
+  function startRound() {
+    ensureSession();
+    const tier = TIERS[state.tier];
+    state.questions = makePlan(tier).map(type => makeQuestion(type, tier));
+    state.qIdx = 0;
+    state.roundSlips = 0;
+    state.particles = [];
+    state.phase = 'play';
+    state.roundStart = now();
+    log(`Round ${state.round + 1}/${CONFIG.ROUNDS} started at level ${state.tier + 1}:`, state.questions.map(q => `${q.type}(${q.kind})`).join(', '));
+    beginQuestion(now(), state.round === 0);
+  }
+
+  function beginQuestion(t, first) {
+    const q = currentQ();
+    q.introT0 = t;
+    state.step = 'intro';
+    state.stepAt = t + (q.type === 'weight' ? CONFIG.TILT_MS : CONFIG.INTRO_MS);
+    state.lastInteraction = t;
+    computeLayout();
+    if (q.type === 'weight') playTilt(); else playPop();
+    say(first ? `Let's measure! ${askText(q)}` : askText(q));
+    log(`Question ${state.qIdx + 1}/${CONFIG.QUESTIONS_PER_ROUND}: ${q.type}, ${q.kind}, ${q.items.length} objects, ${q.aligned ? 'aligned' : 'not aligned'}`);
+  }
+
+  function completeRound() {
+    const t = now();
+    const n = state.questions.length;
+    const firstTry = state.questions.filter(q => q.slips === 0).length;
+    const ms = t - state.roundStart;
+    const record = {
+      level: state.tier + 1,
+      questions: n,
+      types: state.questions.map(q => q.type[0]).join(''),   // e.g. "lhw"
+      firstTry,
+      slips: state.roundSlips,
+      seconds: Math.round(ms / 100) / 10,
+    };
+
+    session.rounds.push(record);
+    progress.roundsCompleted++;
+    progress.questions += n;
+    progress.slips += state.roundSlips;
+    state.questions.forEach(q => { progress.byType[q.type] = (progress.byType[q.type] || 0) + 1; });
+    progress.lastPlayed = new Date().toISOString();
+    state.round++;
+    log('Level completed', record);
+
+    const finalRound = state.round >= CONFIG.ROUNDS;
+    if (finalRound) {
+      session.finished = true;
+      progress.gamesCompleted++;
+    } else {
+      // Praise the effort, not the child's "smartness" (growth mindset).
+      say(state.roundSlips > 0 ? 'You kept trying, and you did it!' : 'You looked so carefully!');
+    }
+    saveProgress();
+    adjustDifficulty(record, ms);
+
+    playRoundDone();
+    const q = currentQ();
+    const win = q && q.items.find(it => it.correct);
+    if (win) spawnParticles(win.box.x + win.box.w / 2, win.box.y + win.box.h / 2, Math.max(win.box.w, win.box.h) * 0.6 + L.m * 2, t);
+    spawnParticles(L.badge.x, L.badge.y, L.badge.r * 2.2, t);
+    state.phase = 'celebrate';
+    state.celebrateStart = t;
+  }
+
+  // Simple DDA: quick and clean -> one step harder; a real struggle -> one step easier.
+  function adjustDifficulty(record, ms) {
+    const fast = ms / record.questions <= CONFIG.FAST_MS_PER_QUESTION;
+    const before = state.tier;
+    if (record.firstTry === record.questions && fast) {
+      state.tier = Math.min(TIERS.length - 1, state.tier + 1);
+    } else if (record.slips >= 3) {
+      state.tier = Math.max(0, state.tier - 1);
+    }
+    if (state.tier !== before) log(`Difficulty ${state.tier > before ? 'up' : 'down'}: level ${before + 1} -> ${state.tier + 1}`);
+  }
+
+  function enterEnd() {
+    state.phase = 'end';
+    say('Great job! Time to play outside!');
+    log('Session finished: end screen shown, no replay offered');
+  }
+
+  // ---------------------------------------------------------------------
+  // Tapping objects
+  // ---------------------------------------------------------------------
+  function tapItem(it, t) {
+    const q = currentQ();
+    if (it.correct) {
+      q.solvedT0 = t;
+      state.step = 'measure';
+      state.stepAt = t + CONFIG.MEASURE_MS + CONFIG.HOLD_MS;
+      // The glow, the measuring animation and its sound all start on this frame.
+      if (q.type === 'weight') playWeigh(); else playMeasure();
+      say(`This one is ${WORD[q.type]}!`);
+      log(`Answer accepted: ${it.kind} is ${WORD[q.type]}${q.slips ? ` (after ${q.slips} slips)` : ''}`);
+    } else {
+      // Control of error: that object wobbles softly, nothing else changes.
+      it.wobbleT0 = t;
+      q.slips++;
+      state.roundSlips++;
+      playSoft();
+      log(`Item rejected: ${it.kind} is not the ${WORD[q.type]} one (slip ${q.slips})`);
+      if (q.slips === CONFIG.HINT_AFTER_SLIPS) log('Hint shown: the right object glows');
+    }
+  }
+
+  function advance(t) {
+    if (state.step === 'intro') {
+      state.step = 'ask';
+      state.lastInteraction = t;
+    } else if (state.step === 'measure') {
+      if (state.qIdx >= state.questions.length - 1) { completeRound(); return; }
+      state.step = 'outro';
+      state.stepAt = t + CONFIG.OUTRO_MS;
+    } else if (state.step === 'outro') {
+      state.qIdx++;
+      beginQuestion(t, false);
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Layout
+  // ---------------------------------------------------------------------
+  function computeLayout() {
+    const minDim = Math.min(W, H);
+    const m = clamp(minDim * 0.04, 12, 32);
+    L.m = m;
+
+    // The badge that says what kind of question this is: top centre.
+    const br = clamp(minDim * 0.065, 26, 44);
+    L.badge = { x: W / 2, y: m + br, r: br };
+
+    const sx = m, sy = m + br * 2 + m * 0.8;
+    L.stage = { x: sx, y: sy, w: W - 2 * m, h: H - m - sy };
+    const S = L.stage;
+
+    const q = currentQ();
+    if (!q) return;
+    if (q.type === 'length') layoutLength(q, S);
+    else if (q.type === 'height') layoutHeight(q, S);
+    else layoutWeight(S);
+  }
+
+  // Lanes stacked top to bottom; every object starts at the same line on the left.
+  function layoutLength(q, S) {
+    const n = q.items.length;
+    const lane = S.h / n;
+    const pad = L.m;
+    let th = Math.min(lane / 3.1, 58);
+    let lmax = S.w - pad * 2;
+    th = Math.min(th, lmax * 0.11);
+    lmax = Math.min(lmax, th * 17);
+    L.th = th;
+    L.lmax = lmax;
+    L.laneGap = Math.min(lane, th * 3.8);
+    L.startX = W / 2 - lmax / 2;
+    const top = S.y + S.h / 2 - L.laneGap * n / 2;
+
+    for (const it of q.items) {
+      const len = lmax * it.size;
+      it.len = len;
+      it.lx = L.startX + it.offset * (lmax - len);
+      it.ly = top + L.laneGap * (it.slot + 0.42);
+      it.box = { x: it.lx, y: it.ly - th * 1.0, w: len, h: th * 1.75 };
+      // The whole lane is tappable (lanes never overlap).
+      const hx = Math.max(24, th);
+      it.hit = { x: it.lx - hx, y: top + L.laneGap * it.slot, w: len + hx * 2, h: L.laneGap };
+    }
+  }
+
+  // Columns side by side; everything stands on one ground line.
+  function layoutHeight(q, S) {
+    const n = q.items.length;
+    L.ground = S.y + S.h - L.m * 0.6;
+    let hmax = (L.ground - S.y) * 0.92;
+    let colW = S.w / n;
+    hmax = Math.min(hmax, colW * 2.9);
+    colW = Math.min(colW, hmax * 0.95);
+    L.colW = colW;
+    L.hmax = hmax;
+    const x0 = W / 2 - colW * n / 2;
+    for (const it of q.items) {
+      it.cx = x0 + colW * (it.slot + 0.5);
+      it.h = hmax * it.size;
+      it.maxW = colW * 0.8;
+      it.box = heightBox(it);
+      // The whole column above the ground, up past the object's top, is tappable.
+      const top = Math.max(S.y, L.ground - it.h - Math.max(40, it.h * 0.3));
+      it.hit = { x: it.cx - colW / 2, y: top, w: colW, h: L.ground + L.m - top };
+    }
+  }
+
+  function layoutWeight(S) {
+    // Width: two pans plus the beam. Height: items above the pans down to the foot.
+    const bl = Math.min(S.w / 2.9, S.h / 1.55, 260);
+    const sc = L.sc;
+    sc.bl = bl;
+    sc.sl = bl * 0.5;
+    sc.pw = bl * 0.86;
+    sc.cx = W / 2;
+    sc.py = S.y + bl * 0.5 + (S.h - bl * 1.55) / 2;
+    sc.foot = sc.py + bl * 1.05;
+  }
+
+  // Current pan positions (they move with the beam).
+  function scaleAngle(q, t) {
+    const p = clamp((t - q.introT0) / CONFIG.TILT_MS, 0, 1);
+    let a = q.tilt * easeOutCubic(p);
+    if (!reduceMotion) a += q.tilt * 0.16 * Math.sin(p * Math.PI * 2.5) * (1 - p);
+    if (q.solvedT0) {
+      // Settle: a small extra dip and back, then rest.
+      const s = (t - q.solvedT0) / CONFIG.MEASURE_MS;
+      if (s >= 0 && s < 1) a += q.tilt * (reduceMotion ? 0.08 : 0.28) * Math.sin(s * Math.PI * 2) * (1 - s);
+    }
+    return a;
+  }
+
+  function panPos(side, a) {
+    const sc = L.sc;
+    const dir = side === 0 ? -1 : 1;
+    const ex = sc.cx + dir * sc.bl * Math.cos(a);
+    const ey = sc.py + dir * sc.bl * Math.sin(a);
+    return { ex, ey, x: ex, y: ey + sc.sl };
+  }
+
+  // Keep each weight item's boxes in step with its pan.
+  function updateWeightGeom(q, t) {
+    const a = scaleAngle(q, t);
+    const sc = L.sc;
+    for (const it of q.items) {
+      const p = panPos(it.slot, a);
+      const s = sc.pw * it.size;
+      const ih = weightItemHeight(it.kind, s);
+      it.px = p.x; it.py = p.y; it.s = s;
+      it.box = { x: p.x - Math.max(s, sc.pw * 0.4) / 2, y: p.y - ih, w: Math.max(s, sc.pw * 0.4), h: ih };
+      const top = Math.max(L.stage.y, p.y - Math.max(ih, sc.pw * 0.5) - L.m);
+      it.hit = { x: p.x - sc.pw * 0.75, y: top, w: sc.pw * 1.5, h: p.y + sc.pw * 0.35 - top };
+    }
+    return a;
+  }
+
+  // Forgiving pick: inside the object's hit area; nearest centre wins on overlap.
+  function pickItem(p) {
+    const q = currentQ();
+    if (!q) return null;
+    if (q.type === 'weight') updateWeightGeom(q, now());
+    let best = null, bestD = Infinity;
+    for (const it of q.items) {
+      const h = it.hit;
+      if (p.x >= h.x && p.x <= h.x + h.w && p.y >= h.y && p.y <= h.y + h.h) {
+        const d = Math.hypot(p.x - (h.x + h.w / 2), p.y - (h.y + h.h / 2));
+        if (d < bestD) { best = it; bestD = d; }
+      }
+    }
+    return best;
+  }
+
+  // ---------------------------------------------------------------------
+  // Input: touch + mouse
+  // ---------------------------------------------------------------------
+  let activeTouch = null;
+  let mouseDown = false;
+  let parentTimer = null;
+
+  function toCanvas(clientX, clientY) {
+    const r = canvas.getBoundingClientRect();
+    return { x: clientX - r.left, y: clientY - r.top };
+  }
+
+  function findTouch(list, id) {
+    for (let i = 0; i < list.length; i++) if (list[i].identifier === id) return list[i];
+    return null;
+  }
+
+  function cancelParentHold() {
+    if (parentTimer) { clearTimeout(parentTimer); parentTimer = null; }
+  }
+
+  function onDown(p) {
+    unlockAudio();
+    const t = now();
+    state.lastInteraction = t;
+
+    if (state.phase === 'start' || state.phase === 'between') {
+      const g = starGeom();
+      if (Math.hypot(p.x - g.cx, p.y - g.cy) <= g.R * 1.8) { startRound(); return; }
+    } else if (state.phase === 'play') {
+      // Tapping the badge asks the question again.
+      const b = L.badge;
+      if (Math.hypot(p.x - b.x, p.y - b.y) <= b.r * 1.35) {
+        state.badgeTapT0 = t;
+        playPop();
+        const q = currentQ();
+        if (q && (state.step === 'ask' || state.step === 'intro')) say(askText(q));
+        return;
+      }
+      if (state.step === 'ask') {
+        const it = pickItem(p);
+        if (it) { tapItem(it, t); return; }
+      }
+    }
+
+    // Hidden parent view: hold the top-left corner still for 3 seconds.
+    if (p.x < CONFIG.PARENT_CORNER_PX && p.y < CONFIG.PARENT_CORNER_PX) {
+      cancelParentHold();
+      parentTimer = setTimeout(openParent, CONFIG.PARENT_HOLD_MS);
+    }
+  }
+
+  function onMove(p) {
+    if (parentTimer && (p.x >= CONFIG.PARENT_CORNER_PX || p.y >= CONFIG.PARENT_CORNER_PX)) cancelParentHold();
+  }
+
+  function onUp() {
+    cancelParentHold();
+  }
+
+  canvas.addEventListener('touchstart', e => {
+    e.preventDefault();
+    if (activeTouch !== null) return;          // one finger at a time
+    const t = e.changedTouches[0];
+    activeTouch = t.identifier;
+    onDown(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  canvas.addEventListener('touchmove', e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (t) onMove(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  const endTouch = e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (!t) return;
+    activeTouch = null;
+    onUp(toCanvas(t.clientX, t.clientY));
+  };
+  canvas.addEventListener('touchend', endTouch, { passive: false });
+  canvas.addEventListener('touchcancel', endTouch, { passive: false });
+
+  canvas.addEventListener('mousedown', e => { mouseDown = true; onDown(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mousemove', e => { if (mouseDown) onMove(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mouseup', e => {
+    if (!mouseDown) return;
+    mouseDown = false;
+    onUp(toCanvas(e.clientX, e.clientY));
+  });
+
+  // ---------------------------------------------------------------------
+  // Parent view (hidden, local data only)
+  // ---------------------------------------------------------------------
+  const parentEl = document.getElementById('parent');
+  const parentBody = document.getElementById('parentBody');
+
+  function el(tag, text) {
+    const node = document.createElement(tag);
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function openParent() {
+    parentTimer = null;
+    const qs = progress.sessions.reduce((a, s) => a + s.rounds.reduce((b, r) => b + r.questions, 0), 0);
+    const firstTry = progress.sessions.reduce((a, s) => a + s.rounds.reduce((b, r) => b + r.firstTry, 0), 0);
+    const bt = progress.byType || {};
+
+    parentBody.textContent = '';
+    parentBody.appendChild(el('div', `Full games finished: ${progress.gamesCompleted}`));
+    parentBody.appendChild(el('div', `Rounds finished: ${progress.roundsCompleted}`));
+    parentBody.appendChild(el('div', `Comparisons made: ${progress.questions} (length ${bt.length || 0}, height ${bt.height || 0}, weight ${bt.weight || 0})`));
+    parentBody.appendChild(el('div', `Right on the first try: ${qs ? Math.round(100 * firstTry / qs) : 0}%`));
+
+    const recent = progress.sessions.slice(-6).reverse();
+    if (recent.length) {
+      const table = el('table');
+      const head = el('tr');
+      ['When', 'Rounds', 'Top level', 'Slips', 'Avg s/round'].forEach(h => head.appendChild(el('th', h)));
+      table.appendChild(head);
+      recent.forEach(s => {
+        const tr = el('tr');
+        const when = new Date(s.startedAt);
+        tr.appendChild(el('td', when.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' ' +
+          when.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })));
+        tr.appendChild(el('td', `${s.rounds.length}/${CONFIG.ROUNDS}`));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => Math.max(a, r.level), 0) || '-')));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => a + r.slips, 0))));
+        const secs = s.rounds.reduce((a, r) => a + r.seconds, 0);
+        tr.appendChild(el('td', s.rounds.length ? String(Math.round(secs / s.rounds.length)) : '-'));
+        table.appendChild(tr);
+      });
+      parentBody.appendChild(table);
+    }
+    parentEl.hidden = false;
+    log('Parent view opened', progress);
+  }
+
+  parentEl.addEventListener('click', () => { parentEl.hidden = true; });
+
+  // Read-only debug hooks for the Android/desktop console.
+  window.SimpleMeasure = {
+    progress: () => JSON.parse(JSON.stringify(progress)),
+    state: () => {
+      const q = currentQ();
+      const g = starGeom();
+      if (q && q.type === 'weight' && state.phase === 'play') updateWeightGeom(q, now());
+      return {
+        phase: state.phase,
+        round: state.round,
+        level: state.tier + 1,
+        step: state.step,                       // objects accept taps only while 'ask'
+        question: q ? { index: state.qIdx, type: q.type, kind: q.kind, aligned: q.aligned, slips: q.slips } : null,
+        items: q ? q.items.map(it => ({ kind: it.kind, correct: it.correct, x: it.hit.x + it.hit.w / 2, y: it.hit.y + it.hit.h / 2, box: Object.assign({}, it.box) })) : [],
+        badge: { x: L.badge.x, y: L.badge.y },
+        star: (state.phase === 'start' || state.phase === 'between') ? { x: g.cx, y: g.cy } : null,
+      };
+    },
+  };
+
+  // ---------------------------------------------------------------------
+  // Drawing primitives
+  // ---------------------------------------------------------------------
+  function roundRectPath(x, y, w, h, r) {
+    r = Math.max(0, Math.min(r, w / 2, h / 2));
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  function rrect(x, y, w, h, r, fill, stroke, lw) {
+    ctx.beginPath();
+    roundRectPath(x, y, w, h, r);
+    if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+    if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = lw || 2; ctx.stroke(); }
+  }
+
+  function ellipse(x, y, rx, ry, rot = 0) {
+    ctx.beginPath();
+    ctx.ellipse(x, y, Math.max(0.1, rx), Math.max(0.1, ry), rot, 0, TAU);
+  }
+
+  function blob(x, y, rx, ry, fill, stroke, lw, rot = 0) {
+    ellipse(x, y, rx, ry, rot);
+    if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+    if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = lw; ctx.stroke(); }
+  }
+
+  function dot(x, y, r, fill) {
+    ctx.beginPath();
+    ctx.arc(x, y, Math.max(0.1, r), 0, TAU);
+    ctx.fillStyle = fill;
+    ctx.fill();
+  }
+
+  // Two friendly eyes with a sparkle.
+  function eyes(x1, x2, y, r) {
+    for (const x of [x1, x2]) {
+      dot(x, y, r, COLORS.ink);
+      dot(x + r * 0.35, y - r * 0.35, r * 0.35, '#fff');
+    }
+  }
+
+  function smile(x, y, r, lw) {
+    ctx.strokeStyle = COLORS.ink;
+    ctx.lineWidth = lw;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0.15 * Math.PI, 0.85 * Math.PI);
+    ctx.stroke();
+  }
+
+  // ----- Length objects: drawn from (x, y-centre) to the right, `len` long, `t` thick.
+
+  function drawPencil(x, y, len, t, col) {
+    const top = y - t / 2;
+    const eraserW = t * 0.55, ferruleW = t * 0.42;
+    const tipW = Math.min(t * 1.3, len * 0.26);
+    const bodyX = x + eraserW + ferruleW, bodyEnd = x + len - tipW;
+    const line = shade(col, -0.32), lw = Math.max(1.5, t * 0.06);
+    rrect(x, top, eraserW + t * 0.2, t, t * 0.3, '#EFA3B5', shade('#EFA3B5', -0.28), lw);
+    rrect(x + eraserW, top - t * 0.04, ferruleW, t * 1.08, t * 0.06, '#D3CCC2', shade('#D3CCC2', -0.3), lw);
+    ctx.strokeStyle = shade('#D3CCC2', -0.22);
+    ctx.lineWidth = Math.max(1, t * 0.04);
+    ctx.beginPath();
+    ctx.moveTo(x + eraserW + ferruleW * 0.35, top); ctx.lineTo(x + eraserW + ferruleW * 0.35, top + t);
+    ctx.moveTo(x + eraserW + ferruleW * 0.7, top); ctx.lineTo(x + eraserW + ferruleW * 0.7, top + t);
+    ctx.stroke();
+    // Wooden cone and coloured lead.
+    ctx.beginPath();
+    ctx.moveTo(bodyEnd - 1, top); ctx.lineTo(x + len, y); ctx.lineTo(bodyEnd - 1, top + t); ctx.closePath();
+    ctx.fillStyle = '#F1D3A8'; ctx.fill();
+    ctx.strokeStyle = shade('#F1D3A8', -0.3); ctx.lineWidth = lw; ctx.lineJoin = 'round'; ctx.stroke();
+    const k = 0.38;
+    ctx.beginPath();
+    ctx.moveTo(x + len - tipW * k, y - t * 0.5 * k); ctx.lineTo(x + len, y); ctx.lineTo(x + len - tipW * k, y + t * 0.5 * k); ctx.closePath();
+    ctx.fillStyle = shade(col, -0.18); ctx.fill();
+    // Hexagonal body: three facets.
+    ctx.fillStyle = col;
+    ctx.fillRect(bodyX, top, bodyEnd - bodyX, t);
+    ctx.fillStyle = shade(col, 0.28);
+    ctx.fillRect(bodyX, top + t * 0.08, bodyEnd - bodyX, t * 0.24);
+    ctx.fillStyle = shade(col, -0.1);
+    ctx.fillRect(bodyX, top + t * 0.68, bodyEnd - bodyX, t * 0.32);
+    ctx.strokeStyle = line; ctx.lineWidth = lw;
+    ctx.strokeRect(bodyX, top, bodyEnd - bodyX, t);
+  }
+
+  function drawSnake(x, y, len, t, col) {
+    const hr = t * 0.48;                 // head radius (vertical)
+    const hx = x + len - hr * 1.25;      // head centre, so the nose is exactly at x + len
+    const span = hx - x;
+    const waves = Math.max(1, Math.round(span / (t * 3.4)));
+    const N = Math.max(12, Math.ceil(span / 2.5));
+    const pts = [];
+    for (let i = 0; i <= N; i++) {
+      const u = i / N;
+      const env = Math.min(1, (1 - u) * 6);          // the wave fades into the neck
+      pts.push({
+        x: x + span * u,
+        y: y + Math.sin(u * TAU * waves) * t * 0.26 * env,
+        r: t * 0.31 * (0.28 + 0.72 * Math.min(1, u * 3.2)), // tapered tail
+      });
+    }
+    const line = shade(col, -0.32);
+    const lw = Math.max(1.5, t * 0.06);
+    for (const p of pts) dot(p.x, p.y, p.r + lw, line);
+    blob(hx, y, hr * 1.25 + lw, hr + lw, line);
+    for (const p of pts) dot(p.x, p.y, p.r, col);
+    // Belly stripe and back spots.
+    for (let i = 0; i <= N; i++) {
+      const p = pts[i];
+      if (i % 2 === 0) dot(p.x, p.y + p.r * 0.45, p.r * 0.38, shade(col, 0.3));
+    }
+    const step = Math.max(4, Math.round(N / (waves * 4)));
+    for (let i = step; i < N - 2; i += step) dot(pts[i].x, pts[i].y - pts[i].r * 0.15, pts[i].r * 0.38, shade(col, -0.16));
+    blob(hx, y, hr * 1.25, hr, col);
+    eyes(hx + hr * 0.1, hx + hr * 0.7, y - hr * 0.28, hr * 0.17);
+    smile(hx + hr * 0.45, y + hr * 0.05, hr * 0.32, Math.max(1.2, hr * 0.09));
+    ctx.globalAlpha = 0.4;
+    blob(hx - hr * 0.1, y + hr * 0.28, hr * 0.18, hr * 0.11, COLORS.cheek);
+    ctx.globalAlpha = 1;
+  }
+
+  function drawTrain(x, y, len, t, col) {
+    const bodyH = t * 1.0, wr = t * 0.2;
+    const base = y + bodyH * 0.35;
+    const engW = Math.min(t * 2.3, len * 0.5);
+    const carsW = len - engW;
+    const gap = t * 0.16;
+    const n = Math.max(1, Math.round(carsW / (t * 1.9)));
+    const carW = Math.max(t * 0.4, (carsW - gap * n) / n);
+    const lw = Math.max(1.5, t * 0.06);
+    const line = shade(col, -0.32);
+    const wheel = (wx, r) => {
+      dot(wx, base + r * 0.3, r + lw * 0.6, shade(COLORS.ink, 0.25));
+      dot(wx, base + r * 0.3, r * 0.4, '#D3CCC2');
+    };
+    for (let k = 0; k < n; k++) {
+      const cx0 = x + k * (carW + gap);
+      const c = k % 2 ? shade(col, 0.2) : col;
+      if (k > 0) { ctx.fillStyle = shade(COLORS.ink, 0.3); ctx.fillRect(cx0 - gap - 1, base - bodyH * 0.3, gap + 2, bodyH * 0.12); }
+      rrect(cx0, base - bodyH * 0.8, carW, bodyH * 0.8, t * 0.14, c, shade(c, -0.3), lw);
+      if (carW > t * 0.9) rrect(cx0 + carW * 0.18, base - bodyH * 0.66, carW * 0.64, bodyH * 0.3, t * 0.08, '#FFF8EA', shade(c, -0.25), lw * 0.8);
+      wheel(cx0 + carW * 0.25, wr);
+      wheel(cx0 + carW * 0.75, wr);
+    }
+    // Engine at the front (right).
+    const ex = x + carsW;
+    ctx.fillStyle = shade(COLORS.ink, 0.3);
+    ctx.fillRect(ex - gap - 1, base - bodyH * 0.3, gap + 2, bodyH * 0.12);
+    const ec = shade(col, -0.12);
+    rrect(ex + engW * 0.62, base - bodyH * 1.05, engW * 0.12, bodyH * 0.35, t * 0.04, shade(COLORS.ink, 0.2), null);
+    rrect(ex, base - bodyH * 1.15, engW * 0.42, bodyH * 1.15, t * 0.1, ec, line, lw);
+    rrect(ex - engW * 0.03, base - bodyH * 1.25, engW * 0.48, bodyH * 0.14, t * 0.06, shade(col, -0.3), null);
+    rrect(ex + engW * 0.08, base - bodyH * 0.95, engW * 0.26, bodyH * 0.34, t * 0.06, '#FFF8EA', shade(ec, -0.25), lw * 0.8);
+    rrect(ex + engW * 0.38, base - bodyH * 0.72, engW * 0.52, bodyH * 0.72, t * 0.2, col, line, lw);
+    // Cow-catcher at the very front, ending exactly at x + len.
+    ctx.beginPath();
+    ctx.moveTo(ex + engW * 0.88, base - bodyH * 0.3); ctx.lineTo(x + len, base); ctx.lineTo(ex + engW * 0.88, base); ctx.closePath();
+    ctx.fillStyle = shade(COLORS.ink, 0.3); ctx.fill();
+    dot(ex + engW * 0.9, base - bodyH * 0.5, t * 0.09, '#FCE7A0');
+    wheel(ex + engW * 0.2, wr * 1.35);
+    wheel(ex + engW * 0.66, wr);
+  }
+
+  function drawScarf(x, y, len, t, col) {
+    const h = t * 0.85, fr = Math.min(t * 0.4, len * 0.12);
+    const bx = x + fr, bw = len - fr * 2;
+    const lw = Math.max(1.5, t * 0.06);
+    // Fringe tassels at both ends.
+    ctx.strokeStyle = shade(col, -0.15);
+    ctx.lineWidth = Math.max(1.5, t * 0.07);
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    for (let i = 0; i < 5; i++) {
+      const fy = y - h * 0.4 + h * 0.8 * i / 4;
+      ctx.moveTo(bx + 1, fy); ctx.lineTo(x + lw, fy + (i - 2) * t * 0.03);
+      ctx.moveTo(bx + bw - 1, fy); ctx.lineTo(x + len - lw, fy + (i - 2) * t * 0.03);
+    }
+    ctx.stroke();
+    // Knitted band with a gentle wave and stripes.
+    ctx.save();
+    ctx.beginPath();
+    const wv = h * 0.06;
+    ctx.moveTo(bx, y - h / 2);
+    for (let i = 1; i <= 16; i++) ctx.lineTo(bx + bw * i / 16, y - h / 2 + Math.sin(i * 1.3) * wv);
+    for (let i = 16; i >= 0; i--) ctx.lineTo(bx + bw * i / 16, y + h / 2 + Math.sin(i * 1.3 + 1) * wv);
+    ctx.closePath();
+    ctx.fillStyle = col;
+    ctx.fill();
+    ctx.strokeStyle = shade(col, -0.3); ctx.lineWidth = lw; ctx.lineJoin = 'round';
+    ctx.stroke();
+    ctx.clip();
+    const sw = t * 0.75;
+    ctx.fillStyle = '#FFF6E6';
+    for (let sx = bx + sw; sx < bx + bw - sw * 0.5; sx += sw * 2) ctx.fillRect(sx, y - h, sw * 0.55, h * 2);
+    // Knit "v" texture.
+    ctx.strokeStyle = shade(col, -0.12);
+    ctx.globalAlpha = 0.45;
+    ctx.lineWidth = Math.max(1, t * 0.035);
+    const vs = t * 0.22;
+    ctx.beginPath();
+    for (let row = -1; row <= 1; row++) {
+      const vy = y + row * h * 0.28;
+      for (let vx = bx + vs * 0.5; vx < bx + bw; vx += vs * 1.4) {
+        ctx.moveTo(vx, vy - vs * 0.35); ctx.lineTo(vx + vs * 0.35, vy + vs * 0.25); ctx.lineTo(vx + vs * 0.7, vy - vs * 0.35);
+      }
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawLengthItem(it) {
+    const f = { pencil: drawPencil, snake: drawSnake, train: drawTrain, scarf: drawScarf }[it.kind];
+    f(it.lx, it.ly, it.len, L.th, it.color);
+  }
+
+  // ----- Height objects: drawn centred on cx, standing on `ground`, exactly `h` tall.
+
+  function drawTree(cx, g, h, maxW, col) {
+    const r = Math.min(h * 0.3, maxW * 0.4);
+    const cy = g - h + r;
+    const tw = Math.max(6, r * 0.34);
+    const lw = Math.max(1.5, r * 0.05);
+    // Trunk with a little root flare.
+    ctx.beginPath();
+    ctx.moveTo(cx - tw / 2, cy);
+    ctx.lineTo(cx - tw / 2, g - tw * 0.4);
+    ctx.quadraticCurveTo(cx - tw / 2, g, cx - tw, g);
+    ctx.lineTo(cx + tw, g);
+    ctx.quadraticCurveTo(cx + tw / 2, g, cx + tw / 2, g - tw * 0.4);
+    ctx.lineTo(cx + tw / 2, cy);
+    ctx.closePath();
+    ctx.fillStyle = COLORS.trunk; ctx.fill();
+    ctx.strokeStyle = shade(COLORS.trunk, -0.3); ctx.lineWidth = lw; ctx.stroke();
+    // Canopy: three overlapping puffs with one shared outline.
+    const puffs = [[cx, cy, r], [cx - r * 0.62, cy + r * 0.48, r * 0.66], [cx + r * 0.62, cy + r * 0.48, r * 0.66]];
+    for (const [px, py, pr] of puffs) dot(px, py, pr + lw, shade(col, -0.3));
+    for (const [px, py, pr] of puffs) dot(px, py, pr, col);
+    ctx.globalAlpha = 0.35;
+    dot(cx - r * 0.32, cy - r * 0.35, r * 0.28, '#fff');
+    ctx.globalAlpha = 1;
+    for (const [ax, ay] of [[-0.3, 0.2], [0.35, 0.05], [0.05, 0.62]]) dot(cx + ax * r, cy + ay * r, r * 0.08, shade(col, -0.18));
+  }
+
+  function drawFlower(cx, g, h, maxW, col) {
+    const ph = Math.min(h * 0.16, maxW * 0.4);          // pot
+    const pw = ph * 1.1;
+    const R = Math.min(h * 0.14, maxW * 0.38);          // petal radius
+    const hy = g - h + R;
+    const lw = Math.max(1.5, R * 0.07);
+    // Stem and leaves.
+    ctx.strokeStyle = '#7DB27A';
+    ctx.lineWidth = Math.max(3, R * 0.16);
+    ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(cx, g - ph); ctx.lineTo(cx, hy); ctx.stroke();
+    const stemLen = g - ph - hy;
+    if (stemLen > R * 1.4) {
+      blob(cx + R * 0.38, g - ph - stemLen * 0.38, R * 0.42, R * 0.17, '#8DC48A', shade('#8DC48A', -0.3), lw, -0.5);
+      blob(cx - R * 0.38, g - ph - stemLen * 0.62, R * 0.42, R * 0.17, '#8DC48A', shade('#8DC48A', -0.3), lw, 0.5);
+    }
+    // Petals and centre.
+    for (let i = 0; i < 10; i++) {
+      const a = i * TAU / 10;
+      blob(cx + Math.cos(a) * R * 0.6, hy + Math.sin(a) * R * 0.6, R * 0.42, R * 0.2, col, shade(col, -0.25), lw, a);
+    }
+    dot(cx, hy, R * 0.42, shade('#8B6A4E', 0));
+    eyes(cx - R * 0.14, cx + R * 0.14, hy - R * 0.06, R * 0.06);
+    smile(cx, hy + R * 0.04, R * 0.13, Math.max(1, R * 0.04));
+    // Terracotta pot.
+    ctx.beginPath();
+    ctx.moveTo(cx - pw / 2, g - ph); ctx.lineTo(cx + pw / 2, g - ph);
+    ctx.lineTo(cx + pw * 0.36, g); ctx.lineTo(cx - pw * 0.36, g); ctx.closePath();
+    ctx.fillStyle = '#E3A27E'; ctx.fill();
+    ctx.strokeStyle = shade('#E3A27E', -0.3); ctx.lineWidth = lw; ctx.lineJoin = 'round'; ctx.stroke();
+    rrect(cx - pw * 0.56, g - ph, pw * 1.12, ph * 0.26, ph * 0.08, shade('#E3A27E', 0.1), shade('#E3A27E', -0.3), lw);
+  }
+
+  // Giraffe facing right. Built on a 10-unit-tall grid so its height is exactly h;
+  // a narrow column only makes it slimmer, never shorter.
+  function drawGiraffe(cx, g, h, maxW) {
+    const u = h / 10;
+    const ux = Math.min(u, maxW / 6.4);
+    const X = v => cx + (v - 0.35) * ux;     // centre the 6.4-unit-wide figure
+    const Y = v => g - v * u;
+    const col = COLORS.giraffe, spot = COLORS.giraffeSpot;
+    const line = shade(col, -0.35);
+    const lw = Math.max(1.5, ux * 0.12);
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    // Tail.
+    ctx.strokeStyle = line; ctx.lineWidth = lw;
+    ctx.beginPath(); ctx.moveTo(X(-1.9), Y(4.4)); ctx.quadraticCurveTo(X(-2.5), Y(3.9), X(-2.4), Y(3.2)); ctx.stroke();
+    blob(X(-2.4), Y(3.1), ux * 0.18, u * 0.22, spot);
+    // Legs with hooves.
+    for (const lx of [-1.5, -0.8, 0.9, 1.6]) {
+      rrect(X(lx) - ux * 0.22, Y(3.8), ux * 0.44, u * 3.8, ux * 0.18, col, line, lw);
+      rrect(X(lx) - ux * 0.24, Y(0.35), ux * 0.48, u * 0.35, ux * 0.1, shade(spot, -0.2), null);
+    }
+    // Body.
+    blob(X(0), Y(4.3), ux * 2.2, u * 1.05, col, line, lw);
+    // Neck.
+    ctx.beginPath();
+    ctx.moveTo(X(1.0), Y(4.9));
+    ctx.lineTo(X(2.15), Y(8.7));
+    ctx.lineTo(X(3.05), Y(8.55));
+    ctx.lineTo(X(2.1), Y(4.0));
+    ctx.closePath();
+    ctx.fillStyle = col; ctx.fill(); ctx.strokeStyle = line; ctx.stroke();
+    // Mane.
+    ctx.strokeStyle = spot; ctx.lineWidth = Math.max(2, ux * 0.22);
+    ctx.beginPath(); ctx.moveTo(X(1.05), Y(5.2)); ctx.lineTo(X(2.05), Y(8.5)); ctx.stroke();
+    // Spots (fixed pattern).
+    for (const [sx, sy, sr] of [[-1.2, 4.5, 0.42], [-0.2, 4.0, 0.36], [0.7, 4.6, 0.4], [-0.6, 4.9, 0.28], [1.6, 5.6, 0.26], [1.95, 6.8, 0.24], [2.25, 7.8, 0.2]]) {
+      blob(X(sx), Y(sy), ux * sr, u * sr * 0.85, spot);
+    }
+    // Ossicones and ears.
+    ctx.strokeStyle = line; ctx.lineWidth = lw * 1.4;
+    ctx.beginPath(); ctx.moveTo(X(2.55), Y(9.3)); ctx.lineTo(X(2.45), Y(9.8)); ctx.moveTo(X(2.95), Y(9.3)); ctx.lineTo(X(2.95), Y(9.8)); ctx.stroke();
+    dot(X(2.45), Y(9.82), Math.max(2, ux * 0.16), spot);
+    dot(X(2.95), Y(9.82), Math.max(2, ux * 0.16), spot);
+    blob(X(2.2), Y(9.15), ux * 0.32, u * 0.14, col, line, lw, -0.4);
+    // Head.
+    blob(X(3.0), Y(9.0), ux * 0.95, u * 0.52, col, line, lw, 0.15);
+    blob(X(3.65), Y(8.85), ux * 0.4, u * 0.36, shade(col, 0.3), null, 0, 0.15);
+    eyes(X(2.85), X(3.25), Y(9.15), Math.max(1.5, Math.min(ux, u) * 0.11));
+    ctx.globalAlpha = 0.45;
+    blob(X(3.3), Y(8.85), ux * 0.16, u * 0.08, COLORS.cheek);
+    ctx.globalAlpha = 1;
+  }
+
+  // A sitting cat facing the child, exactly h tall (ear tips at the top).
+  function drawCat(cx, g, h) {
+    const u = h / 10;
+    const col = COLORS.cat;
+    const line = shade(col, -0.35);
+    const lw = Math.max(1.5, u * 0.18);
+    // Tail curling round the side.
+    ctx.strokeStyle = line; ctx.lineWidth = u * 1.2; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(cx + u * 2.2, g - u * 0.8); ctx.quadraticCurveTo(cx + u * 4.6, g - u * 1.2, cx + u * 3.9, g - u * 4.4); ctx.stroke();
+    ctx.strokeStyle = col; ctx.lineWidth = u * 0.85;
+    ctx.beginPath(); ctx.moveTo(cx + u * 2.2, g - u * 0.8); ctx.quadraticCurveTo(cx + u * 4.6, g - u * 1.2, cx + u * 3.9, g - u * 4.4); ctx.stroke();
+    // Body.
+    blob(cx, g - u * 2.9, u * 2.9, u * 2.9, col, line, lw);
+    blob(cx, g - u * 2.4, u * 1.6, u * 2.0, shade(col, 0.4), null, 0);
+    // Paws.
+    blob(cx - u * 1.1, g - u * 0.4, u * 0.9, u * 0.45, shade(col, 0.4), line, lw);
+    blob(cx + u * 1.1, g - u * 0.4, u * 0.9, u * 0.45, shade(col, 0.4), line, lw);
+    // Ears.
+    for (const s of [-1, 1]) {
+      ctx.beginPath();
+      ctx.moveTo(cx + s * u * 0.7, g - u * 8.6); ctx.lineTo(cx + s * u * 1.85, g - u * 10); ctx.lineTo(cx + s * u * 2.25, g - u * 7.6); ctx.closePath();
+      ctx.fillStyle = col; ctx.fill(); ctx.strokeStyle = line; ctx.lineWidth = lw; ctx.lineJoin = 'round'; ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(cx + s * u * 1.05, g - u * 8.5); ctx.lineTo(cx + s * u * 1.8, g - u * 9.4); ctx.lineTo(cx + s * u * 2.0, g - u * 7.9); ctx.closePath();
+      ctx.fillStyle = '#F2B8C6'; ctx.fill();
+    }
+    // Head.
+    blob(cx, g - u * 7.0, u * 2.5, u * 2.15, col, line, lw);
+    // Tabby stripes.
+    ctx.strokeStyle = shade(col, -0.18); ctx.lineWidth = u * 0.3;
+    ctx.beginPath();
+    ctx.moveTo(cx - u * 0.5, g - u * 8.9); ctx.lineTo(cx - u * 0.35, g - u * 8.2);
+    ctx.moveTo(cx, g - u * 9.1); ctx.lineTo(cx, g - u * 8.3);
+    ctx.moveTo(cx + u * 0.5, g - u * 8.9); ctx.lineTo(cx + u * 0.35, g - u * 8.2);
+    ctx.stroke();
+    eyes(cx - u * 0.9, cx + u * 0.9, g - u * 7.1, u * 0.3);
+    blob(cx, g - u * 6.45, u * 0.26, u * 0.18, '#E99AAE');
+    smile(cx - u * 0.28, g - u * 6.3, u * 0.28, Math.max(1, u * 0.12));
+    smile(cx + u * 0.28, g - u * 6.3, u * 0.28, Math.max(1, u * 0.12));
+    ctx.strokeStyle = shade(col, -0.3); ctx.lineWidth = Math.max(1, u * 0.08);
+    ctx.beginPath();
+    for (const s of [-1, 1]) {
+      ctx.moveTo(cx + s * u * 0.9, g - u * 6.4); ctx.lineTo(cx + s * u * 2.6, g - u * 6.7);
+      ctx.moveTo(cx + s * u * 0.9, g - u * 6.2); ctx.lineTo(cx + s * u * 2.6, g - u * 6.0);
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 0.4;
+    blob(cx - u * 1.5, g - u * 6.5, u * 0.4, u * 0.25, COLORS.cheek);
+    blob(cx + u * 1.5, g - u * 6.5, u * 0.4, u * 0.25, COLORS.cheek);
+    ctx.globalAlpha = 1;
+  }
+
+  function heightBox(it) {
+    const { cx, h, maxW } = it;
+    const g = L.ground;
+    let w;
+    if (it.kind === 'tree') w = Math.min(h * 0.3, maxW * 0.4) * 2.6;
+    else if (it.kind === 'flower') w = Math.max(Math.min(h * 0.14, maxW * 0.38) * 2.1, Math.min(h * 0.16, maxW * 0.4) * 1.25);
+    else if (it.kind === 'giraffe') { const ux = Math.min(h / 10, maxW / 6.4); return { x: cx - 2.9 * ux, y: g - h, w: 6.6 * ux, h }; }
+    else return { x: cx - h * 0.4, y: g - h, w: h * 0.74, h };   // cat: drawn shifted left, tail on the right
+    return { x: cx - w / 2, y: g - h, w, h };
+  }
+
+  function drawHeightItem(it) {
+    const g = L.ground;
+    if (it.kind === 'tree') drawTree(it.cx, g, it.h, it.maxW, it.color);
+    else if (it.kind === 'flower') drawFlower(it.cx, g, it.h, it.maxW, it.color);
+    else if (it.kind === 'giraffe') drawGiraffe(it.cx, g, it.h, it.maxW);
+    else drawCat(it.cx - it.h * 0.1, g, it.h);
+  }
+
+  // ----- Weight objects: sitting on a pan at (x, y), `s` = nominal width.
+
+  function weightItemHeight(kind, s) {
+    return { elephant: 0.82, mouse: 0.62, watermelon: 0.62, grapes: 1.2, rock: 0.68, feather: 0.42 }[kind] * s;
+  }
+
+  function drawElephant(x, y, s) {
+    const col = COLORS.elephant, line = shade(col, -0.35);
+    const lw = Math.max(1.5, s * 0.025);
+    // Body, legs, tail.
+    blob(x - s * 0.08, y - s * 0.3, s * 0.4, s * 0.28, col, line, lw);
+    rrect(x - s * 0.38, y - s * 0.2, s * 0.16, s * 0.2, s * 0.06, col, line, lw);
+    rrect(x + s * 0.0, y - s * 0.2, s * 0.16, s * 0.2, s * 0.06, col, line, lw);
+    ctx.strokeStyle = line; ctx.lineWidth = lw * 1.4; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(x - s * 0.46, y - s * 0.34); ctx.quadraticCurveTo(x - s * 0.56, y - s * 0.3, x - s * 0.52, y - s * 0.2); ctx.stroke();
+    // Head with a big ear and a curled trunk.
+    blob(x + s * 0.22, y - s * 0.52, s * 0.25, s * 0.24, col, line, lw);
+    blob(x + s * 0.03, y - s * 0.5, s * 0.15, s * 0.21, shade(col, 0.15), line, lw, -0.2);
+    blob(x + s * 0.03, y - s * 0.5, s * 0.09, s * 0.13, '#E9C3CF', null, 0, -0.2);
+    ctx.strokeStyle = line; ctx.lineWidth = s * 0.11 + lw * 2;
+    ctx.beginPath(); ctx.moveTo(x + s * 0.38, y - s * 0.45); ctx.quadraticCurveTo(x + s * 0.5, y - s * 0.2, x + s * 0.42, y - s * 0.12); ctx.stroke();
+    ctx.strokeStyle = col; ctx.lineWidth = s * 0.11;
+    ctx.beginPath(); ctx.moveTo(x + s * 0.38, y - s * 0.45); ctx.quadraticCurveTo(x + s * 0.5, y - s * 0.2, x + s * 0.42, y - s * 0.12); ctx.stroke();
+    eyes(x + s * 0.25, x + s * 0.36, y - s * 0.58, s * 0.025);
+    ctx.globalAlpha = 0.4;
+    blob(x + s * 0.3, y - s * 0.47, s * 0.045, s * 0.028, COLORS.cheek);
+    ctx.globalAlpha = 1;
+  }
+
+  function drawMouse(x, y, s) {
+    const col = COLORS.mouse, line = shade(col, -0.35);
+    const lw = Math.max(1.2, s * 0.05);
+    ctx.strokeStyle = line; ctx.lineWidth = lw; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(x - s * 0.4, y - s * 0.1); ctx.quadraticCurveTo(x - s * 0.8, y - s * 0.1, x - s * 0.7, y - s * 0.45); ctx.stroke();
+    blob(x - s * 0.05, y - s * 0.24, s * 0.42, s * 0.24, col, line, lw);
+    blob(x + s * 0.2, y - s * 0.46, s * 0.14, s * 0.16, col, line, lw);
+    blob(x + s * 0.2, y - s * 0.46, s * 0.08, s * 0.09, '#F2B8C6');
+    dot(x + s * 0.45, y - s * 0.24, s * 0.05, '#E99AAE');
+    // Side view: one eye.
+    dot(x + s * 0.28, y - s * 0.3, Math.max(1.2, s * 0.045), COLORS.ink);
+    dot(x + s * 0.29, y - s * 0.315, Math.max(0.5, s * 0.015), '#fff');
+  }
+
+  function drawWatermelon(x, y, s) {
+    const rx = s * 0.5, ry = s * 0.31, cy = y - ry;
+    const lw = Math.max(1.5, s * 0.025);
+    blob(x, cy, rx, ry, '#86BE84', shade('#86BE84', -0.35), lw);
+    ctx.save();
+    ellipse(x, cy, rx, ry); ctx.clip();
+    ctx.strokeStyle = '#5E9E64'; ctx.lineWidth = s * 0.045;
+    for (let i = -3; i <= 3; i++) {
+      ctx.beginPath();
+      ctx.ellipse(x + i * rx * 0.3, cy, rx * 0.1, ry * 1.1, 0, 0, TAU);
+      ctx.stroke();
+    }
+    ctx.restore();
+    ctx.globalAlpha = 0.3;
+    blob(x - rx * 0.4, cy - ry * 0.45, rx * 0.25, ry * 0.15, '#fff', null, 0, -0.3);
+    ctx.globalAlpha = 1;
+    rrect(x - s * 0.02, cy - ry - s * 0.07, s * 0.04, s * 0.08, s * 0.02, COLORS.trunk, null);
+  }
+
+  function drawGrapes(x, y, s) {
+    const r = s * 0.17;
+    const col = '#A993D0', line = shade(col, -0.35);
+    const lw = Math.max(1.2, s * 0.04);
+    const grapes = [[0, -r], [-r * 0.95, -r * 2.5], [r * 0.95, -r * 2.5], [0, -r * 3.9], [-r * 1.0, -r * 5.1], [r * 1.0, -r * 5.1]];
+    ctx.strokeStyle = shade(COLORS.trunk, -0.1); ctx.lineWidth = lw * 1.4; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(x, y - r * 5.6); ctx.lineTo(x + r * 0.3, y - r * 6.9); ctx.stroke();
+    blob(x + r * 1.0, y - r * 6.5, r * 0.9, r * 0.45, '#8DC48A', shade('#8DC48A', -0.3), lw, -0.4);
+    for (const [gx, gy] of grapes.slice().reverse()) {
+      dot(x + gx, y + gy, r + lw, line);
+      dot(x + gx, y + gy, r, col);
+      dot(x + gx - r * 0.35, y + gy - r * 0.35, r * 0.25, shade(col, 0.5));
+    }
+  }
+
+  function drawRock(x, y, s) {
+    const col = '#A8A39B', line = shade(col, -0.38);
+    const lw = Math.max(1.5, s * 0.04);
+    const w = s * 0.5, h = s * 0.68;
+    ctx.beginPath();
+    ctx.moveTo(x - w, y);
+    ctx.quadraticCurveTo(x - w * 1.08, y - h * 0.6, x - w * 0.45, y - h * 0.9);
+    ctx.quadraticCurveTo(x + w * 0.1, y - h * 1.08, x + w * 0.6, y - h * 0.82);
+    ctx.quadraticCurveTo(x + w * 1.1, y - h * 0.5, x + w, y);
+    ctx.closePath();
+    ctx.fillStyle = col; ctx.fill();
+    ctx.strokeStyle = line; ctx.lineWidth = lw; ctx.lineJoin = 'round'; ctx.stroke();
+    for (const [a, b, r] of [[-0.4, 0.35, 0.07], [0.3, 0.55, 0.05], [0.1, 0.25, 0.04], [0.5, 0.3, 0.06]]) dot(x + a * w, y - b * h, s * r, shade(col, -0.15));
+    ctx.globalAlpha = 0.3;
+    blob(x - w * 0.3, y - h * 0.72, w * 0.25, h * 0.08, '#fff', null, 0, -0.3);
+    ctx.globalAlpha = 1;
+  }
+
+  function drawFeather(x, y, s) {
+    const col = '#E8B4C8', line = shade(col, -0.3);
+    const lw = Math.max(1.2, s * 0.02);
+    const x0 = x - s * 0.5, x1 = x + s * 0.5;
+    const yb = y - s * 0.06;
+    // Soft vane on both sides of a gently curved shaft.
+    ctx.beginPath();
+    ctx.moveTo(x0 + s * 0.12, yb);
+    ctx.quadraticCurveTo(x - s * 0.1, yb - s * 0.42, x1, yb - s * 0.34);
+    ctx.quadraticCurveTo(x + s * 0.05, yb + s * 0.02, x0 + s * 0.12, yb);
+    ctx.closePath();
+    ctx.fillStyle = col; ctx.fill();
+    ctx.strokeStyle = line; ctx.lineWidth = lw; ctx.stroke();
+    ctx.strokeStyle = shade(col, -0.12); ctx.lineWidth = Math.max(1, lw * 0.7);
+    ctx.beginPath();
+    for (let i = 1; i < 8; i++) {
+      const u = i / 8;
+      const sx = lerp(x0 + s * 0.12, x1, u), sy = lerp(yb, yb - s * 0.34, u) - Math.sin(u * Math.PI) * s * 0.06;
+      ctx.moveTo(sx, sy); ctx.lineTo(sx + s * 0.05, sy - s * 0.1);
+      ctx.moveTo(sx, sy); ctx.lineTo(sx + s * 0.07, sy + s * 0.05);
+    }
+    ctx.stroke();
+    ctx.strokeStyle = shade(col, -0.35); ctx.lineWidth = lw * 1.6; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(x0, yb + s * 0.04); ctx.quadraticCurveTo(x - s * 0.05, yb - s * 0.2, x1, yb - s * 0.34); ctx.stroke();
+  }
+
+  function drawWeightItem(it) {
+    const f = { elephant: drawElephant, mouse: drawMouse, watermelon: drawWatermelon, grapes: drawGrapes, rock: drawRock, feather: drawFeather }[it.kind];
+    f(it.px, it.py, it.s);
+  }
+
+  // ----- Scenes
+
+  function drawRuler(x, y, len, h, unit, horizontal) {
+    // A yellow ruler `len` long; ticks every `unit`, longer ones every 4th.
+    const lw = Math.max(1.5, h * 0.08);
+    if (horizontal) rrect(x, y, len, h, h * 0.18, COLORS.ruler, shade(COLORS.ruler, -0.3), lw);
+    else rrect(x, y - len, h, len, h * 0.18, COLORS.ruler, shade(COLORS.ruler, -0.3), lw);
+    ctx.strokeStyle = shade(COLORS.ruler, -0.45);
+    ctx.lineWidth = Math.max(1, h * 0.07);
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    for (let i = 1, d = unit; d < len - unit * 0.3; i++, d += unit) {
+      const k = i % 4 === 0 ? 0.55 : 0.3;
+      if (horizontal) { ctx.moveTo(x + d, y + h * 0.1); ctx.lineTo(x + d, y + h * (0.1 + k)); }
+      else { ctx.moveTo(x + h * 0.1, y - d); ctx.lineTo(x + h * (0.1 + k), y - d); }
+    }
+    ctx.stroke();
+  }
+
+  // Soft golden halo behind an object (right answer, or the scaffolding hint).
+  function drawHalo(box, k) {
+    if (k <= 0) return;
+    const pad = Math.max(10, Math.min(box.w, box.h) * 0.15) * (0.8 + 0.4 * k);
+    ctx.globalAlpha = 0.25 + 0.4 * k;
+    ctx.fillStyle = shade(COLORS.star, 0.35);
+    ctx.beginPath();
+    roundRectPath(box.x - pad, box.y - pad, box.w + pad * 2, box.h + pad * 2, Math.min(box.w, box.h) * 0.3 + pad);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  // Wrong-tap wobble plus the idle sway, applied around a pivot point.
+  function itemTransform(it, t, g, px, py) {
+    let rot = 0, sc = 1;
+    const wp = (t - it.wobbleT0) / CONFIG.WOBBLE_MS;
+    if (wp >= 0 && wp < 1) rot = (reduceMotion ? 0.025 : 0.07) * Math.sin(wp * Math.PI * 4) * (1 - wp);
+    sc += g.sway(it);
+    ctx.translate(px, py);
+    ctx.rotate(rot);
+    ctx.scale(sc, sc);
+    ctx.translate(-px, -py);
+  }
+
+  function solvedGlow(q, it, t) {
+    if (!q.solvedT0 || !it.correct) return 0;
+    return clamp((t - q.solvedT0) / 250, 0, 1);
+  }
+
+  function drawLengthScene(q, t, g) {
+    const n = q.items.length;
+    const top = q.items.reduce((a, it) => Math.min(a, it.hit.y), Infinity);
+    // Lanes.
+    for (const it of q.items) {
+      const laneY = it.hit.y + L.laneGap * 0.08;
+      rrect(L.startX - L.m * 0.8, laneY, L.lmax + L.m * 1.6, L.laneGap * 0.84, L.laneGap * 0.2, COLORS.lane, null);
+    }
+    // Shared start line (only when the objects are lined up).
+    if (q.aligned) {
+      ctx.strokeStyle = 'rgba(74, 64, 54, 0.35)';
+      ctx.lineWidth = Math.max(2, L.th * 0.08);
+      ctx.setLineDash([L.th * 0.25, L.th * 0.2]);
+      ctx.beginPath();
+      ctx.moveTo(L.startX, top + L.laneGap * 0.04);
+      ctx.lineTo(L.startX, top + L.laneGap * (n - 0.04));
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    for (const it of q.items) {
+      const glow = Math.max(solvedGlow(q, it, t), it === g.hint ? g.glow : 0);
+      drawHalo(it.box, glow);
+      ctx.save();
+      itemTransform(it, t, g, it.lx + it.len / 2, it.ly);
+      drawLengthItem(it);
+      ctx.restore();
+    }
+    // Measuring: a ruler slides out under the right object while a light sweeps along it.
+    const win = q.items.find(it => it.correct);
+    if (q.solvedT0 && win) {
+      const p = easeInOutQuad(clamp((t - q.solvedT0) / CONFIG.MEASURE_MS, 0, 1));
+      const rh = L.th * 0.42;
+      if (p > 0.01) drawRuler(win.lx, win.ly + L.th * 0.98, win.len * p, rh, L.th * 0.5, true);
+      sweep(win.box, p, true);
+    }
+  }
+
+  function drawHeightScene(q, t, g) {
+    // The shared ground line: a soft strip of grass.
+    const gx = W / 2 - L.colW * q.items.length / 2 - L.m;
+    rrect(gx, L.ground - 2, L.colW * q.items.length + L.m * 2, L.m * 0.9, L.m * 0.45, COLORS.grass, null);
+    ctx.strokeStyle = shade(COLORS.grass, -0.25);
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(gx + L.m * 0.3, L.ground); ctx.lineTo(gx + L.colW * q.items.length + L.m * 1.7, L.ground); ctx.stroke();
+    for (const it of q.items) {
+      const glow = Math.max(solvedGlow(q, it, t), it === g.hint ? g.glow : 0);
+      drawHalo(it.box, glow);
+      ctx.save();
+      itemTransform(it, t, g, it.cx, L.ground);
+      drawHeightItem(it);
+      ctx.restore();
+    }
+    // Measuring: a ruler rises beside the right object while a light sweeps up it.
+    const win = q.items.find(it => it.correct);
+    if (q.solvedT0 && win) {
+      const p = easeInOutQuad(clamp((t - q.solvedT0) / CONFIG.MEASURE_MS, 0, 1));
+      const rw = clamp(L.colW * 0.08, 10, 22);
+      const rx = Math.max(win.cx - L.colW / 2 + 2, win.box.x - rw * 1.4);
+      if (p > 0.01) drawRuler(rx, L.ground, win.h * p, rw, rw * 1.2, false);
+      sweep(win.box, p, false);
+    }
+  }
+
+  // A soft band of light passing over an object while it is measured.
+  function sweep(box, p, horizontal) {
+    if (p <= 0 || p >= 1) return;
+    const bw = Math.max(16, (horizontal ? box.h : box.w) * 0.6);
+    ctx.save();
+    ctx.globalAlpha = 0.45 * Math.sin(Math.PI * p);
+    let grad;
+    if (horizontal) {
+      const x = box.x + box.w * p;
+      grad = ctx.createLinearGradient(x - bw, 0, x + bw, 0);
+    } else {
+      const y = box.y + box.h * (1 - p);
+      grad = ctx.createLinearGradient(0, y - bw, 0, y + bw);
+    }
+    grad.addColorStop(0, 'rgba(255,255,255,0)');
+    grad.addColorStop(0.5, 'rgba(255,253,240,1)');
+    grad.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(box.x - 4, box.y - 4, box.w + 8, box.h + 8);
+    ctx.restore();
+  }
+
+  function drawWeightScene(q, t, g) {
+    const sc = L.sc;
+    const a = updateWeightGeom(q, t);
+    const lw = Math.max(2, sc.bl * 0.025);
+    const wline = shade(COLORS.wood, -0.35);
+
+    // Foot and post.
+    rrect(sc.cx - sc.bl * 0.42, sc.foot - sc.bl * 0.12, sc.bl * 0.84, sc.bl * 0.12, sc.bl * 0.05, COLORS.wood, wline, lw);
+    rrect(sc.cx - sc.bl * 0.05, sc.py, sc.bl * 0.1, sc.foot - sc.py - sc.bl * 0.1, sc.bl * 0.04, shade(COLORS.wood, 0.1), wline, lw);
+
+    // Strings and pans (pans stay level as they hang).
+    for (const side of [0, 1]) {
+      const p = panPos(side, a);
+      ctx.strokeStyle = 'rgba(74, 64, 54, 0.45)';
+      ctx.lineWidth = Math.max(1.5, lw * 0.6);
+      ctx.beginPath();
+      ctx.moveTo(p.ex, p.ey); ctx.lineTo(p.x - sc.pw * 0.46, p.y);
+      ctx.moveTo(p.ex, p.ey); ctx.lineTo(p.x + sc.pw * 0.46, p.y);
+      ctx.stroke();
+    }
+
+    // Beam, tipped toward the heavier side.
+    ctx.save();
+    ctx.translate(sc.cx, sc.py);
+    ctx.rotate(a);
+    rrect(-sc.bl * 1.03, -sc.bl * 0.04, sc.bl * 2.06, sc.bl * 0.08, sc.bl * 0.04, COLORS.wood, wline, lw);
+    ctx.restore();
+    dot(sc.cx, sc.py, sc.bl * 0.075 + lw, wline);
+    dot(sc.cx, sc.py, sc.bl * 0.075, shade(COLORS.star, -0.05));
+    for (const side of [0, 1]) { const p = panPos(side, a); dot(p.ex, p.ey, lw * 1.6, wline); }
+
+    // Items, sitting in their pans; the pan bowl is drawn in front so they sit "in" it.
+    for (const it of q.items) {
+      const glow = Math.max(solvedGlow(q, it, t), it === g.hint ? g.glow : 0);
+      drawHalo(it.box, glow);
+      ctx.save();
+      itemTransform(it, t, g, it.px, it.py);
+      drawWeightItem(it);
+      ctx.restore();
+    }
+    for (const side of [0, 1]) {
+      const p = panPos(side, a);
+      ctx.beginPath();
+      ctx.moveTo(p.x - sc.pw * 0.5, p.y - sc.pw * 0.02);
+      ctx.quadraticCurveTo(p.x, p.y + sc.pw * 0.34, p.x + sc.pw * 0.5, p.y - sc.pw * 0.02);
+      ctx.closePath();
+      ctx.fillStyle = COLORS.pan; ctx.fill();
+      ctx.strokeStyle = shade(COLORS.pan, -0.35); ctx.lineWidth = lw; ctx.lineJoin = 'round'; ctx.stroke();
+      ctx.globalAlpha = 0.5;
+      blob(p.x - sc.pw * 0.18, p.y + sc.pw * 0.06, sc.pw * 0.12, sc.pw * 0.03, '#fff');
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  // ----- Badges: what kind of question this is, shown without words.
+
+  function drawBadge(q, t, g) {
+    const b = L.badge;
+    let k = g.badgePulse;
+    const tp = (t - state.badgeTapT0) / 300;
+    if (tp >= 0 && tp < 1) k *= 1 + 0.06 * Math.sin(Math.PI * tp);
+    const r = b.r * k;
+    ctx.save();
+    ctx.shadowColor = 'rgba(74, 64, 54, 0.15)';
+    ctx.shadowBlur = r * 0.3;
+    ctx.shadowOffsetY = r * 0.08;
+    dot(b.x, b.y, r, '#FFFDF8');
+    ctx.restore();
+    ctx.lineWidth = Math.max(2, r * 0.07);
+    ctx.strokeStyle = '#E6DCCB';
+    ctx.beginPath(); ctx.arc(b.x, b.y, r, 0, TAU); ctx.stroke();
+
+    const s = r * 0.62;
+    if (q.type === 'length') {
+      // A ruler with a two-way arrow above it.
+      ctx.save();
+      ctx.translate(b.x, b.y);
+      drawRuler(-s, s * 0.05, s * 2, s * 0.5, s * 0.3, true);
+      arrowLine(-s * 0.9, -s * 0.38, s * 0.9, -s * 0.38, s * 0.3, true);
+      ctx.restore();
+    } else if (q.type === 'height') {
+      // A tall up-arrow standing on a ground line.
+      ctx.save();
+      ctx.translate(b.x, b.y);
+      ctx.strokeStyle = shade(COLORS.grass, -0.3);
+      ctx.lineWidth = Math.max(2, s * 0.14);
+      ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(-s * 0.8, s * 0.85); ctx.lineTo(s * 0.8, s * 0.85); ctx.stroke();
+      arrowLine(0, s * 0.7, 0, -s * 0.95, s * 0.42, false);
+      ctx.restore();
+    } else {
+      // A tiny balance scale, tipped.
+      ctx.save();
+      ctx.translate(b.x, b.y);
+      const a = q.tilt * 0.9;
+      const ink = shade(COLORS.wood, -0.35);
+      ctx.strokeStyle = ink;
+      ctx.lineWidth = Math.max(2, s * 0.12);
+      ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(0, -s * 0.55); ctx.lineTo(0, s * 0.85); ctx.moveTo(-s * 0.45, s * 0.85); ctx.lineTo(s * 0.45, s * 0.85); ctx.stroke();
+      const ex = Math.cos(a) * s * 0.85, ey = Math.sin(a) * s * 0.85;
+      ctx.beginPath(); ctx.moveTo(-ex, -s * 0.55 - ey); ctx.lineTo(ex, -s * 0.55 + ey); ctx.stroke();
+      for (const d of [-1, 1]) {
+        const px = d * ex, py = -s * 0.55 + d * ey + s * 0.45;
+        ctx.lineWidth = Math.max(1, s * 0.06);
+        ctx.beginPath(); ctx.moveTo(d * ex, -s * 0.55 + d * ey); ctx.lineTo(px - s * 0.28, py); ctx.moveTo(d * ex, -s * 0.55 + d * ey); ctx.lineTo(px + s * 0.28, py); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(px - s * 0.32, py); ctx.quadraticCurveTo(px, py + s * 0.32, px + s * 0.32, py); ctx.closePath();
+        ctx.fillStyle = COLORS.pan; ctx.fill(); ctx.lineWidth = Math.max(1.5, s * 0.08); ctx.stroke();
+      }
+      ctx.restore();
+    }
+  }
+
+  function arrowLine(x1, y1, x2, y2, head, both) {
+    const a = Math.atan2(y2 - y1, x2 - x1);
+    ctx.strokeStyle = COLORS.ink;
+    ctx.globalAlpha = 0.75;
+    ctx.lineWidth = Math.max(2, head * 0.32);
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
+    const tip = (x, y, ang) => {
+      ctx.moveTo(x - head * Math.cos(ang - 0.6), y - head * Math.sin(ang - 0.6));
+      ctx.lineTo(x, y);
+      ctx.lineTo(x - head * Math.cos(ang + 0.6), y - head * Math.sin(ang + 0.6));
+    };
+    tip(x2, y2, a);
+    if (both) tip(x1, y1, a + Math.PI);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawStar(cx, cy, R, fill, face) {
+    ctx.save();
+    ctx.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const rad = i % 2 === 0 ? R : R * 0.5;
+      const a = -Math.PI / 2 + i * Math.PI / 5;
+      const x = cx + rad * Math.cos(a), y = cy + rad * Math.sin(a);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    ctx.lineJoin = 'round';
+    if (fill) {
+      ctx.fillStyle = fill;
+      ctx.fill();
+      ctx.strokeStyle = fill;            // same-colour stroke rounds the tips
+      ctx.lineWidth = Math.max(2, R * 0.16);
+      ctx.stroke();
+    } else {
+      ctx.strokeStyle = 'rgba(74, 64, 54, 0.25)';
+      ctx.lineWidth = Math.max(2, R * 0.14);
+      ctx.stroke();
+    }
+
+    if (face) {
+      ctx.fillStyle = COLORS.ink;
+      ctx.beginPath(); ctx.arc(cx - R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.arc(cx + R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.strokeStyle = COLORS.ink;
+      ctx.lineWidth = Math.max(2, R * 0.05);
+      ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.arc(cx, cy + R * 0.06, R * 0.17, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+      ctx.globalAlpha = 0.35;
+      ctx.fillStyle = COLORS.cheek;
+      ctx.beginPath(); ctx.ellipse(cx - R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(cx + R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // Same ring of sparkles every time (no random rewards).
+  function spawnParticles(cx, cy, dist, t) {
+    for (let i = 0; i < 12; i++) {
+      const a = i * TAU / 12 - Math.PI / 2;
+      state.particles.push({ x0: cx, y0: cy, dx: Math.cos(a), dy: Math.sin(a), dist, t0: t, life: 900, color: i % 2 ? COLORS.star : COLORS.items[i % COLORS.items.length] });
+    }
+  }
+
+  function drawParticles(t) {
+    state.particles = state.particles.filter(p => t - p.t0 < p.life);
+    const pr = clamp(Math.min(W, H) * 0.012, 4, 9);
+    for (const p of state.particles) {
+      const k = (t - p.t0) / p.life;
+      const e = easeOutCubic(k);
+      ctx.globalAlpha = 1 - k;
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x0 + p.dx * p.dist * e, p.y0 + p.dy * p.dist * e, pr * (1 - k * 0.5), 0, TAU);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------------------------------------------------------------------
+  // Screens
+  // ---------------------------------------------------------------------
+  function starGeom() {
+    return { cx: W / 2, cy: H * 0.42, R: Math.min(W, H) * 0.2 };
+  }
+
+  // Start and between-round screen: one big pulsing star to tap, plus 5 slots
+  // that fill up so the child can see the end coming.
+  function drawStarScreen(t) {
+    const { cx, cy, R } = starGeom();
+    const amp = reduceMotion ? 0.03 : 0.07;
+    const k = 1 + amp * (0.5 - 0.5 * Math.cos(TAU * t / 1400));
+    drawStar(cx, cy, R * k, COLORS.star, true);
+
+    const sr = R * 0.16, gap = sr * 2.8, y = cy + R * 1.35;
+    for (let i = 0; i < CONFIG.ROUNDS; i++) {
+      drawStar(cx + (i - (CONFIG.ROUNDS - 1) / 2) * gap, y, sr, i < state.round ? COLORS.star : null, false);
+    }
+  }
+
+  function fitFont(text, weight, size, maxW) {
+    ctx.font = `${weight} ${size}px ${FONT}`;
+    while (size > 12 && ctx.measureText(text).width > maxW) {
+      size -= 1;
+      ctx.font = `${weight} ${size}px ${FONT}`;
+    }
+    return size;
+  }
+
+  // Static end screen. No buttons: the session is over.
+  function drawEnd() {
+    const gh = H * 0.14;
+    ctx.fillStyle = COLORS.grass;
+    ctx.beginPath();
+    ctx.moveTo(0, H - gh);
+    ctx.quadraticCurveTo(W / 2, H - gh * 1.5, W, H - gh);
+    ctx.lineTo(W, H);
+    ctx.lineTo(0, H);
+    ctx.closePath();
+    ctx.fill();
+
+    const R = Math.min(W, H) * 0.2;
+    const cy = H * 0.36;
+    drawStar(W / 2, cy, R, COLORS.star, true);
+
+    const big = clamp(Math.min(W, H) * 0.1, 26, 68);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = COLORS.ink;
+    const top = cy + R * 1.25;
+    fitFont('Great Job!', 800, big, W * 0.9);
+    ctx.fillText('Great Job!', W / 2, top + big * 0.5);
+    fitFont('Time to play outside!', 700, Math.round(big * 0.62), W * 0.9);
+    ctx.fillText('Time to play outside!', W / 2, top + big * 1.55);
+  }
+
+  // What to pulse and which object (if any) to glow right now.
+  function guidance(t) {
+    const out = { badgePulse: 1, sway: () => 0, hint: null, glow: 0 };
+    const q = currentQ();
+    if (state.phase !== 'play' || state.step !== 'ask' || !q) return out;
+    const amp = reduceMotion ? 0.03 : 0.07;
+    const right = q.items.find(it => it.correct);
+
+    // After repeated slips on this question, the right object glows until it is chosen.
+    if (q.slips >= CONFIG.HINT_AFTER_SLIPS) { out.hint = right; out.glow = 0.5 + 0.5 * Math.sin(TAU * t / 1300); }
+
+    const idle = t - state.lastInteraction;
+    if (idle <= CONFIG.IDLE_PULSE_MS) return out;
+    const it0 = idle - CONFIG.IDLE_PULSE_MS;
+    const wave = 0.5 - 0.5 * Math.cos(TAU * it0 / 1300);
+    out.badgePulse = 1 + amp * wave;
+
+    // The objects breathe one after another: "these can be tapped".
+    if (!reduceMotion) {
+      const n = q.items.length;
+      out.sway = it => 0.03 * Math.max(0, Math.sin((it0 / 1800) * TAU - it.slot * (TAU / (n + 2))));
+    }
+
+    // First round: if the child has not found the mechanic yet, show the way.
+    const tutorial = state.round === 0 && state.qIdx === 0 && idle > CONFIG.TUTORIAL_HINT_MS;
+    if (tutorial && !out.hint) { out.hint = right; out.glow = wave; }
+    return out;
+  }
+
+  function drawPlay(t) {
+    const q = currentQ();
+    if (!q) return;
+    const g = guidance(t);
+
+    // Fade objects in at the start of a question and out before the next one.
+    let alpha = 1;
+    if (state.step === 'intro') alpha = easeOutCubic(clamp((t - q.introT0) / CONFIG.INTRO_MS, 0, 1));
+    else if (state.step === 'outro') alpha = clamp((state.stepAt - t) / CONFIG.OUTRO_MS, 0, 1);
+
+    drawBadge(q, t, g);
+    if (q.type === 'length') drawLengthScene(q, t, g);
+    else if (q.type === 'height') drawHeightScene(q, t, g);
+    else drawWeightScene(q, t, g);
+
+    // The fade is a veil of background colour over the stage (no offscreen layer needed).
+    if (alpha < 1) {
+      ctx.globalAlpha = 1 - alpha;
+      ctx.fillStyle = COLORS.bg;
+      const S = L.stage;
+      ctx.fillRect(0, S.y - L.m * 0.4, W, H - S.y + L.m * 0.4);
+      ctx.globalAlpha = 1;
+    }
+    drawParticles(t);
+  }
+
+  // ---------------------------------------------------------------------
+  // Main loop
+  // ---------------------------------------------------------------------
+  function update(t) {
+    if (state.phase === 'play' && state.step !== 'ask' && t >= state.stepAt) advance(t);
+
+    if (state.phase === 'celebrate' && t - state.celebrateStart >= CONFIG.CELEBRATE_MS) {
+      if (state.round >= CONFIG.ROUNDS) enterEnd();
+      else state.phase = 'between';
+    }
+  }
+
+  function render(t) {
+    ctx.fillStyle = COLORS.bg;
+    ctx.fillRect(0, 0, W, H);
+    if (state.phase === 'start' || state.phase === 'between') drawStarScreen(t);
+    else if (state.phase === 'play' || state.phase === 'celebrate') drawPlay(t);
+    else if (state.phase === 'end') drawEnd();
+  }
+
+  let rafId = 0;
+  function frame(t) {
+    update(t);
+    render(t);
+    // The end screen is static: stop the loop entirely.
+    if (state.phase !== 'end') rafId = requestAnimationFrame(frame);
+  }
+
+  function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    DPR = Math.min(window.devicePixelRatio || 1, 2.5);
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    // Objects are stored as relative sizes and slots, so they simply re-lay out.
+    computeLayout();
+    if (state.phase === 'end') render(now());
+  }
+
+  window.addEventListener('resize', resize);
+  window.addEventListener('orientationchange', resize);
+
+  resize();
+  log('Game loaded', { roundsPerSession: CONFIG.ROUNDS, gamesCompletedBefore: progress.gamesCompleted });
+  rafId = requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

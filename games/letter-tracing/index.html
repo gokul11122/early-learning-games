@@ -1,0 +1,1381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Letter Tracing</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
+  body {
+    background: #F6F1E7;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  canvas { display: block; width: 100%; height: 100%; }
+
+  #home {
+    position: fixed; top: max(10px, env(safe-area-inset-top)); right: max(10px, env(safe-area-inset-right));
+    width: 52px; height: 52px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+    background: rgba(255, 253, 248, 0.85); box-shadow: 0 2px 8px rgba(74, 64, 54, 0.15);
+    -webkit-tap-highlight-color: transparent; z-index: 5;
+  }
+  #home:active { transform: scale(0.94); }
+
+  /* Hidden parent view: press and hold the top-left corner for 3 seconds. */
+  #parent {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: rgba(74, 64, 54, 0.55); padding: 16px; box-sizing: border-box; z-index: 10;
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #4A4036;
+  }
+  #parent[hidden] { display: none; }
+  #parent .card { background: #FFFDF8; border-radius: 16px; padding: 20px 22px; max-width: 380px; width: 100%; box-shadow: 0 10px 30px rgba(0,0,0,0.18); }
+  #parent h2 { margin: 0 0 10px; font-size: 18px; }
+  #parent table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+  #parent th, #parent td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #EDE5D6; }
+  #parent .hint { margin: 12px 0 0; font-size: 12px; opacity: 0.7; }
+</style>
+</head>
+<body>
+<canvas id="game" aria-label="Letter tracing game"></canvas>
+<a id="home" href="../../index.html" aria-label="Home">
+  <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><path d="M4 11.5 12 5l8 6.5V19a1 1 0 0 1-1 1h-4.5v-5h-5v5H5a1 1 0 0 1-1-1z" fill="none" stroke="#4A4036" stroke-width="2" stroke-linejoin="round"/></svg>
+</a>
+
+<div id="parent" hidden>
+  <div class="card">
+    <h2>Progress on this device</h2>
+    <div id="parentBody"></div>
+    <p class="hint">Stored only on this device. Tap anywhere to close.</p>
+  </div>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  /* =====================================================================
+   * LETTER TRACING
+   * ELOF domain: Language and Literacy (alphabet knowledge, emergent writing)
+   *              + Perceptual/Motor (fine motor control, stroke direction).
+   *
+   * Design rules this file follows (from the brief):
+   *  - Coherence: one big letter as a soft track, a green start dot with a
+   *    direction arrow, and nothing else until the letter is finished.
+   *  - Control of error: colour flows only while the finger stays on the
+   *    track and moves forward. Drifting off simply stops the colour; there is
+   *    no sound, no shake, no "wrong". Touch the end of the colour to go on.
+   *  - Strokes follow a standard teaching order (top to bottom, left to right).
+   *  - Modality: each finished stroke chimes; the finished letter is named
+   *    with a word and a small picture ("A... apple").
+   *  - Self-paced: no timers anywhere the child can see or feel.
+   *  - Natural stopping point: 5 rounds of 2 letters, then "play outside".
+   * ===================================================================== */
+
+  // ---------------------------------------------------------------------
+  // Configuration
+  // ---------------------------------------------------------------------
+  const CONFIG = {
+    ROUNDS: 5,                     // hard session limit (natural stopping point)
+    LETTERS_PER_ROUND: 2,
+    STORAGE_KEY: 'letter-tracing.v1',
+    IDLE_PULSE_MS: 1500,           // idle time before the start dot pulses harder
+    TUTORIAL_HINT_MS: 5000,        // first letter: idle time before the guide dot shows the way
+    GHOST_MS: 1700,                // one pass of the guide dot along the stroke
+    FILL_MS: 450,                  // finished letter swells to full colour
+    LETTER_DONE_MS: 2300,          // after a finished letter, before the next one
+    CELEBRATE_MS: 1600,            // round-complete celebration length
+    FAST_MS_PER_STROKE: 4500,      // "quick" threshold for difficulty step-up
+    PARENT_HOLD_MS: 3000,          // hold time for the hidden parent view
+    PARENT_CORNER_PX: 80,
+    HOME_RESERVE_PX: 72,           // top band kept clear of the home button
+    TRACK_K: 0.15,                 // track width as a fraction of the letter height
+    INK_K: 0.11,                   // ink width as a fraction of the letter height
+    AHEAD_K: 1.0,                  // furthest the ink may jump ahead per step, in tolerances
+    BACK_K: 0.6,                   // how far behind the ink head a touch still counts
+    SUBSTEP_K: 0.35,               // finger path is checked in steps of this many tolerances
+    REJOIN_K: 0.9,                 // must come back this close (in tolerances) to continue
+    TOUCH_K: 1.3,                  // a new touch this close to the ink head picks it up
+  };
+
+  const COLORS = {
+    bg: '#F6F1E7',
+    ink: '#4A4036',
+    track: '#E6DED0',
+    trackNow: '#D9CEBB',
+    start: '#7DBE7A',
+    card: '#FFFDF8',
+    letterInks: ['#7FB0DD', '#86C08A', '#F09A7A', '#B49BD9', '#EFB94A'],
+    star: '#F6C85F',
+    grass: '#B9D7A8',
+    cheek: '#F2A88A',
+  };
+
+  const FONT = 'ui-rounded, "Arial Rounded MT Bold", "Nunito", system-ui, -apple-system, sans-serif';
+  const TAU = Math.PI * 2;
+  const reduceMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+
+  // ---------------------------------------------------------------------
+  // Letter shapes: strokes in a normalised box (x across the letter's own
+  // width, y down its height, both 0..1), in teaching order and direction.
+  // ---------------------------------------------------------------------
+  // Points along an elliptical arc. Angles in degrees, screen style:
+  // 0 = right, 90 = down, 270 = up. a1 < a0 runs anticlockwise on screen.
+  function arc(cx, cy, rx, ry, a0, a1) {
+    const n = Math.max(6, Math.round(Math.abs(a1 - a0) / 7.5));
+    const pts = [];
+    for (let i = 0; i <= n; i++) {
+      const a = (a0 + (a1 - a0) * i / n) * Math.PI / 180;
+      pts.push([cx + rx * Math.cos(a), cy + ry * Math.sin(a)]);
+    }
+    return pts;
+  }
+  // Join straight points and arcs into one stroke, dropping repeated points.
+  function path(...parts) {
+    const out = [];
+    for (const part of parts) {
+      const list = Array.isArray(part[0]) ? part : [part];
+      for (const p of list) {
+        const last = out[out.length - 1];
+        if (!last || Math.hypot(last[0] - p[0], last[1] - p[1]) > 1e-6) out.push(p);
+      }
+    }
+    return out;
+  }
+
+  const LETTERS = {
+    L: { w: 0.62, word: 'leaf',      strokes: [path([0.14, 0], [0.14, 1]), path([0.14, 1], [0.92, 1])] },
+    T: { w: 0.8,  word: 'tent',      strokes: [path([0.06, 0], [0.94, 0]), path([0.5, 0], [0.5, 1])] },
+    V: { w: 0.9,  word: 'van',       strokes: [path([0.05, 0], [0.5, 1], [0.95, 0])] },
+    X: { w: 0.85, word: 'xylophone', strokes: [path([0.08, 0], [0.92, 1]), path([0.92, 0], [0.08, 1])] },
+    I: { w: 0.62, word: 'igloo',     strokes: [path([0.5, 0], [0.5, 1]), path([0.1, 0], [0.9, 0]), path([0.1, 1], [0.9, 1])] },
+    H: { w: 0.8,  word: 'hat',       strokes: [path([0.1, 0], [0.1, 1]), path([0.9, 0], [0.9, 1]), path([0.1, 0.5], [0.9, 0.5])] },
+    E: { w: 0.7,  word: 'egg',       strokes: [path([0.12, 0], [0.12, 1]), path([0.12, 0], [0.9, 0]), path([0.12, 0.5], [0.78, 0.5]), path([0.12, 1], [0.9, 1])] },
+    F: { w: 0.7,  word: 'fish',      strokes: [path([0.12, 0], [0.12, 1]), path([0.12, 0], [0.9, 0]), path([0.12, 0.5], [0.78, 0.5])] },
+    A: { w: 0.9,  word: 'apple',     strokes: [path([0.5, 0], [0.05, 1]), path([0.5, 0], [0.95, 1]), path([0.24, 0.64], [0.76, 0.64])] },
+    N: { w: 0.8,  word: 'nest',      strokes: [path([0.1, 0], [0.1, 1]), path([0.1, 0], [0.9, 1], [0.9, 0])] },
+    M: { w: 1.0,  word: 'moon',      strokes: [path([0.08, 0], [0.08, 1]), path([0.08, 0], [0.5, 0.72], [0.92, 0], [0.92, 1])] },
+    O: { w: 0.86, word: 'octopus',   strokes: [arc(0.5, 0.5, 0.5, 0.5, 270, -90)] },
+    C: { w: 0.82, word: 'cat',       strokes: [arc(0.56, 0.5, 0.46, 0.5, 318, 42)] },
+    U: { w: 0.8,  word: 'umbrella',  strokes: [path([0.12, 0], arc(0.5, 0.62, 0.38, 0.38, 180, 0), [0.88, 0])] },
+    S: { w: 0.74, word: 'sun',       strokes: [path(arc(0.5, 0.26, 0.4, 0.26, 330, 90), arc(0.5, 0.76, 0.42, 0.24, 270, 510))] },
+    P: { w: 0.72, word: 'pig',       strokes: [path([0.12, 0], [0.12, 1]), path([0.12, 0], [0.5, 0], arc(0.5, 0.27, 0.4, 0.27, 270, 450), [0.12, 0.54])] },
+    D: { w: 0.8,  word: 'dog',       strokes: [path([0.12, 0], [0.12, 1]), path([0.12, 0], [0.4, 0], arc(0.4, 0.5, 0.5, 0.5, 270, 450), [0.12, 1])] },
+    B: { w: 0.72, word: 'ball',      strokes: [path([0.12, 0], [0.12, 1]), path([0.12, 0], [0.48, 0], arc(0.48, 0.25, 0.36, 0.25, 270, 450), [0.12, 0.5]),
+                                               path([0.12, 0.5], [0.52, 0.5], arc(0.52, 0.75, 0.4, 0.25, 270, 450), [0.12, 1])] },
+    R: { w: 0.76, word: 'rainbow',   strokes: [path([0.12, 0], [0.12, 1]), path([0.12, 0], [0.5, 0], arc(0.5, 0.27, 0.38, 0.27, 270, 450), [0.12, 0.54]),
+                                               path([0.42, 0.54], [0.9, 1])] },
+  };
+
+  // What is said for each letter's name (a lone "A" is often read as "uh").
+  const LETTER_NAME = { A: 'ay' };
+
+  // Difficulty ladder for dynamic difficulty adjustment (scaffolding).
+  // tol = how far (as a fraction of the letter height) the finger may stray.
+  const TIERS = [
+    { letters: ['L', 'T', 'V', 'X'],                tol: 0.17 }, // straight lines, 1-2 strokes, wide tolerance
+    { letters: ['H', 'E', 'F', 'I', 'A', 'N'],      tol: 0.15 }, // 3-4 straight strokes
+    { letters: ['O', 'C', 'U', 'S', 'P', 'D'],      tol: 0.14 }, // curves
+    { letters: ['B', 'R', 'M', 'S', 'E', 'A', 'N', 'D'], tol: 0.1 }, // trickier letters, tighter tolerance
+  ];
+
+  // ---------------------------------------------------------------------
+  // Small helpers
+  // ---------------------------------------------------------------------
+  const now = () => performance.now();
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const easeOutCubic = t => 1 - Math.pow(1 - t, 3);
+  const easeInOutQuad = t => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
+  const easeOutBack = t => { const c = 1.6; return 1 + (c + 1) * Math.pow(t - 1, 3) + c * Math.pow(t - 1, 2); };
+  const log = (...args) => console.log('[Tracing]', ...args);
+
+  function shuffle(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }
+
+  // Mix a hex colour toward black (amt < 0) or white (amt > 0).
+  const shadeCache = new Map();
+  function shade(hex, amt) {
+    const key = hex + amt;
+    if (shadeCache.has(key)) return shadeCache.get(key);
+    const n = parseInt(hex.slice(1), 16);
+    const target = amt < 0 ? 0 : 255;
+    const p = Math.abs(amt);
+    const c = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map(v => Math.round(lerp(v, target, p)));
+    const out = `rgb(${c[0]},${c[1]},${c[2]})`;
+    shadeCache.set(key, out);
+    return out;
+  }
+
+  // ---------------------------------------------------------------------
+  // Canvas setup
+  // ---------------------------------------------------------------------
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  let W = 0, H = 0, DPR = 1;
+
+  // Layout values recomputed on every resize.
+  const L = { m: 16, box: { x: 0, y: 0, w: 100, h: 100 }, pic: { x: 0, y: 0, r: 40 }, tol: 30, trackW: 20, inkW: 14 };
+
+  // ---------------------------------------------------------------------
+  // Game state
+  // ---------------------------------------------------------------------
+  const state = {
+    phase: 'start',          // 'start' | 'play' | 'celebrate' | 'between' | 'end'
+    step: 'trace',           // within a letter: 'trace' | 'done'
+    round: 0,                // rounds completed this session
+    tier: 0,                 // index into TIERS
+    letters: [],             // this round's letters
+    letterIndex: 0,
+    letter: 'L',
+    inkColor: COLORS.letterInks[0],
+    strokes: [],             // { norm, pts, s, len, prog (0..1), slips }
+    strokeIndex: 0,
+    engaged: false,          // finger is down and the ink is following it
+    pointerDown: false,
+    lastP: null,             // previous finger point while down
+    doneT0: 0,
+    lastInteraction: 0,
+    roundStart: 0,
+    roundSlips: 0,
+    roundStrokes: 0,
+    completeAt: 0,           // time to fire nextLetterOrFinish()
+    celebrateStart: 0,
+    particles: [],
+    usedLetters: new Set(),
+    colorIndex: 0,
+  };
+
+  // ---------------------------------------------------------------------
+  // Local progress tracking (localStorage, never leaves the device)
+  // ---------------------------------------------------------------------
+  function freshProgress() {
+    return { version: 1, gamesCompleted: 0, roundsCompleted: 0, lettersTraced: 0, slips: 0, lastPlayed: null, sessions: [] };
+  }
+
+  function loadProgress() {
+    try {
+      const raw = window.localStorage.getItem(CONFIG.STORAGE_KEY);
+      if (raw) {
+        const data = JSON.parse(raw);
+        if (data && data.version === 1 && Array.isArray(data.sessions)) return data;
+      }
+    } catch (e) {
+      console.warn('[Tracing] Progress could not be loaded (storage unavailable):', e && e.message);
+    }
+    return freshProgress();
+  }
+
+  function saveProgress() {
+    try {
+      window.localStorage.setItem(CONFIG.STORAGE_KEY, JSON.stringify(progress));
+      log('Progress saved', { gamesCompleted: progress.gamesCompleted, roundsCompleted: progress.roundsCompleted });
+    } catch (e) {
+      console.warn('[Tracing] Progress could not be saved (storage unavailable):', e && e.message);
+    }
+  }
+
+  const progress = loadProgress();
+  let session = null; // created on the first round of this app launch
+
+  function ensureSession() {
+    if (session) return;
+    session = { startedAt: new Date().toISOString(), finished: false, rounds: [] };
+    progress.sessions.push(session);
+    if (progress.sessions.length > 30) progress.sessions.splice(0, progress.sessions.length - 30);
+  }
+
+  // ---------------------------------------------------------------------
+  // Audio: Web Audio tones + optional spoken words
+  // ---------------------------------------------------------------------
+  let actx = null;
+
+  // Browsers only allow audio after a user gesture, so this runs on every pointer down.
+  function unlockAudio() {
+    if (!actx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) { try { actx = new AC(); } catch (e) { actx = null; } }
+    }
+    if (actx && actx.state === 'suspended') actx.resume();
+  }
+
+  function tone(freq, delay, dur, vol = 0.16, type = 'sine') {
+    if (!actx) return;
+    const t = actx.currentTime + delay;
+    const osc = actx.createOscillator();
+    const gain = actx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(vol, t + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    osc.connect(gain).connect(actx.destination);
+    osc.start(t);
+    osc.stop(t + dur + 0.05);
+  }
+
+  // Stroke n always plays the same note, so a letter "climbs" as it is drawn.
+  const STROKE_NOTE = [523.25, 587.33, 659.25, 783.99];
+  const playTouch = () => tone(440, 0, 0.08, 0.05, 'triangle');
+  const playStroke = i => { const f = STROKE_NOTE[i % STROKE_NOTE.length]; tone(f, 0, 0.35); tone(f * 1.5, 0.07, 0.4, 0.1); };
+  const playLetterDone = () => [659.25, 783.99, 1046.5].forEach((f, i) => tone(f, i * 0.1, 0.45, 0.12));
+  const playRoundDone = () => [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => tone(f, i * 0.12, 0.5, 0.12));
+
+  // Spoken words via the Web Speech API. Android WebView usually lacks it,
+  // so this quietly does nothing there and the tones carry the feedback.
+  function say(text) {
+    try {
+      if (!('speechSynthesis' in window)) return;
+      window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'en-US';
+      u.rate = 0.85;
+      u.pitch = 1.15;
+      window.speechSynthesis.speak(u);
+    } catch (e) { /* speech is optional */ }
+  }
+
+  const letterName = k => LETTER_NAME[k] || k;
+
+  // ---------------------------------------------------------------------
+  // Rounds, letters and difficulty
+  // ---------------------------------------------------------------------
+  function pickLetters(tier) {
+    let pool = tier.letters.filter(k => !state.usedLetters.has(k));
+    if (pool.length < CONFIG.LETTERS_PER_ROUND) pool = tier.letters.slice();
+    const picked = shuffle(pool.slice()).slice(0, CONFIG.LETTERS_PER_ROUND);
+    picked.forEach(k => state.usedLetters.add(k));
+    return picked;
+  }
+
+  function startRound() {
+    ensureSession();
+    const tier = TIERS[state.tier];
+    state.letters = pickLetters(tier);
+    state.letterIndex = 0;
+    state.roundSlips = 0;
+    state.roundStrokes = 0;
+    state.completeAt = 0;
+    state.particles = [];
+    state.phase = 'play';
+    state.roundStart = now();
+    setupLetter();
+    log(`Round ${state.round + 1}/${CONFIG.ROUNDS} started at level ${state.tier + 1}: letters ${state.letters.join(', ')}, tolerance ${tier.tol}`);
+  }
+
+  function setupLetter() {
+    const k = state.letters[state.letterIndex];
+    state.letter = k;
+    state.inkColor = COLORS.letterInks[state.colorIndex++ % COLORS.letterInks.length];
+    state.strokes = LETTERS[k].strokes.map(norm => ({ norm, pts: [], s: [], len: 1, prog: 0, slips: 0 }));
+    state.strokeIndex = 0;
+    state.engaged = false;
+    state.lastP = null;
+    state.step = 'trace';
+    state.lastInteraction = now();
+    computeLayout();
+    say(state.round === 0 && state.letterIndex === 0 ? `Trace ${letterName(k)}. Start at the green dot.` : letterName(k));
+    log(`Letter ${state.letterIndex + 1}/${CONFIG.LETTERS_PER_ROUND}: ${k} (${state.strokes.length} strokes)`);
+  }
+
+  function finishStroke(t) {
+    const st = state.strokes[state.strokeIndex];
+    st.prog = 1;
+    playStroke(state.strokeIndex);
+    log(`Stroke ${state.strokeIndex + 1}/${state.strokes.length} of ${state.letter} traced (slips: ${st.slips})`);
+    state.roundStrokes++;
+    state.strokeIndex++;
+    if (state.strokeIndex >= state.strokes.length) { finishLetter(t); return; }
+    // If the finger already sits on the next stroke's start, the ink carries on.
+    const next = state.strokes[state.strokeIndex];
+    if (!(state.lastP && Math.hypot(state.lastP.x - next.pts[0].x, state.lastP.y - next.pts[0].y) <= L.tol)) state.engaged = false;
+  }
+
+  function finishLetter(t) {
+    state.step = 'done';
+    state.engaged = false;
+    state.doneT0 = t;
+    playLetterDone();
+    const word = LETTERS[state.letter].word;
+    say(`${letterName(state.letter)}... ${word}`);
+    spawnParticles(t);
+    state.completeAt = t + CONFIG.LETTER_DONE_MS;
+    log(`Item completed: letter ${state.letter} (${word})`);
+  }
+
+  function nextLetterOrFinish() {
+    state.letterIndex++;
+    if (state.letterIndex < CONFIG.LETTERS_PER_ROUND) setupLetter();
+    else completeRound();
+  }
+
+  function completeRound() {
+    const t = now();
+    const ms = t - state.roundStart;
+    const record = {
+      level: state.tier + 1,
+      letters: state.letters.join(''),
+      items: CONFIG.LETTERS_PER_ROUND,
+      strokes: state.roundStrokes,
+      slips: state.roundSlips,
+      seconds: Math.round(ms / 100) / 10,
+    };
+
+    session.rounds.push(record);
+    progress.roundsCompleted++;
+    progress.lettersTraced += record.items;
+    progress.slips += record.slips;
+    progress.lastPlayed = new Date().toISOString();
+    state.round++;
+    log('Level completed', record);
+
+    const finalRound = state.round >= CONFIG.ROUNDS;
+    if (finalRound) {
+      session.finished = true;
+      progress.gamesCompleted++;
+    } else {
+      // Praise the effort, not the child's "smartness" (growth mindset).
+      say(record.slips > 0 ? 'You kept going, and you made the letters!' : 'You followed every line carefully!');
+    }
+    saveProgress();
+    adjustDifficulty(record, ms);
+
+    playRoundDone();
+    state.phase = 'celebrate';
+    state.celebrateStart = t;
+  }
+
+  // Simple DDA: quick and steady -> one step harder; a real struggle -> one step easier.
+  function adjustDifficulty(record, ms) {
+    const fast = ms / Math.max(1, record.strokes) <= CONFIG.FAST_MS_PER_STROKE;
+    const before = state.tier;
+    if (record.slips <= 1 && fast) {
+      state.tier = Math.min(TIERS.length - 1, state.tier + 1);
+    } else if (record.slips >= Math.max(4, record.strokes)) {
+      state.tier = Math.max(0, state.tier - 1);
+    }
+    if (state.tier !== before) log(`Difficulty ${state.tier > before ? 'up' : 'down'}: level ${before + 1} -> ${state.tier + 1}`);
+  }
+
+  function enterEnd() {
+    state.phase = 'end';
+    say('Great job! Time to play outside!');
+    log('Session finished: end screen shown, no replay offered');
+  }
+
+  // ---------------------------------------------------------------------
+  // Layout
+  // ---------------------------------------------------------------------
+  // The letter and its picture slot form one group: side by side in landscape,
+  // stacked in portrait. The slot stays empty until the letter is finished.
+  function computeLayout() {
+    const minDim = Math.min(W, H);
+    const m = clamp(minDim * 0.045, 12, 36);
+    const asp = (LETTERS[state.letter] || LETTERS.L).w;
+    const pad = 0.12;     // room around the box for the thick track
+    const gap = 0.1;      // between the letter and the picture
+    const ps = 0.44;      // picture slot size
+    let boxH;
+    const box = L.box;
+
+    if (W >= H) {
+      boxH = Math.min((H - 2 * m) / (1 + 2 * pad), (W - 2 * m) / (asp + 2 * pad + gap + ps), 640);
+      const groupW = (asp + 2 * pad + gap + ps) * boxH;
+      const gx = (W - groupW) / 2;
+      box.x = gx + pad * boxH;
+      box.y = (H - boxH) / 2;
+      L.pic.x = gx + (asp + 2 * pad + gap + ps / 2) * boxH;
+      L.pic.y = H / 2;
+    } else {
+      const top = Math.max(m, CONFIG.HOME_RESERVE_PX);
+      boxH = Math.min((W - 2 * m) / (asp + 2 * pad), (H - m - top) / (1 + 2 * pad + gap + ps), 640);
+      const groupH = (1 + 2 * pad + gap + ps) * boxH;
+      const gy = top + (H - m - top - groupH) / 2;
+      box.x = (W - asp * boxH) / 2;
+      box.y = gy + pad * boxH;
+      L.pic.x = W / 2;
+      L.pic.y = gy + (1 + 2 * pad + gap + ps / 2) * boxH;
+    }
+    box.h = boxH;
+    box.w = asp * boxH;
+    L.m = m;
+    L.pic.r = ps * boxH * 0.5;
+    L.trackW = Math.max(18, boxH * CONFIG.TRACK_K);
+    L.inkW = Math.max(13, boxH * CONFIG.INK_K);
+    L.tol = Math.max(L.trackW * 0.6, 24, boxH * TIERS[state.tier].tol);
+
+    // Strokes in pixels, with running length so progress survives a resize.
+    for (const st of state.strokes) {
+      st.pts = st.norm.map(([x, y]) => ({ x: box.x + x * box.w, y: box.y + y * box.h }));
+      st.s = [0];
+      for (let i = 1; i < st.pts.length; i++) st.s.push(st.s[i - 1] + Math.hypot(st.pts[i].x - st.pts[i - 1].x, st.pts[i].y - st.pts[i - 1].y));
+      st.len = Math.max(1, st.s[st.s.length - 1]);
+    }
+    state.lastP = null;   // the old finger point is meaningless after a re-layout
+  }
+
+  // Point at arc length d along a stroke, plus the direction of travel there.
+  function pointAt(st, d) {
+    d = clamp(d, 0, st.len);
+    let i = 1;
+    while (i < st.pts.length - 1 && st.s[i] < d) i++;
+    const a = st.pts[i - 1], b = st.pts[i];
+    const seg = Math.max(1e-6, st.s[i] - st.s[i - 1]);
+    const k = clamp((d - st.s[i - 1]) / seg, 0, 1);
+    return { x: lerp(a.x, b.x, k), y: lerp(a.y, b.y, k), dx: (b.x - a.x) / seg, dy: (b.y - a.y) / seg, i };
+  }
+
+  // Nearest point on the stroke to p, searching only between `from` and `to`
+  // (arc lengths). Returns its arc length and distance from p.
+  function nearestOnStroke(st, p, from, to) {
+    let best = { s: from, d: Infinity };
+    for (let i = 1; i < st.pts.length; i++) {
+      const s0 = st.s[i - 1], s1 = st.s[i];
+      if (s1 < from || s0 > to) continue;
+      const a = st.pts[i - 1], b = st.pts[i];
+      const vx = b.x - a.x, vy = b.y - a.y;
+      const segLen2 = vx * vx + vy * vy || 1e-6;
+      let k = ((p.x - a.x) * vx + (p.y - a.y) * vy) / segLen2;
+      // Keep the projection inside the allowed window.
+      const segLen = s1 - s0 || 1e-6;
+      k = clamp(k, Math.max(0, (from - s0) / segLen), Math.min(1, (to - s0) / segLen));
+      const qx = a.x + vx * k, qy = a.y + vy * k;
+      const d = Math.hypot(p.x - qx, p.y - qy);
+      if (d < best.d) best = { s: s0 + segLen * k, d };
+    }
+    return best;
+  }
+
+  // ---------------------------------------------------------------------
+  // Tracing
+  // ---------------------------------------------------------------------
+  const currentStroke = () => (state.step === 'trace' ? state.strokes[state.strokeIndex] : null);
+
+  // Look for the finger near the ink head. The window ahead is short, so the
+  // ink can only ever creep forward along the track (no skipping).
+  function probe(st, p) {
+    const head = st.prog * st.len;
+    return nearestOnStroke(st, p, Math.max(0, head - L.tol * CONFIG.BACK_K), Math.min(st.len, head + L.tol * CONFIG.AHEAD_K));
+  }
+
+  function advanceTo(st, hit) {
+    const head = st.prog * st.len;
+    if (hit.s > head) st.prog = Math.min(1, Math.min(hit.s, head + L.tol * CONFIG.AHEAD_K) / st.len);
+    if (st.len * (1 - st.prog) <= Math.max(4, L.tol * 0.3)) finishStroke(now());
+  }
+
+  // One small step of finger movement while the finger is down.
+  function traceStep(p) {
+    const st = currentStroke();
+    if (!st) return;
+    const hit = probe(st, p);
+    if (state.engaged) {
+      if (hit.d <= L.tol) {
+        advanceTo(st, hit);
+      } else {
+        // Drifted off the track: the ink just stops. Counted for the parents only.
+        state.engaged = false;
+        st.slips++;
+        state.roundSlips++;
+        log(`Slip on ${state.letter} stroke ${state.strokeIndex + 1} (slips on this stroke: ${st.slips})`);
+      }
+    } else if (hit.d <= L.tol * CONFIG.REJOIN_K) {
+      state.engaged = true;   // came back to the ink head: carry on
+      advanceTo(st, hit);
+    }
+  }
+
+  // Check the finger's path in small pieces so a quick but accurate swipe still counts.
+  // A huge jump between two events is not filled in, so it can never skip ahead.
+  function traceMove(p) {
+    const from = state.lastP || p;
+    const dist = Math.hypot(p.x - from.x, p.y - from.y);
+    const n = dist > L.tol * 2.5 ? 1 : Math.max(1, Math.ceil(dist / (L.tol * CONFIG.SUBSTEP_K)));
+    for (let i = 1; i <= n && state.step === 'trace'; i++) {
+      const q = { x: lerp(from.x, p.x, i / n), y: lerp(from.y, p.y, i / n) };
+      state.lastP = q;
+      traceStep(q);
+    }
+    state.lastP = p;
+  }
+
+  // A new touch picks the ink up only near where it stopped. The touch itself
+  // adds no ink; moving the finger along the track does.
+  function beginTouch(p) {
+    const st = currentStroke();
+    if (!st) return false;
+    const head = st.prog * st.len;
+    const hit = nearestOnStroke(st, p, Math.max(0, head - L.tol * CONFIG.BACK_K), Math.min(st.len, head + L.tol * 0.5));
+    if (hit.d > L.tol * CONFIG.TOUCH_K) return false;
+    state.engaged = true;
+    state.lastP = p;
+    playTouch();
+    return true;
+  }
+
+  // ---------------------------------------------------------------------
+  // Input: touch + mouse
+  // ---------------------------------------------------------------------
+  let activeTouch = null;
+  let mouseDown = false;
+  let parentTimer = null;
+
+  function toCanvas(clientX, clientY) {
+    const r = canvas.getBoundingClientRect();
+    return { x: clientX - r.left, y: clientY - r.top };
+  }
+
+  function findTouch(list, id) {
+    for (let i = 0; i < list.length; i++) if (list[i].identifier === id) return list[i];
+    return null;
+  }
+
+  function cancelParentHold() {
+    if (parentTimer) { clearTimeout(parentTimer); parentTimer = null; }
+  }
+
+  function onDown(p) {
+    unlockAudio();
+    state.lastInteraction = now();
+    state.pointerDown = true;
+    state.lastP = p;
+
+    if (state.phase === 'start' || state.phase === 'between') {
+      const g = starGeom();
+      if (Math.hypot(p.x - g.cx, p.y - g.cy) <= g.R * 1.8) { startRound(); return; }
+    } else if (state.phase === 'play' && state.step === 'trace') {
+      if (beginTouch(p)) return;
+    }
+
+    // Hidden parent view: hold the top-left corner still for 3 seconds.
+    if (p.x < CONFIG.PARENT_CORNER_PX && p.y < CONFIG.PARENT_CORNER_PX) {
+      cancelParentHold();
+      parentTimer = setTimeout(openParent, CONFIG.PARENT_HOLD_MS);
+    }
+  }
+
+  function onMove(p) {
+    if (parentTimer && (p.x >= CONFIG.PARENT_CORNER_PX || p.y >= CONFIG.PARENT_CORNER_PX)) cancelParentHold();
+    if (!state.pointerDown || state.phase !== 'play' || state.step !== 'trace') return;
+    state.lastInteraction = now();
+    traceMove(p);
+  }
+
+  // Lifting the finger keeps the ink where it is; the next touch continues it.
+  function onUp() {
+    cancelParentHold();
+    state.pointerDown = false;
+    state.engaged = false;
+    state.lastP = null;
+  }
+
+  canvas.addEventListener('touchstart', e => {
+    e.preventDefault();
+    if (activeTouch !== null) return;          // one finger at a time
+    const t = e.changedTouches[0];
+    activeTouch = t.identifier;
+    onDown(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  canvas.addEventListener('touchmove', e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (t) onMove(toCanvas(t.clientX, t.clientY));
+  }, { passive: false });
+
+  const endTouch = e => {
+    e.preventDefault();
+    const t = findTouch(e.changedTouches, activeTouch);
+    if (!t) return;
+    activeTouch = null;
+    onUp();
+  };
+  canvas.addEventListener('touchend', endTouch, { passive: false });
+  canvas.addEventListener('touchcancel', endTouch, { passive: false });
+
+  canvas.addEventListener('mousedown', e => { mouseDown = true; onDown(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mousemove', e => { if (mouseDown) onMove(toCanvas(e.clientX, e.clientY)); });
+  window.addEventListener('mouseup', () => {
+    if (!mouseDown) return;
+    mouseDown = false;
+    onUp();
+  });
+
+  // ---------------------------------------------------------------------
+  // Parent view (hidden, local data only)
+  // ---------------------------------------------------------------------
+  const parentEl = document.getElementById('parent');
+  const parentBody = document.getElementById('parentBody');
+
+  function el(tag, text) {
+    const node = document.createElement(tag);
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function openParent() {
+    parentTimer = null;
+    const strokes = progress.sessions.reduce((a, s) => a + s.rounds.reduce((b, r) => b + r.strokes, 0), 0);
+    const slips = progress.sessions.reduce((a, s) => a + s.rounds.reduce((b, r) => b + r.slips, 0), 0);
+
+    parentBody.textContent = '';
+    parentBody.appendChild(el('div', `Full games finished: ${progress.gamesCompleted}`));
+    parentBody.appendChild(el('div', `Rounds finished: ${progress.roundsCompleted}`));
+    parentBody.appendChild(el('div', `Letters traced: ${progress.lettersTraced}`));
+    parentBody.appendChild(el('div', `Slips off the line per stroke: ${strokes ? (slips / strokes).toFixed(1) : '0'}`));
+
+    const recent = progress.sessions.slice(-6).reverse();
+    if (recent.length) {
+      const table = el('table');
+      const head = el('tr');
+      ['When', 'Rounds', 'Top level', 'Letters', 'Slips'].forEach(h => head.appendChild(el('th', h)));
+      table.appendChild(head);
+      recent.forEach(s => {
+        const tr = el('tr');
+        const when = new Date(s.startedAt);
+        tr.appendChild(el('td', when.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' ' +
+          when.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })));
+        tr.appendChild(el('td', `${s.rounds.length}/${CONFIG.ROUNDS}`));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => Math.max(a, r.level), 0) || '-')));
+        tr.appendChild(el('td', s.rounds.map(r => r.letters).join(' ') || '-'));
+        tr.appendChild(el('td', String(s.rounds.reduce((a, r) => a + r.slips, 0))));
+        table.appendChild(tr);
+      });
+      parentBody.appendChild(table);
+    }
+    parentEl.hidden = false;
+    log('Parent view opened', progress);
+  }
+
+  parentEl.addEventListener('click', () => { parentEl.hidden = true; });
+
+  // Read-only debug hooks for the Android/desktop console.
+  window.LetterTracing = {
+    progress: () => JSON.parse(JSON.stringify(progress)),
+    state: () => {
+      const st = currentStroke();
+      const head = st ? pointAt(st, st.prog * st.len) : null;
+      return {
+        phase: state.phase,
+        step: state.step,
+        round: state.round,
+        level: state.tier + 1,
+        letter: state.letter,
+        letterIndex: state.letterIndex,
+        strokeIndex: state.strokeIndex,
+        strokeCount: state.strokes.length,
+        tolerance: L.tol,
+        engaged: state.engaged,
+        star: (state.phase === 'start' || state.phase === 'between') ? { x: starGeom().cx, y: starGeom().cy } : null,
+        head: head ? { x: head.x, y: head.y } : null,
+        strokeProgress: st ? st.prog : 1,
+        // The current stroke as a dense list of points a test can follow.
+        path: st ? Array.from({ length: 61 }, (_, i) => { const q = pointAt(st, st.len * i / 60); return { x: q.x, y: q.y }; }) : [],
+      };
+    },
+  };
+
+  // ---------------------------------------------------------------------
+  // Drawing primitives
+  // ---------------------------------------------------------------------
+  function roundRectPath(x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  // Pictures below are drawn in a unit space (fits a circle of radius 1).
+  function paint(fill, lw = 0.07) {
+    ctx.fillStyle = fill;
+    ctx.fill();
+    ctx.lineWidth = lw;
+    ctx.strokeStyle = shade(fill, -0.3);
+    ctx.stroke();
+  }
+  function circle(x, y, r) { ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); }
+  function ellipse(x, y, rx, ry, rot = 0) { ctx.beginPath(); ctx.ellipse(x, y, rx, ry, rot, 0, TAU); }
+  function dot(x, y, r, fill = COLORS.ink) { circle(x, y, r); ctx.fillStyle = fill; ctx.fill(); }
+  function line(pts, color, w) {
+    ctx.beginPath();
+    pts.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+    ctx.strokeStyle = color; ctx.lineWidth = w; ctx.stroke();
+  }
+  function tube(build, fill, w) {
+    ctx.beginPath(); build();
+    ctx.strokeStyle = shade(fill, -0.3); ctx.lineWidth = w + 0.12; ctx.stroke();
+    ctx.beginPath(); build();
+    ctx.strokeStyle = fill; ctx.lineWidth = w; ctx.stroke();
+  }
+  function shine(x, y, rx, ry, rot = -0.6) {
+    ctx.globalAlpha = 0.4; ellipse(x, y, rx, ry, rot); ctx.fillStyle = '#fff'; ctx.fill(); ctx.globalAlpha = 1;
+  }
+  function smile(x, y, r, w = 0.06) {
+    ctx.beginPath(); ctx.arc(x, y, r, 0.15 * Math.PI, 0.85 * Math.PI);
+    ctx.strokeStyle = COLORS.ink; ctx.lineWidth = w; ctx.stroke();
+  }
+  function cheeks(x1, x2, y, r) {
+    ctx.globalAlpha = 0.4;
+    ellipse(x1, y, r, r * 0.65); ctx.fillStyle = COLORS.cheek; ctx.fill();
+    ellipse(x2, y, r, r * 0.65); ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------------------------------------------------------------------
+  // One picture per letter word, all drawn in code
+  // ---------------------------------------------------------------------
+  const PICS = {
+    apple() {
+      ctx.beginPath();
+      ctx.moveTo(0, -0.5);
+      ctx.bezierCurveTo(0.45, -0.85, 0.95, -0.45, 0.8, 0.15);
+      ctx.bezierCurveTo(0.7, 0.7, 0.3, 0.92, 0, 0.78);
+      ctx.bezierCurveTo(-0.3, 0.92, -0.7, 0.7, -0.8, 0.15);
+      ctx.bezierCurveTo(-0.95, -0.45, -0.45, -0.85, 0, -0.5);
+      paint('#E9776B');
+      line([[0, -0.5], [0.08, -0.88]], '#8A6D4B', 0.11);
+      ellipse(0.32, -0.78, 0.24, 0.11, -0.45); paint('#8CC084', 0.05);
+      shine(-0.42, -0.18, 0.16, 0.09);
+    },
+    ball() {
+      ctx.save();
+      circle(0, 0, 0.85); ctx.clip();
+      const cols = ['#E9776B', '#F4D35E', '#8FB8DE'];
+      for (let k = 0; k < 6; k++) {
+        ctx.beginPath(); ctx.moveTo(0.12, -0.18);
+        ctx.arc(0.12, -0.18, 2, k * TAU / 6 + 0.3, (k + 1) * TAU / 6 + 0.3);
+        ctx.closePath(); ctx.fillStyle = k % 2 ? '#FFFDF8' : cols[(k / 2) | 0]; ctx.fill();
+      }
+      ctx.restore();
+      circle(0, 0, 0.85); ctx.lineWidth = 0.07; ctx.strokeStyle = shade('#B9A58A', -0.1); ctx.stroke();
+      circle(0.12, -0.18, 0.12); paint('#FFFDF8', 0.04);
+      shine(-0.4, -0.4, 0.18, 0.1);
+    },
+    cat() {
+      for (const s of [-1, 1]) {
+        ctx.beginPath(); ctx.moveTo(s * 0.62, -0.1); ctx.lineTo(s * 0.55, -0.82); ctx.lineTo(s * 0.12, -0.5); ctx.closePath(); paint('#F2B67A');
+        ctx.beginPath(); ctx.moveTo(s * 0.5, -0.25); ctx.lineTo(s * 0.48, -0.65); ctx.lineTo(s * 0.24, -0.47); ctx.closePath(); ctx.fillStyle = '#F4B6C2'; ctx.fill();
+      }
+      ellipse(0, 0.1, 0.72, 0.64); paint('#F2B67A');
+      dot(-0.26, 0.0, 0.09); dot(0.26, 0.0, 0.09);
+      dot(-0.23, -0.03, 0.03, '#fff'); dot(0.29, -0.03, 0.03, '#fff');
+      ctx.beginPath(); ctx.moveTo(-0.08, 0.16); ctx.lineTo(0.08, 0.16); ctx.lineTo(0, 0.25); ctx.closePath(); ctx.fillStyle = '#E58C9A'; ctx.fill();
+      ctx.beginPath(); ctx.moveTo(-0.16, 0.34); ctx.quadraticCurveTo(-0.08, 0.42, 0, 0.3); ctx.quadraticCurveTo(0.08, 0.42, 0.16, 0.34);
+      ctx.strokeStyle = COLORS.ink; ctx.lineWidth = 0.045; ctx.stroke();
+      for (const s of [-1, 1]) for (const dy of [0.2, 0.32]) line([[s * 0.32, dy], [s * 0.82, dy - 0.06 + (dy - 0.2)]], shade('#F2B67A', -0.4), 0.03);
+    },
+    dog() {
+      ellipse(-0.6, 0.05, 0.22, 0.42, 0.25); paint('#A9805C');
+      ellipse(0.6, 0.05, 0.22, 0.42, -0.25); paint('#A9805C');
+      ellipse(0, 0.02, 0.6, 0.66); paint('#D9B48F');
+      ellipse(0.25, -0.15, 0.2, 0.18, 0.3); ctx.fillStyle = shade('#D9B48F', -0.15); ctx.fill();
+      dot(-0.22, -0.12, 0.08); dot(0.24, -0.12, 0.08);
+      dot(-0.2, -0.15, 0.025, '#fff'); dot(0.26, -0.15, 0.025, '#fff');
+      ellipse(0, 0.25, 0.26, 0.2); ctx.fillStyle = '#F0DCC2'; ctx.fill();
+      ellipse(0, 0.16, 0.11, 0.08); ctx.fillStyle = COLORS.ink; ctx.fill();
+      ctx.beginPath(); ctx.moveTo(-0.12, 0.33); ctx.quadraticCurveTo(0, 0.42, 0.12, 0.33);
+      ctx.strokeStyle = COLORS.ink; ctx.lineWidth = 0.045; ctx.stroke();
+      ellipse(0.04, 0.46, 0.08, 0.1); ctx.fillStyle = '#E58C9A'; ctx.fill();
+    },
+    egg() {
+      ctx.globalAlpha = 0.15; ellipse(0, 0.82, 0.5, 0.08); ctx.fillStyle = COLORS.ink; ctx.fill(); ctx.globalAlpha = 1;
+      ctx.beginPath();
+      ctx.moveTo(0, -0.82);
+      ctx.bezierCurveTo(0.42, -0.82, 0.66, -0.05, 0.62, 0.3);
+      ctx.bezierCurveTo(0.58, 0.66, 0.3, 0.8, 0, 0.8);
+      ctx.bezierCurveTo(-0.3, 0.8, -0.58, 0.66, -0.62, 0.3);
+      ctx.bezierCurveTo(-0.66, -0.05, -0.42, -0.82, 0, -0.82);
+      paint('#FBEBCD');
+      for (const [x, y, r] of [[0.22, -0.3, 0.05], [-0.18, 0.1, 0.04], [0.3, 0.35, 0.045], [-0.05, 0.5, 0.035]]) dot(x, y, r, '#E8CFA6');
+      shine(-0.25, -0.35, 0.1, 0.18, 0.3);
+    },
+    fish() {
+      ctx.beginPath(); ctx.moveTo(-0.5, 0); ctx.lineTo(-0.95, -0.4); ctx.quadraticCurveTo(-0.82, 0, -0.95, 0.4); ctx.closePath(); paint('#5FA3BD');
+      ctx.beginPath();
+      ctx.moveTo(0.85, 0.02);
+      ctx.bezierCurveTo(0.6, -0.6, -0.3, -0.6, -0.6, 0);
+      ctx.bezierCurveTo(-0.3, 0.6, 0.6, 0.6, 0.85, 0.02);
+      paint('#7FB7C9');
+      ctx.beginPath(); ctx.moveTo(-0.05, -0.38); ctx.quadraticCurveTo(0.05, -0.68, 0.3, -0.38); ctx.closePath(); paint('#5FA3BD', 0.05);
+      for (const x of [-0.2, 0.05]) { ctx.beginPath(); ctx.arc(x, 0.02, 0.18, -0.9, 0.9); ctx.strokeStyle = shade('#7FB7C9', -0.2); ctx.lineWidth = 0.04; ctx.stroke(); }
+      dot(0.48, -0.08, 0.09, '#fff'); dot(0.5, -0.08, 0.05);
+      smile(0.62, 0.08, 0.08, 0.04);
+    },
+    hat() {
+      ellipse(0, 0.48, 0.92, 0.22); paint('#B8A9D9');
+      ctx.beginPath(); ctx.moveTo(-0.5, 0.45); ctx.lineTo(-0.44, -0.55); ctx.quadraticCurveTo(0, -0.68, 0.44, -0.55); ctx.lineTo(0.5, 0.45);
+      ctx.quadraticCurveTo(0, 0.58, -0.5, 0.45); ctx.closePath(); paint('#B8A9D9');
+      ctx.beginPath(); ctx.moveTo(-0.48, 0.12); ctx.quadraticCurveTo(0, 0.24, 0.48, 0.12); ctx.lineTo(0.49, 0.32); ctx.quadraticCurveTo(0, 0.44, -0.49, 0.32); ctx.closePath(); paint('#E8B4C8', 0.05);
+      circle(0.3, 0.22, 0.12); paint('#F4D35E', 0.04);
+      shine(-0.25, -0.3, 0.08, 0.2, 0);
+    },
+    igloo() {
+      line([[-0.98, 0.52], [0.98, 0.52]], '#CFE3F1', 0.1);
+      ctx.beginPath(); ctx.moveTo(-0.85, 0.5); ctx.arc(0, 0.5, 0.85, Math.PI, TAU); ctx.closePath(); paint('#EEF4F8');
+      ctx.save();
+      ctx.beginPath(); ctx.moveTo(-0.85, 0.5); ctx.arc(0, 0.5, 0.85, Math.PI, TAU); ctx.closePath(); ctx.clip();
+      ctx.strokeStyle = '#C7D7E3'; ctx.lineWidth = 0.035;
+      for (const y of [0.22, -0.05, -0.3]) { ctx.beginPath(); ctx.moveTo(-1, y); ctx.lineTo(1, y); ctx.stroke(); }
+      [[0.22, 0.5, [-0.5, -0.1, 0.3, 0.7]], [-0.05, 0.22, [-0.65, -0.3, 0.1, 0.5]], [-0.3, -0.05, [-0.4, 0.0, 0.4]], [-0.6, -0.3, [-0.2, 0.2]]].forEach(([y0, y1, xs]) => {
+        xs.forEach(x => { ctx.beginPath(); ctx.moveTo(x, y0); ctx.lineTo(x, y1); ctx.stroke(); });
+      });
+      ctx.restore();
+      ctx.beginPath(); ctx.moveTo(0.12, 0.5); ctx.lineTo(0.12, 0.28); ctx.arc(0.34, 0.28, 0.22, Math.PI, TAU); ctx.lineTo(0.56, 0.5); ctx.closePath(); paint('#EEF4F8');
+      ctx.beginPath(); ctx.moveTo(0.2, 0.5); ctx.lineTo(0.2, 0.3); ctx.arc(0.34, 0.3, 0.14, Math.PI, TAU); ctx.lineTo(0.48, 0.5); ctx.closePath(); ctx.fillStyle = '#6E8AA8'; ctx.fill();
+    },
+    leaf() {
+      ctx.save(); ctx.rotate(-0.6);
+      line([[0, 0.55], [0, 0.95]], '#8A6D4B', 0.08);
+      ctx.beginPath(); ctx.moveTo(0, -0.95); ctx.bezierCurveTo(0.7, -0.5, 0.6, 0.35, 0, 0.6); ctx.bezierCurveTo(-0.6, 0.35, -0.7, -0.5, 0, -0.95); paint('#8CC084');
+      line([[0, -0.75], [0, 0.6]], shade('#8CC084', -0.25), 0.045);
+      for (const y of [-0.4, -0.1, 0.2]) { line([[0, y + 0.15], [0.32, y - 0.05]], shade('#8CC084', -0.2), 0.035); line([[0, y + 0.15], [-0.32, y - 0.05]], shade('#8CC084', -0.2), 0.035); }
+      ctx.restore();
+    },
+    moon() {
+      ctx.save(); ctx.rotate(-0.35);
+      const R = 0.8, r = 0.64, d = 0.42;
+      const ix = (d * d + R * R - r * r) / (2 * d), iy = Math.sqrt(Math.max(0, R * R - ix * ix));
+      const th = Math.atan2(iy, ix), ph = Math.atan2(iy, ix - d);
+      ctx.beginPath(); ctx.arc(0, 0, R, th, TAU - th, false); ctx.arc(d, 0, r, -ph, ph, true); ctx.closePath();
+      paint('#F4D35E');
+      ctx.beginPath(); ctx.arc(-0.42, -0.12, 0.09, 0.1 * Math.PI, 0.9 * Math.PI); ctx.strokeStyle = COLORS.ink; ctx.lineWidth = 0.05; ctx.stroke();
+      smile(-0.4, 0.14, 0.12, 0.05);
+      ctx.restore();
+      dot(0.6, -0.6, 0.06, '#F4D35E'); dot(0.75, 0.3, 0.05, '#F4D35E');
+    },
+    nest() {
+      for (const [x, y, rot] of [[-0.28, -0.08, -0.3], [0.28, -0.08, 0.3], [0, -0.2, 0]]) { ellipse(x, y, 0.2, 0.27, rot); paint('#A8D5D1', 0.05); }
+      ctx.beginPath(); ctx.moveTo(-0.9, 0.05); ctx.quadraticCurveTo(-0.85, 0.75, 0, 0.75); ctx.quadraticCurveTo(0.85, 0.75, 0.9, 0.05);
+      ctx.quadraticCurveTo(0, 0.25, -0.9, 0.05); ctx.closePath(); paint('#B98A63');
+      ctx.strokeStyle = shade('#B98A63', -0.25); ctx.lineWidth = 0.04;
+      for (let i = 0; i < 6; i++) {
+        const y = 0.2 + i * 0.09;
+        ctx.beginPath(); ctx.moveTo(-0.8 + i * 0.06, y + 0.04); ctx.quadraticCurveTo(0, y - 0.08 + (i % 2) * 0.12, 0.8 - i * 0.06, y); ctx.stroke();
+      }
+      line([[-0.92, 0.05], [-1.0, -0.05]], '#B98A63', 0.05); line([[0.9, 0.08], [1.0, -0.02]], '#B98A63', 0.05);
+    },
+    octopus() {
+      const c = '#E8B4C8';
+      for (let i = 0; i < 6; i++) {
+        const x = -0.5 + i * 0.2;
+        const s = i % 2 ? 1 : -1;
+        tube(() => { ctx.moveTo(x, 0.1); ctx.bezierCurveTo(x - 0.05, 0.45, x + s * 0.2, 0.55, x + s * 0.08, 0.8); }, c, 0.13);
+      }
+      ctx.beginPath(); ctx.moveTo(-0.62, 0.25); ctx.bezierCurveTo(-0.72, -0.95, 0.72, -0.95, 0.62, 0.25); ctx.quadraticCurveTo(0, 0.4, -0.62, 0.25); ctx.closePath(); paint(c);
+      dot(-0.22, -0.15, 0.1, '#fff'); dot(0.22, -0.15, 0.1, '#fff');
+      dot(-0.2, -0.13, 0.055); dot(0.24, -0.13, 0.055);
+      smile(0, 0.0, 0.14, 0.05);
+      cheeks(-0.38, 0.38, 0.04, 0.08);
+      shine(-0.3, -0.48, 0.15, 0.08);
+    },
+    pig() {
+      for (const s of [-1, 1]) { ctx.beginPath(); ctx.moveTo(s * 0.62, -0.32); ctx.lineTo(s * 0.62, -0.82); ctx.lineTo(s * 0.2, -0.58); ctx.closePath(); paint('#F4B6C2'); }
+      ellipse(0, 0.05, 0.74, 0.66); paint('#F4B6C2');
+      dot(-0.28, -0.12, 0.08); dot(0.28, -0.12, 0.08);
+      dot(-0.26, -0.15, 0.025, '#fff'); dot(0.3, -0.15, 0.025, '#fff');
+      ellipse(0, 0.2, 0.28, 0.2); paint('#EE9AAC', 0.05);
+      ellipse(-0.1, 0.2, 0.05, 0.08); ctx.fillStyle = shade('#EE9AAC', -0.4); ctx.fill();
+      ellipse(0.1, 0.2, 0.05, 0.08); ctx.fill();
+      smile(0, 0.36, 0.14, 0.045);
+      cheeks(-0.5, 0.5, 0.15, 0.1);
+    },
+    rainbow() {
+      const bands = ['#E9776B', '#F2A65A', '#F4D35E', '#9CCB9A', '#8FB8DE', '#B8A9D9'];
+      bands.forEach((col, i) => {
+        ctx.beginPath(); ctx.arc(0, 0.45, 0.88 - i * 0.1, Math.PI, TAU);
+        ctx.strokeStyle = col; ctx.lineWidth = 0.1; ctx.lineCap = 'butt'; ctx.stroke();
+      });
+      ctx.lineCap = 'round';
+      for (const x of [-0.6, 0.6]) {
+        circle(x - 0.16, 0.5, 0.16); paint('#FFFDF8', 0.04);
+        circle(x + 0.16, 0.5, 0.16); paint('#FFFDF8', 0.04);
+        circle(x, 0.4, 0.2); paint('#FFFDF8', 0.04);
+        ctx.beginPath(); ctx.rect(x - 0.3, 0.45, 0.6, 0.2); ctx.fillStyle = '#FFFDF8'; ctx.fill();
+      }
+    },
+    sun() {
+      for (let i = 0; i < 10; i++) {
+        const a = i * TAU / 10;
+        ctx.beginPath(); ctx.moveTo(Math.cos(a) * 0.62, Math.sin(a) * 0.62); ctx.lineTo(Math.cos(a) * 0.92, Math.sin(a) * 0.92);
+        ctx.strokeStyle = '#F2B84B'; ctx.lineWidth = 0.13; ctx.lineCap = 'round'; ctx.stroke();
+      }
+      circle(0, 0, 0.5); paint('#F6C85F');
+      dot(-0.17, -0.07, 0.06); dot(0.17, -0.07, 0.06);
+      smile(0, 0.04, 0.2, 0.05);
+      cheeks(-0.3, 0.3, 0.1, 0.08);
+    },
+    tent() {
+      line([[0, -0.75], [0, -0.98]], '#8A6D4B', 0.05);
+      ctx.beginPath(); ctx.moveTo(0, -0.98); ctx.lineTo(0.3, -0.9); ctx.lineTo(0, -0.82); ctx.closePath(); ctx.fillStyle = '#E8B4C8'; ctx.fill();
+      ctx.beginPath(); ctx.moveTo(0, -0.78); ctx.lineTo(0.92, 0.66); ctx.lineTo(-0.92, 0.66); ctx.closePath(); paint('#F2A88A');
+      ctx.beginPath(); ctx.moveTo(0, -0.15); ctx.lineTo(0.34, 0.66); ctx.lineTo(-0.34, 0.66); ctx.closePath(); paint('#B86A55', 0.04);
+      ctx.beginPath(); ctx.moveTo(0, -0.15); ctx.lineTo(0.12, 0.66); ctx.lineTo(0.42, 0.66); ctx.closePath(); paint('#F7C2AE', 0.04);
+      line([[-1, 0.7], [1, 0.7]], '#9CCB9A', 0.08);
+    },
+    umbrella() {
+      tube(() => { ctx.moveTo(0, -0.1); ctx.lineTo(0, 0.7); ctx.arc(-0.15, 0.7, 0.15, 0, Math.PI); }, '#8A6D4B', 0.07);
+      const cols = ['#E9776B', '#F4D35E', '#8FB8DE', '#9CCB9A'];
+      ctx.beginPath(); ctx.moveTo(-0.9, 0.0); ctx.arc(0, 0.0, 0.9, Math.PI, TAU);
+      for (let i = 4; i > 0; i--) ctx.quadraticCurveTo(-0.9 + (i - 0.5) * 0.45, -0.12, -0.9 + (i - 1) * 0.45, 0.0);
+      ctx.closePath();
+      ctx.save(); ctx.clip();
+      for (let i = 0; i < 4; i++) {
+        ctx.beginPath(); ctx.moveTo(0, -0.9); ctx.lineTo(-0.9 + i * 0.45 - 0.1, 0.1); ctx.lineTo(-0.9 + (i + 1) * 0.45 + 0.1, 0.1); ctx.closePath();
+        ctx.fillStyle = cols[i]; ctx.fill();
+      }
+      ctx.restore();
+      ctx.beginPath(); ctx.moveTo(-0.9, 0.0); ctx.arc(0, 0.0, 0.9, Math.PI, TAU);
+      for (let i = 4; i > 0; i--) ctx.quadraticCurveTo(-0.9 + (i - 0.5) * 0.45, -0.12, -0.9 + (i - 1) * 0.45, 0.0);
+      ctx.closePath(); ctx.lineWidth = 0.06; ctx.strokeStyle = 'rgba(74,64,54,0.45)'; ctx.stroke();
+      dot(0, -0.92, 0.06, '#8A6D4B');
+    },
+    van() {
+      const c = '#9CCB9A';
+      ctx.beginPath(); ctx.moveTo(-0.92, 0.3); ctx.lineTo(-0.92, -0.45); ctx.quadraticCurveTo(-0.92, -0.55, -0.8, -0.55);
+      ctx.lineTo(0.38, -0.55); ctx.quadraticCurveTo(0.5, -0.55, 0.56, -0.45); ctx.lineTo(0.8, -0.08); ctx.quadraticCurveTo(0.94, -0.04, 0.94, 0.1);
+      ctx.lineTo(0.94, 0.3); ctx.quadraticCurveTo(0.94, 0.38, 0.86, 0.38); ctx.lineTo(-0.84, 0.38); ctx.quadraticCurveTo(-0.92, 0.38, -0.92, 0.3); ctx.closePath();
+      paint(c);
+      ctx.beginPath(); ctx.moveTo(0.3, -0.44); ctx.lineTo(0.48, -0.44); ctx.lineTo(0.68, -0.12); ctx.lineTo(0.3, -0.12); ctx.closePath(); paint('#CFE3F1', 0.04);
+      for (const x of [-0.78, -0.34]) { ctx.beginPath(); roundRectPath(x, -0.44, 0.36, 0.3, 0.05); paint('#CFE3F1', 0.04); }
+      ctx.beginPath(); ctx.rect(-0.92, 0.0, 1.86, 0.08); ctx.fillStyle = '#FFFDF8'; ctx.fill();
+      for (const x of [-0.52, 0.52]) { circle(x, 0.4, 0.2); paint('#5A5048'); dot(x, 0.4, 0.08, '#D8D2C8'); }
+      dot(0.88, 0.2, 0.05, '#F4D35E');
+    },
+    xylophone() {
+      line([[-0.9, -0.1], [0.9, -0.3]], '#B98A63', 0.08); line([[-0.9, 0.5], [0.9, 0.3]], '#B98A63', 0.08);
+      const cols = ['#E9776B', '#F2A65A', '#F4D35E', '#9CCB9A', '#8FB8DE', '#B8A9D9'];
+      cols.forEach((col, i) => {
+        const x = -0.75 + i * 0.29, h = 0.85 - i * 0.08, cy = 0.1 - i * 0.022;
+        ctx.beginPath(); roundRectPath(x - 0.1, cy - h / 2, 0.2, h, 0.05); paint(col, 0.04);
+        dot(x, cy - h / 2 + 0.08, 0.025, '#FFFDF8'); dot(x, cy + h / 2 - 0.08, 0.025, '#FFFDF8');
+      });
+      line([[0.2, -0.95], [0.55, -0.5]], '#8A6D4B', 0.05); dot(0.2, -0.95, 0.08, '#E8B4C8');
+      line([[0.75, -0.9], [0.85, -0.45]], '#8A6D4B', 0.05); dot(0.75, -0.9, 0.08, '#E8B4C8');
+    },
+  };
+
+  // ---------------------------------------------------------------------
+  // Letter drawing
+  // ---------------------------------------------------------------------
+  function strokePolyline(st, upTo) {
+    ctx.beginPath();
+    ctx.moveTo(st.pts[0].x, st.pts[0].y);
+    if (upTo >= st.len) {
+      for (let i = 1; i < st.pts.length; i++) ctx.lineTo(st.pts[i].x, st.pts[i].y);
+      return;
+    }
+    const end = pointAt(st, upTo);
+    for (let i = 1; i < end.i; i++) ctx.lineTo(st.pts[i].x, st.pts[i].y);
+    ctx.lineTo(end.x, end.y);
+  }
+
+  function drawLetter(t, g) {
+    const done = state.step === 'done' || state.phase === 'celebrate';
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    // The soft gray track of every stroke; the current one a touch darker.
+    for (let i = 0; i < state.strokes.length; i++) {
+      const st = state.strokes[i];
+      strokePolyline(st, st.len);
+      ctx.strokeStyle = i === state.strokeIndex && !done ? COLORS.trackNow : COLORS.track;
+      ctx.lineWidth = L.trackW;
+      ctx.stroke();
+    }
+
+    // Scaffolding hint: the rest of the current stroke glows softly.
+    const cur = currentStroke();
+    if (cur && g.glow > 0) {
+      ctx.save();
+      ctx.globalAlpha = 0.25 + 0.35 * g.glow;
+      strokePolyline(cur, cur.len);
+      ctx.strokeStyle = shade(COLORS.start, 0.45);
+      ctx.lineWidth = L.trackW * 1.25;
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // Ink: finished strokes in full, the current stroke up to its head.
+    // When the letter is done the ink swells to fill the whole track.
+    const swell = done ? easeOutCubic(clamp((t - state.doneT0) / CONFIG.FILL_MS, 0, 1)) : 0;
+    const inkW = lerp(L.inkW, L.trackW * 1.04, swell);
+    for (let i = 0; i < state.strokes.length; i++) {
+      const st = state.strokes[i];
+      const upTo = st.prog * st.len;
+      if (upTo <= 0.5) continue;
+      strokePolyline(st, upTo);
+      ctx.strokeStyle = state.inkColor;
+      ctx.lineWidth = inkW;
+      ctx.stroke();
+      ctx.save();
+      ctx.globalAlpha = 0.35;
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = inkW * 0.22;
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    if (cur) drawStartDot(cur, t, g);
+  }
+
+  // Green dot at the ink head with a small arrow showing which way to go.
+  function drawStartDot(st, t, g) {
+    const head = pointAt(st, st.prog * st.len);
+    const r = L.trackW * 0.48 * (state.engaged ? 0.9 : g.pulse);
+    const ang = Math.atan2(head.dy, head.dx);
+    ctx.save();
+    ctx.translate(head.x, head.y);
+    ctx.beginPath(); ctx.arc(0, 0, r, 0, TAU);
+    ctx.fillStyle = COLORS.start; ctx.fill();
+    ctx.lineWidth = Math.max(2, r * 0.18); ctx.strokeStyle = shade(COLORS.start, -0.25); ctx.stroke();
+    ctx.rotate(ang);
+    ctx.beginPath();
+    ctx.moveTo(-r * 0.3, -r * 0.45); ctx.lineTo(r * 0.35, 0); ctx.lineTo(-r * 0.3, r * 0.45);
+    ctx.strokeStyle = '#FFFDF8'; ctx.lineWidth = Math.max(2.5, r * 0.22); ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.stroke();
+    ctx.restore();
+
+    // Guide dot: travels along the rest of the stroke to show the way.
+    if (g.ghost >= 0 && !state.engaged) {
+      const from = st.prog * st.len;
+      const q = pointAt(st, lerp(from, st.len, easeInOutQuad(g.ghost)));
+      ctx.save();
+      ctx.globalAlpha = 0.5 * Math.sin(Math.PI * g.ghost);
+      ctx.beginPath(); ctx.arc(q.x, q.y, r * 0.8, 0, TAU);
+      ctx.fillStyle = COLORS.start; ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  // The word picture pops in beside the finished letter.
+  function drawPicture(t) {
+    if (!(state.step === 'done' || state.phase === 'celebrate')) return;
+    const p = clamp((t - state.doneT0) / 420, 0, 1);
+    const k = reduceMotion ? 1 : lerp(0.5, 1, easeOutBack(p));
+    const { x, y, r } = L.pic;
+    ctx.save();
+    ctx.globalAlpha = clamp(p * 2, 0, 1);
+    ctx.translate(x, y);
+    ctx.scale(k, k);
+    ctx.beginPath(); ctx.arc(0, r * 0.05, r, 0, TAU); ctx.fillStyle = 'rgba(74,64,54,0.08)'; ctx.fill();
+    ctx.beginPath(); ctx.arc(0, 0, r, 0, TAU); ctx.fillStyle = COLORS.card; ctx.fill();
+    ctx.lineWidth = Math.max(2, r * 0.05); ctx.strokeStyle = state.inkColor; ctx.stroke();
+    ctx.scale(r * 0.66, r * 0.66);
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    PICS[LETTERS[state.letter].word]();
+    ctx.restore();
+  }
+
+  function drawStar(cx, cy, R, fill, face) {
+    ctx.save();
+    ctx.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const rad = i % 2 === 0 ? R : R * 0.5;
+      const a = -Math.PI / 2 + i * Math.PI / 5;
+      const x = cx + rad * Math.cos(a), y = cy + rad * Math.sin(a);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    ctx.lineJoin = 'round';
+    if (fill) {
+      ctx.fillStyle = fill;
+      ctx.fill();
+      ctx.strokeStyle = fill;            // same-colour stroke rounds the tips
+      ctx.lineWidth = Math.max(2, R * 0.16);
+      ctx.stroke();
+    } else {
+      ctx.strokeStyle = 'rgba(74, 64, 54, 0.25)';
+      ctx.lineWidth = Math.max(2, R * 0.14);
+      ctx.stroke();
+    }
+
+    if (face) {
+      ctx.fillStyle = COLORS.ink;
+      ctx.beginPath(); ctx.arc(cx - R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.arc(cx + R * 0.17, cy - R * 0.05, R * 0.055, 0, TAU); ctx.fill();
+      ctx.strokeStyle = COLORS.ink;
+      ctx.lineWidth = Math.max(2, R * 0.05);
+      ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.arc(cx, cy + R * 0.06, R * 0.17, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+      ctx.globalAlpha = 0.35;
+      ctx.fillStyle = COLORS.cheek;
+      ctx.beginPath(); ctx.ellipse(cx - R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(cx + R * 0.3, cy + R * 0.1, R * 0.08, R * 0.05, 0, 0, TAU); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // Same ring of sparkles around every finished letter (no random rewards).
+  function spawnParticles(t) {
+    const b = L.box;
+    const cx = b.x + b.w / 2, cy = b.y + b.h / 2;
+    for (let i = 0; i < 12; i++) {
+      const a = i * TAU / 12;
+      state.particles.push({ x0: cx, y0: cy, dx: Math.cos(a), dy: Math.sin(a), dist: b.h * 0.62, t0: t, life: 1000, color: i % 2 ? COLORS.star : state.inkColor });
+    }
+  }
+
+  function drawParticles(t) {
+    state.particles = state.particles.filter(p => t - p.t0 < p.life);
+    for (const p of state.particles) {
+      const k = (t - p.t0) / p.life;
+      const e = easeOutCubic(k);
+      ctx.globalAlpha = 1 - k;
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x0 + p.dx * p.dist * e, p.y0 + p.dy * p.dist * e, L.trackW * 0.22 * (1 - k * 0.5), 0, TAU);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------------------------------------------------------------------
+  // Screens
+  // ---------------------------------------------------------------------
+  function starGeom() {
+    return { cx: W / 2, cy: H * 0.42, R: Math.min(W, H) * 0.2 };
+  }
+
+  // Start and between-round screen: one big pulsing star to tap, plus 5 slots
+  // that fill up so the child can see the end coming.
+  function drawStarScreen(t) {
+    const { cx, cy, R } = starGeom();
+    const amp = reduceMotion ? 0.03 : 0.07;
+    const k = 1 + amp * (0.5 - 0.5 * Math.cos(TAU * t / 1400));
+    drawStar(cx, cy, R * k, COLORS.star, true);
+
+    const sr = R * 0.16, gap = sr * 2.8, y = cy + R * 1.35;
+    for (let i = 0; i < CONFIG.ROUNDS; i++) {
+      drawStar(cx + (i - (CONFIG.ROUNDS - 1) / 2) * gap, y, sr, i < state.round ? COLORS.star : null, false);
+    }
+  }
+
+  function fitFont(text, weight, size, maxW) {
+    ctx.font = `${weight} ${size}px ${FONT}`;
+    while (size > 12 && ctx.measureText(text).width > maxW) {
+      size -= 1;
+      ctx.font = `${weight} ${size}px ${FONT}`;
+    }
+    return size;
+  }
+
+  // Static end screen. No buttons: the session is over.
+  function drawEnd() {
+    const gh = H * 0.14;
+    ctx.fillStyle = COLORS.grass;
+    ctx.beginPath();
+    ctx.moveTo(0, H - gh);
+    ctx.quadraticCurveTo(W / 2, H - gh * 1.5, W, H - gh);
+    ctx.lineTo(W, H);
+    ctx.lineTo(0, H);
+    ctx.closePath();
+    ctx.fill();
+
+    const R = Math.min(W, H) * 0.2;
+    const cy = H * 0.36;
+    drawStar(W / 2, cy, R, COLORS.star, true);
+
+    const big = clamp(Math.min(W, H) * 0.1, 26, 68);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = COLORS.ink;
+    const top = cy + R * 1.25;
+    fitFont('Great Job!', 800, big, W * 0.9);
+    ctx.fillText('Great Job!', W / 2, top + big * 0.5);
+    fitFont('Time to play outside!', 700, Math.round(big * 0.62), W * 0.9);
+    ctx.fillText('Time to play outside!', W / 2, top + big * 1.55);
+  }
+
+  // How hard the start dot pulses, and whether the guide dot and glow show.
+  function guidance(t) {
+    const out = { pulse: 1, ghost: -1, glow: 0 };
+    const st = currentStroke();
+    if (state.phase !== 'play' || !st) return out;
+    const amp = reduceMotion ? 0.06 : 0.16;
+    const idle = state.pointerDown ? 0 : t - state.lastInteraction;
+    // The dot always breathes a little; it pulses harder when the child is idle.
+    const base = 0.5 - 0.5 * Math.cos(TAU * t / 1400);
+    out.pulse = 1 + (idle > CONFIG.IDLE_PULSE_MS ? amp : amp * 0.3) * base;
+
+    // Scaffolding: after 2 slips on this stroke, or in the very first letter if
+    // the child has not found the mechanic yet, the guide dot shows the way.
+    const tutorial = state.round === 0 && state.letterIndex === 0 && state.strokeIndex === 0 && st.prog === 0 && idle > CONFIG.TUTORIAL_HINT_MS;
+    if (st.slips >= 2 || tutorial) {
+      out.glow = 0.5 - 0.5 * Math.cos(TAU * t / 1300);
+      if (idle > 600 || tutorial) out.ghost = (t % CONFIG.GHOST_MS) / CONFIG.GHOST_MS;
+    }
+    return out;
+  }
+
+  function drawPlay(t) {
+    const g = guidance(t);
+    drawLetter(t, g);
+    drawPicture(t);
+    drawParticles(t);
+  }
+
+  // ---------------------------------------------------------------------
+  // Main loop
+  // ---------------------------------------------------------------------
+  function update(t) {
+    if (state.phase === 'play' && state.completeAt && t >= state.completeAt) {
+      state.completeAt = 0;
+      nextLetterOrFinish();
+    }
+
+    if (state.phase === 'celebrate' && t - state.celebrateStart >= CONFIG.CELEBRATE_MS) {
+      if (state.round >= CONFIG.ROUNDS) enterEnd();
+      else state.phase = 'between';
+    }
+  }
+
+  function render(t) {
+    ctx.fillStyle = COLORS.bg;
+    ctx.fillRect(0, 0, W, H);
+    if (state.phase === 'start' || state.phase === 'between') drawStarScreen(t);
+    else if (state.phase === 'play' || state.phase === 'celebrate') drawPlay(t);
+    else if (state.phase === 'end') drawEnd();
+  }
+
+  let rafId = 0;
+  function frame(t) {
+    update(t);
+    render(t);
+    // The end screen is static: stop the loop entirely.
+    if (state.phase !== 'end') rafId = requestAnimationFrame(frame);
+  }
+
+  function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    DPR = Math.min(window.devicePixelRatio || 1, 2.5);
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    // The letter may move under the finger: pause the ink (no slip); touching the head picks it up again.
+    state.engaged = false;
+    computeLayout();
+    if (state.phase === 'end') render(now());
+  }
+
+  window.addEventListener('resize', resize);
+  window.addEventListener('orientationchange', resize);
+
+  resize();
+  log('Game loaded', { roundsPerSession: CONFIG.ROUNDS, lettersPerRound: CONFIG.LETTERS_PER_ROUND, gamesCompletedBefore: progress.gamesCompleted });
+  rafId = requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
