@@ -242,7 +242,7 @@
       const raw = window.localStorage.getItem(CONFIG.STORAGE_KEY);
       if (raw) {
         const data = JSON.parse(raw);
-        if (data && data.version === 1 && Array.isArray(data.sessions)) return data;
+        if (data && data.version === 1 && Array.isArray(data.sessions)) return Object.assign(freshProgress(), data);   // fill counters an older save lacks
       }
     } catch (e) {
       console.warn('[ColorFreeze] Progress could not be loaded (storage unavailable):', e && e.message);
@@ -497,7 +497,9 @@
     const horizon = t - d.t0 + CONFIG.LOOKAHEAD_MS;
     while (d.next < d.events.length && d.events[d.next].beat * BEAT_MS < horizon) {
       const ev = d.events[d.next++];
-      playMusicEvent(ev, Math.max(actx.currentTime, d.a0 + ev.beat * BEAT_MS / 1000));
+      const at = d.a0 + ev.beat * BEAT_MS / 1000;
+      // Notes missed while frames were paused (background, long stall) are skipped, not all played at once.
+      if (at > actx.currentTime - 0.1) playMusicEvent(ev, Math.max(actx.currentTime, at));
     }
   }
 

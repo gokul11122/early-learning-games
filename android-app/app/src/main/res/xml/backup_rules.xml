@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 6-11 auto backup: back up everything except caches (the WebView cache is rebuildable). -->
+<full-backup-content>
+    <exclude domain="root" path="cache/" />
+    <exclude domain="root" path="app_webview/Default/HTTP Cache/" />
+    <exclude domain="root" path="app_webview/Default/GPUCache/" />
+</full-backup-content>

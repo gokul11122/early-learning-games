@@ -245,7 +245,7 @@
         if (data && data.version === 1 && Array.isArray(data.sessions)) {
           const fresh = freshProgress();
           data.feelings = Object.assign(fresh.feelings, data.feelings || {});
-          return data;
+          return Object.assign(fresh, data);   // fill counters an older save lacks
         }
       }
     } catch (e) {

@@ -216,7 +216,7 @@
       const raw = window.localStorage.getItem(CONFIG.STORAGE_KEY);
       if (raw) {
         const data = JSON.parse(raw);
-        if (data && data.version === 1 && Array.isArray(data.sessions)) return data;
+        if (data && data.version === 1 && Array.isArray(data.sessions)) return Object.assign(freshProgress(), data);   // fill counters an older save lacks
       }
     } catch (e) {
       console.warn('[StoryDice] Progress could not be loaded (storage unavailable):', e && e.message);
@@ -1011,7 +1011,8 @@
       hop = bounce * d.s * (reduceMotion ? 0.12 : 0.45);
       rot = reduceMotion ? 0 : (1 - easeOutCubic(p)) * TAU * 1.25 * (d.idx % 2 ? -1 : 1);
       // The face flicks through pictures while tumbling, then settles on the real one.
-      if (p < 0.8) face = PICTURES[(d.seed + Math.floor((t - d.t0) / CONFIG.FLICK_MS) * 5) % PICTURES.length].id;
+      // t (the frame time) can be a little before d.t0 (stamped in the tap handler): keep the index >= 0.
+      if (p < 0.8) face = PICTURES[(d.seed + Math.floor(Math.max(0, t - d.t0) / CONFIG.FLICK_MS) * 5) % PICTURES.length].id;
     }
 
     const lp = (t - d.landT) / CONFIG.LAND_MS;

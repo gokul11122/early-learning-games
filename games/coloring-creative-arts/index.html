@@ -664,7 +664,7 @@
         const data = JSON.parse(raw);
         if (data && data.version === 1 && Array.isArray(data.sessions)) {
           if (!data.colorCounts) data.colorCounts = {};
-          return data;
+          return Object.assign(freshProgress(), data);   // fill counters an older save lacks
         }
       }
     } catch (e) {

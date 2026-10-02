@@ -61,15 +61,18 @@ python -m http.server 8000
 
 Then open http://localhost:8000. You can also open a game's `index.html` file directly.
 
-## Android (Jetpack Compose)
+## Android app
 
-1. Copy `index.html` and the `games/` folder into `app/src/main/assets/`.
-2. Add [`android/EducationalGameScreen.kt`](android/EducationalGameScreen.kt) to the app and call
-   `EducationalGameScreen()` for the launcher, or `EducationalGameScreen("games/letter-tracing/index.html")`
-   for one game.
+```bash
+./build-apk.sh
+```
 
-The WebView turns on JavaScript and DOM storage, blocks zoom, keeps links inside the app, and sends each
-game's `console.log` output to Logcat under the tag `LLM_Game_Debug`.
+That builds `dist/EarlyLearningGames-<date>.apk`, an installable app with all 20 games packed inside. It
+works offline and needs no permissions. Share that one file. Installing a newer one over an older one keeps
+every child's progress.
+
+The app lives in [`android-app/`](android-app/). Its [README](android-app/README.md) covers the one-time
+setup, how to install on a phone, how to ship updates safely, and the signing key you must back up.
 
 Android WebView usually has no speech engine, so the games fall back to their visual cues and Web Audio
 tones there.

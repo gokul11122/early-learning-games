@@ -5,8 +5,8 @@ is the reference implementation: copy its skeleton and replace only the game-spe
 
 ## Audience
 
-Children aged 2 to 6, homeschooling, played on an Android tablet/phone inside a Jetpack Compose
-WebView (also opened straight in desktop browsers for testing).
+Children aged 2 to 6, homeschooling, played on an Android tablet/phone inside the WebView of the
+Android app in `android-app/` (also opened straight in desktop browsers for testing).
 
 ## Technical rules
 

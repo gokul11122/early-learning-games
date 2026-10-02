@@ -231,7 +231,7 @@
       const raw = window.localStorage.getItem(CONFIG.STORAGE_KEY);
       if (raw) {
         const data = JSON.parse(raw);
-        if (data && data.version === 1 && Array.isArray(data.sessions)) return data;
+        if (data && data.version === 1 && Array.isArray(data.sessions)) return Object.assign(freshProgress(), data);   // fill counters an older save lacks
       }
     } catch (e) {
       console.warn('[AnimalSounds] Progress could not be loaded (storage unavailable):', e && e.message);

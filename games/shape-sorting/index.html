@@ -194,7 +194,7 @@
       const raw = window.localStorage.getItem(CONFIG.STORAGE_KEY);
       if (raw) {
         const data = JSON.parse(raw);
-        if (data && data.version === 1 && Array.isArray(data.sessions)) return data;
+        if (data && data.version === 1 && Array.isArray(data.sessions)) return Object.assign(freshProgress(), data);   // fill counters an older save lacks
       }
     } catch (e) {
       console.warn('[ShapeSort] Progress could not be loaded (storage unavailable):', e && e.message);
@@ -555,7 +555,7 @@
     if (state.phase === 'start' || state.phase === 'between') {
       const g = starGeom();
       if (Math.hypot(p.x - g.cx, p.y - g.cy) <= g.R * 1.8) { startRound(); return; }
-    } else if (state.phase === 'play') {
+    } else if (state.phase === 'play' && !state.drag) {   // a second pointer (mouse + touch) must not orphan the held item
       const o = pickObject(p);
       if (o) { beginDrag(o, p); return; }
     }

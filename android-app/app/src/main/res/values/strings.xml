@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Early Learning Games</string>
+    <string name="webview_missing">This phone\'s web view is being updated or is missing. Please try again in a minute, or update \"Android System WebView\" from the Play Store.</string>
+</resources>
